@@ -6,6 +6,8 @@ secret.key
 *.db-shm
 uploads/
 .env
+.env.local
+.vercel/
 
 # Python / editor
 __pycache__/
