@@ -323,6 +323,16 @@ def hero():
     return resp
 
 
+@app.get("/official-pad-background.jpg")
+def official_pad_background():
+    path = os.path.join(BASE_DIR, "official_pad_background.jpg")
+    with open(path, "rb") as f:
+        image_bytes = f.read()
+    resp = Response(image_bytes, mimetype="image/jpeg")
+    resp.headers["Cache-Control"] = "public, max-age=86400"
+    return resp
+
+
 @app.after_request
 def no_cache_api(resp):
     if request.path.startswith("/api/"):
@@ -1894,6 +1904,23 @@ INDEX_HTML = r"""<!DOCTYPE html>
 
         button:not(:disabled):active { animation: spring-press 180ms ease-out; }
 
+        /* Universal TAHAM Official Pad printing */
+        .print-pad { background: #ffffff; }
+        .report-print-header { border-bottom: 1px solid #d8dee9; padding-bottom: 10px; margin-bottom: 12px; }
+        .report-print-kicker { margin: 0; color: #c1121f; font-size: 11px; font-weight: 900; letter-spacing: 0.06em; text-transform: uppercase; }
+        .report-print-title { margin: 3px 0 4px; color: #0b1f3a; font-size: 18px; font-weight: 900; }
+        .report-print-period { margin: 2px 0 0; color: #172033; font-size: 12px; font-weight: 700; }
+        .report-print-generated { margin: 3px 0 0; color: #526078; font-size: 11px; }
+        .report-metrics-grid { margin: 12px 0; }
+        .report-orders-wrap { margin-top: 12px; }
+        .report-orders-title { margin: 0 0 8px; color: #0b1f3a; font-size: 13px; font-weight: 900; text-transform: uppercase; letter-spacing: 0.03em; }
+        .report-print-table { width: 100%; border-collapse: collapse; font-size: 12px; background: #fff; }
+        .report-print-table th, .report-print-table td { border: 1px solid #d8dee9; padding: 6px 8px; text-align: left; }
+        .report-print-table thead th { background: #0b1f3a; color: #fff; font-weight: 900; }
+        .report-print-table tbody tr:nth-child(even) { background: #f8fafc; }
+        .report-print-table .num { text-align: right; }
+        .report-print-table .strong { font-weight: 800; }
+
         /* Custom Taham Official Invoice / Cash Memo Pad */
         .invoice-pad {
             position: relative;
@@ -2004,9 +2031,9 @@ INDEX_HTML = r"""<!DOCTYPE html>
         .invoice-footer-bar { padding: 10px 12px; background: #0b1f3a; color: #fff; border-radius: 8px; border-top: 2px solid #c1121f; text-align: center; font-size: 10px; font-weight: 800; letter-spacing: 0.02em; }
 
         @media print {
-            @page { margin: 8mm; size: A4; }
+            @page { size: A4; margin: 0; background-image: url("/official-pad-background.jpg"); background-size: cover; background-position: center; background-repeat: no-repeat; print-color-adjust: exact; -webkit-print-color-adjust: exact; }
             body * { visibility: hidden !important; }
-            #invoice-print-area, #invoice-print-area * { visibility: visible !important; }
+            #invoice-print-area, #invoice-print-area *, .print-pad, .print-pad *, #report-print-area, #report-print-area * { visibility: visible !important; }
             #invoice-print-area {
                 position: fixed !important;
                 inset: 0 !important;
@@ -2026,6 +2053,35 @@ INDEX_HTML = r"""<!DOCTYPE html>
             .invoice-pad { -webkit-print-color-adjust: exact !important; print-color-adjust: exact !important; }
             .invoice-accent-stripe, .invoice-badge, .invoice-table thead th, .invoice-grand-total, .invoice-footer-bar, .invoice-payment-option.active { -webkit-print-color-adjust: exact !important; print-color-adjust: exact !important; }
             .invoice-watermark { opacity: 0.05 !important; }
+            html, body { background-image: url("/official-pad-background.jpg") !important; background-size: cover !important; background-position: center !important; background-repeat: no-repeat !important; -webkit-print-color-adjust: exact !important; print-color-adjust: exact !important; }
+            .invoice-accent-stripe { display: none !important; }
+            .print-pad, #invoice-print-area, #report-print-area {
+                position: relative !important;
+                z-index: 9999 !important;
+                width: 210mm !important;
+                max-width: 210mm !important;
+                min-height: 297mm !important;
+                max-height: none !important;
+                margin: 0 auto !important;
+                padding: 58mm 18mm 48mm !important;
+                box-sizing: border-box !important;
+                border: 0 !important;
+                border-radius: 0 !important;
+                box-shadow: none !important;
+                overflow: visible !important;
+                background-color: transparent !important;
+                background-image: url("/official-pad-background.jpg") !important;
+                background-size: cover !important;
+                background-position: center !important;
+                background-repeat: no-repeat !important;
+                background-origin: border-box !important;
+                background-clip: border-box !important;
+                -webkit-print-color-adjust: exact !important;
+                print-color-adjust: exact !important;
+            }
+            #invoice-print-area { padding: 58mm 18mm 48mm !important; }
+            #report-print-area { padding: 56mm 18mm 48mm !important; }
+            .no-print { display: none !important; }
         }
 
         /* Floating 3D storefront footer */
@@ -2283,7 +2339,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
 
         @media print {
             body * { visibility: hidden !important; }
-            #invoice-print-area, #invoice-print-area * { visibility: visible !important; }
+            #invoice-print-area, #invoice-print-area *, .print-pad, .print-pad *, #report-print-area, #report-print-area * { visibility: visible !important; }
             #invoice-print-area {
                 position: fixed !important;
                 left: 0 !important;
@@ -2957,6 +3013,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
                     <div class="flex gap-2" role="tablist">
                         <button type="button" onclick="switchReportView('daily')" data-report-tab="daily" class="report-tab px-4 py-2 rounded-xl text-sm font-bold bg-brand-600 text-white">Daily Report</button>
                         <button type="button" onclick="switchReportView('monthly')" data-report-tab="monthly" class="report-tab px-4 py-2 rounded-xl text-sm font-bold bg-white text-slate-700 border border-slate-200">Monthly Report</button>
+                        <button type="button" onclick="printReport()" class="report-print-btn no-print px-4 py-2 rounded-xl text-sm font-bold bg-slate-900 text-white hover:bg-slate-800">Print Report</button>
                     </div>
                 </div>
 
@@ -4328,6 +4385,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
                 await api('POST', '/api/login', { username, password });
                 isAdminAuthenticated = true;
                 isSuperAdmin = true;
+                window.adminUsername = username;
                 document.getElementById('login-password').value = '';
                 document.getElementById('admin-logout-btn').classList.remove('hidden');
                 closeAdminLoginModal();
@@ -4875,8 +4933,8 @@ INDEX_HTML = r"""<!DOCTYPE html>
             };
 
             setText('inv-shop-name', 'TAHAM');
-            setText('inv-shop-address', storeSettings.shopAddress || 'Rayerbag, Dhaka, Bangladesh');
-            setText('inv-shop-phone', 'Helpline / WhatsApp: +880 1400-570014');
+            setText('inv-shop-address', 'Rayerbag, Dhaka, Bangladesh');
+            setText('inv-shop-phone', 'Facebook · WhatsApp 01400570014 · taham.info@gmail.com');
             setText('inv-order-id', orderNo);
             setText('inv-order-no', orderNo);
             setText('inv-order-date', fmtDate(order.createdAt) || order.dateStr || '');
@@ -5107,11 +5165,13 @@ INDEX_HTML = r"""<!DOCTYPE html>
             const cancelledCount = filteredOrders.filter(o => o.status === 'Cancelled').length;
             const pendingCount = filteredOrders.filter(o => o.status === 'Pending').length;
 
+            setReportPrintHeader(currentReportView, range);
+
             metricsBox.innerHTML = `
                 ${reportMetricCard('Total Sales', money(totalSales), 'banknote', 'text-brand-700')}
                 ${reportMetricCard('Total Expenses', money(totalExpenses), 'receipt', 'text-rose-600')}
                 ${reportMetricCard('Net Profit', money(netProfit), 'trending-up', netProfit < 0 ? 'text-rose-600' : 'text-emerald-700')}
-                ${reportMetricCard('Orders', String(orderCount), 'package-check', 'text-slate-900')}
+                ${reportMetricCard('Total Orders', String(orderCount), 'package-check', 'text-slate-900')}
                 ${reportMetricCard('Items Sold', String(totalItems), 'shirt', 'text-slate-900')}
                 ${reportMetricCard('Pending', String(pendingCount), 'clock', 'text-amber-600')}
                 ${reportMetricCard('Cancelled', String(cancelledCount), 'x-circle', 'text-rose-600')}
@@ -5119,22 +5179,69 @@ INDEX_HTML = r"""<!DOCTYPE html>
             `;
 
             if (!filteredOrders.length) {
-                ordersBox.innerHTML = `<div class="p-8 text-center text-sm text-slate-400">No order summaries in this date range.</div>`;
+                ordersBox.innerHTML = `<div class="report-empty p-8 text-center text-sm text-slate-400">No order summaries in this date range.</div>`;
             } else {
-                ordersBox.innerHTML = filteredOrders.map(o => `
-                    <div class="p-4 grid grid-cols-1 sm:grid-cols-5 gap-3 items-center text-sm">
-                        <div>
-                            <p class="font-bold text-slate-900">${esc(o.orderNumber || o.id.slice(0, 8))}</p>
-                            <p class="text-xs text-slate-500">${esc(fmtDate(orderTime(o)))}</p>
-                        </div>
-                        <p class="text-slate-700">${esc(o.customerName || '')}</p>
-                        <span class="text-xs font-bold text-slate-600">${esc(o.status)}</span>
-                        <span class="text-xs text-slate-500">${(o.items || []).length} item(s)</span>
-                        <p class="font-bold text-brand-700 sm:text-right">${money(o.total)}</p>
-                    </div>
-                `).join('');
+                ordersBox.innerHTML = `
+                    <table class="report-print-table">
+                        <thead>
+                            <tr>
+                                <th>Date</th>
+                                <th>Order No</th>
+                                <th>Customer</th>
+                                <th>Status</th>
+                                <th>Items</th>
+                                <th class="num">Total</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            ${filteredOrders.map(o => `
+                                <tr>
+                                    <td>${esc(fmtDate(orderTime(o)))}</td>
+                                    <td class="strong">${esc(o.orderNumber || (o.id ? o.id.slice(0, 8) : ''))}</td>
+                                    <td>${esc(o.customerName || '')}</td>
+                                    <td>${esc(o.status || '')}</td>
+                                    <td>${(o.items || []).length} item(s)</td>
+                                    <td class="num strong">${money(o.total)}</td>
+                                </tr>
+                            `).join('')}
+                        </tbody>
+                    </table>`;
             }
             if (window.lucide) lucide.createIcons();
+        };
+
+        function setReportPrintHeader(view, range) {
+            const set = (id, v) => { const el = document.getElementById(id); if (el) el.innerText = v == null ? '' : String(v); };
+            const get = (id) => { const el = document.getElementById(id); return el ? el.value : ''; };
+            const daily = view !== 'monthly';
+            set('report-type', daily ? 'Daily Report' : 'Monthly Report');
+
+            let period = '';
+            if (daily) {
+                const from = get('daily-report-from'), to = get('daily-report-to');
+                const date = get('daily-report-date') || todayKey();
+                period = (from || to) ? `${from || '...'} to ${to || '...'}` : date;
+            } else {
+                const from = get('monthly-report-from'), to = get('monthly-report-to');
+                const month = get('monthly-report-month') || monthKey(new Date());
+                period = (from || to) ? `${from || '...'} to ${to || '...'}` : month;
+            }
+            set('report-period', `Selected Date / Date Range: ${period}`);
+
+            const user = window.adminUsername
+                || (typeof currentUser !== 'undefined' && currentUser && (currentUser.name || currentUser.email || currentUser.uid))
+                || (typeof isAdminAuthenticated !== 'undefined' && isAdminAuthenticated ? 'Admin' : 'TAHAM');
+            set('report-generated-by', `Generated By: ${user} · Generated: ${new Date().toLocaleString('en-US')}`);
+        }
+
+        window.printReport = function() {
+            if (typeof renderReports === 'function') renderReports();
+            setReportPrintHeader(currentReportView, getReportRange(currentReportView));
+            document.body.classList.add('printing-report');
+            const cleanup = () => document.body.classList.remove('printing-report');
+            window.addEventListener('afterprint', cleanup, { once: true });
+            window.print();
+            setTimeout(cleanup, 1000);
         };
 
         function reportMetricCard(label, value, icon, colorClass) {
@@ -6242,6 +6349,16 @@ def _hero_bytes():
 @app.get("/hero.jpg")
 def hero():
     resp = Response(_hero_bytes(), mimetype="image/jpeg")
+    resp.headers["Cache-Control"] = "public, max-age=86400"
+    return resp
+
+
+@app.get("/official-pad-background.jpg")
+def official_pad_background():
+    path = os.path.join(BASE_DIR, "official_pad_background.jpg")
+    with open(path, "rb") as f:
+        image_bytes = f.read()
+    resp = Response(image_bytes, mimetype="image/jpeg")
     resp.headers["Cache-Control"] = "public, max-age=86400"
     return resp
 
@@ -7817,6 +7934,23 @@ INDEX_HTML = r"""<!DOCTYPE html>
 
         button:not(:disabled):active { animation: spring-press 180ms ease-out; }
 
+        /* Universal TAHAM Official Pad printing */
+        .print-pad { background: #ffffff; }
+        .report-print-header { border-bottom: 1px solid #d8dee9; padding-bottom: 10px; margin-bottom: 12px; }
+        .report-print-kicker { margin: 0; color: #c1121f; font-size: 11px; font-weight: 900; letter-spacing: 0.06em; text-transform: uppercase; }
+        .report-print-title { margin: 3px 0 4px; color: #0b1f3a; font-size: 18px; font-weight: 900; }
+        .report-print-period { margin: 2px 0 0; color: #172033; font-size: 12px; font-weight: 700; }
+        .report-print-generated { margin: 3px 0 0; color: #526078; font-size: 11px; }
+        .report-metrics-grid { margin: 12px 0; }
+        .report-orders-wrap { margin-top: 12px; }
+        .report-orders-title { margin: 0 0 8px; color: #0b1f3a; font-size: 13px; font-weight: 900; text-transform: uppercase; letter-spacing: 0.03em; }
+        .report-print-table { width: 100%; border-collapse: collapse; font-size: 12px; background: #fff; }
+        .report-print-table th, .report-print-table td { border: 1px solid #d8dee9; padding: 6px 8px; text-align: left; }
+        .report-print-table thead th { background: #0b1f3a; color: #fff; font-weight: 900; }
+        .report-print-table tbody tr:nth-child(even) { background: #f8fafc; }
+        .report-print-table .num { text-align: right; }
+        .report-print-table .strong { font-weight: 800; }
+
         /* Custom Taham Official Invoice / Cash Memo Pad */
         .invoice-pad {
             position: relative;
@@ -7927,9 +8061,9 @@ INDEX_HTML = r"""<!DOCTYPE html>
         .invoice-footer-bar { padding: 10px 12px; background: #0b1f3a; color: #fff; border-radius: 8px; border-top: 2px solid #c1121f; text-align: center; font-size: 10px; font-weight: 800; letter-spacing: 0.02em; }
 
         @media print {
-            @page { margin: 8mm; size: A4; }
+            @page { size: A4; margin: 0; background-image: url("/official-pad-background.jpg"); background-size: cover; background-position: center; background-repeat: no-repeat; print-color-adjust: exact; -webkit-print-color-adjust: exact; }
             body * { visibility: hidden !important; }
-            #invoice-print-area, #invoice-print-area * { visibility: visible !important; }
+            #invoice-print-area, #invoice-print-area *, .print-pad, .print-pad *, #report-print-area, #report-print-area * { visibility: visible !important; }
             #invoice-print-area {
                 position: fixed !important;
                 inset: 0 !important;
@@ -7949,6 +8083,35 @@ INDEX_HTML = r"""<!DOCTYPE html>
             .invoice-pad { -webkit-print-color-adjust: exact !important; print-color-adjust: exact !important; }
             .invoice-accent-stripe, .invoice-badge, .invoice-table thead th, .invoice-grand-total, .invoice-footer-bar, .invoice-payment-option.active { -webkit-print-color-adjust: exact !important; print-color-adjust: exact !important; }
             .invoice-watermark { opacity: 0.05 !important; }
+            html, body { background-image: url("/official-pad-background.jpg") !important; background-size: cover !important; background-position: center !important; background-repeat: no-repeat !important; -webkit-print-color-adjust: exact !important; print-color-adjust: exact !important; }
+            .invoice-accent-stripe { display: none !important; }
+            .print-pad, #invoice-print-area, #report-print-area {
+                position: relative !important;
+                z-index: 9999 !important;
+                width: 210mm !important;
+                max-width: 210mm !important;
+                min-height: 297mm !important;
+                max-height: none !important;
+                margin: 0 auto !important;
+                padding: 58mm 18mm 48mm !important;
+                box-sizing: border-box !important;
+                border: 0 !important;
+                border-radius: 0 !important;
+                box-shadow: none !important;
+                overflow: visible !important;
+                background-color: transparent !important;
+                background-image: url("/official-pad-background.jpg") !important;
+                background-size: cover !important;
+                background-position: center !important;
+                background-repeat: no-repeat !important;
+                background-origin: border-box !important;
+                background-clip: border-box !important;
+                -webkit-print-color-adjust: exact !important;
+                print-color-adjust: exact !important;
+            }
+            #invoice-print-area { padding: 58mm 18mm 48mm !important; }
+            #report-print-area { padding: 56mm 18mm 48mm !important; }
+            .no-print { display: none !important; }
         }
 
         /* Floating 3D storefront footer */
@@ -8206,7 +8369,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
 
         @media print {
             body * { visibility: hidden !important; }
-            #invoice-print-area, #invoice-print-area * { visibility: visible !important; }
+            #invoice-print-area, #invoice-print-area *, .print-pad, .print-pad *, #report-print-area, #report-print-area * { visibility: visible !important; }
             #invoice-print-area {
                 position: fixed !important;
                 left: 0 !important;
@@ -8880,6 +9043,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
                     <div class="flex gap-2" role="tablist">
                         <button type="button" onclick="switchReportView('daily')" data-report-tab="daily" class="report-tab px-4 py-2 rounded-xl text-sm font-bold bg-brand-600 text-white">Daily Report</button>
                         <button type="button" onclick="switchReportView('monthly')" data-report-tab="monthly" class="report-tab px-4 py-2 rounded-xl text-sm font-bold bg-white text-slate-700 border border-slate-200">Monthly Report</button>
+                        <button type="button" onclick="printReport()" class="report-print-btn no-print px-4 py-2 rounded-xl text-sm font-bold bg-slate-900 text-white hover:bg-slate-800">Print Report</button>
                     </div>
                 </div>
 
@@ -8929,13 +9093,20 @@ INDEX_HTML = r"""<!DOCTYPE html>
                     </div>
                 </div>
 
-                <div id="report-metrics" class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4"></div>
-
-                <div class="bg-white rounded-2xl border border-slate-200 shadow-sm">
-                    <div class="p-4 border-b border-slate-100">
-                        <h4 class="text-lg font-bold text-slate-900">Order Summaries</h4>
+                <div id="report-print-area" class="print-pad report-print-area">
+                    <div class="report-print-header">
+                        <p id="report-type" class="report-print-kicker">Daily Report</p>
+                        <h4 class="report-print-title">Financial Summary &amp; Breakdown</h4>
+                        <p id="report-period" class="report-print-period"></p>
+                        <p id="report-generated-by" class="report-print-generated"></p>
                     </div>
-                    <div id="report-orders" class="divide-y divide-slate-100"></div>
+
+                    <div id="report-metrics" class="report-metrics-grid grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4"></div>
+
+                    <div class="report-orders-wrap">
+                        <h4 class="report-orders-title">Order Summaries / Itemized Records</h4>
+                        <div id="report-orders" class="report-orders"></div>
+                    </div>
                 </div>
             </div>
         </div>
@@ -9151,7 +9322,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
         <div onclick="closeInvoiceModal()" class="fixed inset-0 bg-slate-900/75 backdrop-blur-sm no-print"></div>
         <div class="bg-white rounded-2xl max-w-4xl w-full p-6 sm:p-8 relative z-10 shadow-2xl max-h-[92vh] overflow-y-auto">
             <!-- Printable Area -->
-            <div id="invoice-print-area" class="invoice-pad">
+            <div id="invoice-print-area" class="invoice-pad print-pad">
                 <div class="invoice-accent-stripe" aria-hidden="true"></div>
                 <div class="invoice-watermark" aria-hidden="true">TAHAM</div>
 
@@ -9166,7 +9337,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
                     </div>
                     <div class="invoice-order-heading">
                         <span class="invoice-badge">INVOICE / CASH MEMO</span>
-                        <p class="invoice-helpline">Helpline / WhatsApp: +880 1400-570014</p>
+                        <p class="invoice-helpline">Facebook · WhatsApp 01400570014 · taham.info@gmail.com</p>
                     </div>
                 </header>
 
@@ -9208,10 +9379,10 @@ INDEX_HTML = r"""<!DOCTYPE html>
                     <thead>
                         <tr>
                             <th class="invoice-sl">SL</th>
-                            <th>Item Description &amp; Custom Design Note</th>
+                            <th>Item Name &amp; Custom Design Note</th>
                             <th class="invoice-center">Size</th>
                             <th class="invoice-center">Qty</th>
-                            <th class="invoice-right">Rate</th>
+                            <th class="invoice-right">Price</th>
                             <th class="invoice-right">Total</th>
                         </tr>
                     </thead>
@@ -9257,10 +9428,10 @@ INDEX_HTML = r"""<!DOCTYPE html>
                         </div>
                         <div class="invoice-signature">
                             <span class="invoice-signature-line"></span>
-                            <p>Authorized Signature (Taham)</p>
+                            <p>Authorized Signature</p>
                         </div>
                     </div>
-                    <div class="invoice-footer-bar">Thank you for shopping with TAHAM! For any query, call or WhatsApp: +880 1400-570014</div>
+                    <div class="invoice-footer-bar">Powered by TAHAM</div>
                 </footer>
             </div>
 
@@ -10297,6 +10468,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
                 await api('POST', '/api/login', { username, password });
                 isAdminAuthenticated = true;
                 isSuperAdmin = true;
+                window.adminUsername = username;
                 document.getElementById('login-password').value = '';
                 document.getElementById('admin-logout-btn').classList.remove('hidden');
                 closeAdminLoginModal();
@@ -10844,8 +11016,8 @@ INDEX_HTML = r"""<!DOCTYPE html>
             };
 
             setText('inv-shop-name', 'TAHAM');
-            setText('inv-shop-address', storeSettings.shopAddress || 'Rayerbag, Dhaka, Bangladesh');
-            setText('inv-shop-phone', 'Helpline / WhatsApp: +880 1400-570014');
+            setText('inv-shop-address', 'Rayerbag, Dhaka, Bangladesh');
+            setText('inv-shop-phone', 'Facebook · WhatsApp 01400570014 · taham.info@gmail.com');
             setText('inv-order-id', orderNo);
             setText('inv-order-no', orderNo);
             setText('inv-order-date', fmtDate(order.createdAt) || order.dateStr || '');
@@ -11076,11 +11248,13 @@ INDEX_HTML = r"""<!DOCTYPE html>
             const cancelledCount = filteredOrders.filter(o => o.status === 'Cancelled').length;
             const pendingCount = filteredOrders.filter(o => o.status === 'Pending').length;
 
+            setReportPrintHeader(currentReportView, range);
+
             metricsBox.innerHTML = `
                 ${reportMetricCard('Total Sales', money(totalSales), 'banknote', 'text-brand-700')}
                 ${reportMetricCard('Total Expenses', money(totalExpenses), 'receipt', 'text-rose-600')}
                 ${reportMetricCard('Net Profit', money(netProfit), 'trending-up', netProfit < 0 ? 'text-rose-600' : 'text-emerald-700')}
-                ${reportMetricCard('Orders', String(orderCount), 'package-check', 'text-slate-900')}
+                ${reportMetricCard('Total Orders', String(orderCount), 'package-check', 'text-slate-900')}
                 ${reportMetricCard('Items Sold', String(totalItems), 'shirt', 'text-slate-900')}
                 ${reportMetricCard('Pending', String(pendingCount), 'clock', 'text-amber-600')}
                 ${reportMetricCard('Cancelled', String(cancelledCount), 'x-circle', 'text-rose-600')}
@@ -11088,22 +11262,69 @@ INDEX_HTML = r"""<!DOCTYPE html>
             `;
 
             if (!filteredOrders.length) {
-                ordersBox.innerHTML = `<div class="p-8 text-center text-sm text-slate-400">No order summaries in this date range.</div>`;
+                ordersBox.innerHTML = `<div class="report-empty p-8 text-center text-sm text-slate-400">No order summaries in this date range.</div>`;
             } else {
-                ordersBox.innerHTML = filteredOrders.map(o => `
-                    <div class="p-4 grid grid-cols-1 sm:grid-cols-5 gap-3 items-center text-sm">
-                        <div>
-                            <p class="font-bold text-slate-900">${esc(o.orderNumber || o.id.slice(0, 8))}</p>
-                            <p class="text-xs text-slate-500">${esc(fmtDate(orderTime(o)))}</p>
-                        </div>
-                        <p class="text-slate-700">${esc(o.customerName || '')}</p>
-                        <span class="text-xs font-bold text-slate-600">${esc(o.status)}</span>
-                        <span class="text-xs text-slate-500">${(o.items || []).length} item(s)</span>
-                        <p class="font-bold text-brand-700 sm:text-right">${money(o.total)}</p>
-                    </div>
-                `).join('');
+                ordersBox.innerHTML = `
+                    <table class="report-print-table">
+                        <thead>
+                            <tr>
+                                <th>Date</th>
+                                <th>Order No</th>
+                                <th>Customer</th>
+                                <th>Status</th>
+                                <th>Items</th>
+                                <th class="num">Total</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            ${filteredOrders.map(o => `
+                                <tr>
+                                    <td>${esc(fmtDate(orderTime(o)))}</td>
+                                    <td class="strong">${esc(o.orderNumber || (o.id ? o.id.slice(0, 8) : ''))}</td>
+                                    <td>${esc(o.customerName || '')}</td>
+                                    <td>${esc(o.status || '')}</td>
+                                    <td>${(o.items || []).length} item(s)</td>
+                                    <td class="num strong">${money(o.total)}</td>
+                                </tr>
+                            `).join('')}
+                        </tbody>
+                    </table>`;
             }
             if (window.lucide) lucide.createIcons();
+        };
+
+        function setReportPrintHeader(view, range) {
+            const set = (id, v) => { const el = document.getElementById(id); if (el) el.innerText = v == null ? '' : String(v); };
+            const get = (id) => { const el = document.getElementById(id); return el ? el.value : ''; };
+            const daily = view !== 'monthly';
+            set('report-type', daily ? 'Daily Report' : 'Monthly Report');
+
+            let period = '';
+            if (daily) {
+                const from = get('daily-report-from'), to = get('daily-report-to');
+                const date = get('daily-report-date') || todayKey();
+                period = (from || to) ? `${from || '...'} to ${to || '...'}` : date;
+            } else {
+                const from = get('monthly-report-from'), to = get('monthly-report-to');
+                const month = get('monthly-report-month') || monthKey(new Date());
+                period = (from || to) ? `${from || '...'} to ${to || '...'}` : month;
+            }
+            set('report-period', `Selected Date / Date Range: ${period}`);
+
+            const user = window.adminUsername
+                || (typeof currentUser !== 'undefined' && currentUser && (currentUser.name || currentUser.email || currentUser.uid))
+                || (typeof isAdminAuthenticated !== 'undefined' && isAdminAuthenticated ? 'Admin' : 'TAHAM');
+            set('report-generated-by', `Generated By: ${user} · Generated: ${new Date().toLocaleString('en-US')}`);
+        }
+
+        window.printReport = function() {
+            if (typeof renderReports === 'function') renderReports();
+            setReportPrintHeader(currentReportView, getReportRange(currentReportView));
+            document.body.classList.add('printing-report');
+            const cleanup = () => document.body.classList.remove('printing-report');
+            window.addEventListener('afterprint', cleanup, { once: true });
+            window.print();
+            setTimeout(cleanup, 1000);
         };
 
         function reportMetricCard(label, value, icon, colorClass) {
