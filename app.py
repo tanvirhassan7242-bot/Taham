@@ -3063,13 +3063,20 @@ INDEX_HTML = r"""<!DOCTYPE html>
                     </div>
                 </div>
 
-                <div id="report-metrics" class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4"></div>
-
-                <div class="bg-white rounded-2xl border border-slate-200 shadow-sm">
-                    <div class="p-4 border-b border-slate-100">
-                        <h4 class="text-lg font-bold text-slate-900">Order Summaries</h4>
+                <div id="report-print-area" class="print-pad report-print-area">
+                    <div class="report-print-header">
+                        <p id="report-type" class="report-print-kicker">Daily Report</p>
+                        <h4 class="report-print-title">Financial Summary &amp; Breakdown</h4>
+                        <p id="report-period" class="report-print-period"></p>
+                        <p id="report-generated-by" class="report-print-generated"></p>
                     </div>
-                    <div id="report-orders" class="divide-y divide-slate-100"></div>
+
+                    <div id="report-metrics" class="report-metrics-grid grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4"></div>
+
+                    <div class="report-orders-wrap">
+                        <h4 class="report-orders-title">Order Summaries / Itemized Records</h4>
+                        <div id="report-orders" class="report-orders"></div>
+                    </div>
                 </div>
             </div>
         </div>
@@ -3285,10 +3292,11 @@ INDEX_HTML = r"""<!DOCTYPE html>
         <div onclick="closeInvoiceModal()" class="fixed inset-0 bg-slate-900/75 backdrop-blur-sm no-print"></div>
         <div class="bg-white rounded-2xl max-w-4xl w-full p-6 sm:p-8 relative z-10 shadow-2xl max-h-[92vh] overflow-y-auto">
             <!-- Printable Area -->
-            <div id="invoice-print-area" class="space-y-5 text-slate-800">
+            <div id="invoice-print-area" class="space-y-5 text-slate-800 print-pad">
+                <div class="invoice-watermark" aria-hidden="true">TAHAM</div>
                 <div class="flex justify-between items-start border-b-2 border-slate-900 pb-4">
                     <div>
-                        <div class="flex items-center gap-2.5"><img src="/logo.png?v=2" alt="" class="w-10 h-10 rounded-lg"><h2 id="inv-shop-name" class="text-2xl font-bold text-slate-900">Taham</h2></div>
+                        <div class="flex items-center gap-2.5"><img src="/logo.png?v=2" alt="" class="w-10 h-10 rounded-lg"><h2 id="inv-shop-name" class="text-2xl font-bold text-slate-900">TAHAM</h2><p class="text-[11px] text-rose-600 font-bold">Premium &amp; Custom Fashion Wear</p></div>
                         <p id="inv-shop-address" class="text-xs text-slate-500 mt-0.5">Dhaka, Bangladesh</p>
                         <p id="inv-shop-phone" class="text-xs text-slate-600 font-semibold">Mobile: 01700-000000</p>
                     </div>
@@ -3347,9 +3355,8 @@ INDEX_HTML = r"""<!DOCTYPE html>
                     </div>
                 </div>
 
-                <div class="text-center text-[11px] text-slate-400 pt-4 border-t border-dashed border-slate-200">
-                    Thank you for shopping with us! To exchange a product, contact us with the receipt within 3 days.
-                </div>
+                <div class="grid grid-cols-2 gap-6 pt-8 pb-3 text-center text-[11px] text-slate-700"><div><div class="border-b border-slate-400 h-8"></div>Customer Signature</div><div><div class="border-b border-slate-400 h-8"></div>Authorized Signature</div></div>
+                <div class="text-center text-[11px] text-slate-400 pt-2 border-t border-dashed border-slate-200">Powered by TAHAM</div>
             </div>
 
             <!-- Modal Action Buttons -->
