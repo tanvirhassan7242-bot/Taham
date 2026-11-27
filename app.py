@@ -43,6 +43,8 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_DB_PATH = os.path.join("/tmp" if os.environ.get("VERCEL") else BASE_DIR, "taham.db")
 DB_PATH = os.environ.get("TAHAM_DB", DEFAULT_DB_PATH)
 SECRET_PATH = os.path.join(os.path.dirname(DB_PATH), "secret.key")
+if os.path.dirname(DB_PATH):
+    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
 HOST = os.environ.get("HOST", "127.0.0.1")   # set HOST=0.0.0.0 to open it to your Wi-Fi/LAN
 PORT = int(os.environ.get("PORT", "5000"))
 
@@ -6078,8 +6080,11 @@ except ImportError:                                   # first run: install Flask
 from werkzeug.security import check_password_hash, generate_password_hash
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DB_PATH = os.environ.get("TAHAM_DB", os.path.join(BASE_DIR, "taham.db"))
+DEFAULT_DB_PATH = os.path.join("/tmp" if os.environ.get("VERCEL") else BASE_DIR, "taham.db")
+DB_PATH = os.environ.get("TAHAM_DB", DEFAULT_DB_PATH)
 SECRET_PATH = os.path.join(os.path.dirname(DB_PATH), "secret.key")
+if os.path.dirname(DB_PATH):
+    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
 HOST = os.environ.get("HOST", "0.0.0.0")   # allow access from other PCs on the same LAN/Wi-Fi
 PORT = int(os.environ.get("PORT", "5000"))
 
