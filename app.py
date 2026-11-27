@@ -55,6 +55,7 @@ DEFAULT_SETTINGS = {
     "shopPhone": "01400-570014",
     "paymentNumber": "01400-570014",
     "shopAddress": "Rayerbag, Dhaka, Bangladesh.",
+    "showStockToCustomers": True,
 }
 DELIVERY_OPTIONS = (60, 120)           # Dhaka / outside Dhaka (must match the radio buttons)
 PAYMENT_METHODS = ("Cash on Delivery", "bKash", "Nagad")
@@ -920,12 +921,17 @@ def settings_put():
     required_keys = ("shopName", "shopPhone", "paymentNumber", "shopAddress", "pageName", "theme")
     for key in DEFAULT_SETTINGS:
         if key in d:
+            if key == "showStockToCustomers":
+                raw = d.get(key)
+                s[key] = raw is True or str(raw).strip().lower() in ("true", "1", "on", "yes")
+                continue
             val = str(d.get(key, "")).strip()[:200]
             if key in required_keys and not val:
                 return err("Please fill in all the shop details.")
             s[key] = val
         elif key not in s:
-            s[key] = str(DEFAULT_SETTINGS.get(key, "")).strip()
+            default = DEFAULT_SETTINGS.get(key, "")
+            s[key] = default if isinstance(default, bool) else str(default).strip()
 
     if not str(s.get("pageName", "")).strip():
         s["pageName"] = str(s.get("shopName", "Taham")).strip() or "Taham"
@@ -1888,6 +1894,140 @@ INDEX_HTML = r"""<!DOCTYPE html>
 
         button:not(:disabled):active { animation: spring-press 180ms ease-out; }
 
+        /* Custom Taham Official Invoice / Cash Memo Pad */
+        .invoice-pad {
+            position: relative;
+            overflow: hidden;
+            background: #ffffff;
+            color: #172033;
+            border: 1px solid #d8dee9;
+            border-radius: 14px;
+            padding: 18px;
+            font-size: 12px;
+            line-height: 1.45;
+            box-shadow: 0 10px 28px rgba(11,31,58,0.10);
+        }
+
+        .invoice-pad * { position: relative; z-index: 1; }
+        .invoice-accent-stripe, .invoice-watermark { position: absolute; }
+
+        .invoice-accent-stripe {
+            top: 0;
+            left: 0;
+            right: 0;
+            height: 7px;
+            z-index: 3;
+            background: linear-gradient(90deg, #0b1f3a 0 33.333%, #c1121f 33.333% 66.666%, #d4af37 66.666% 100%);
+        }
+
+        .invoice-watermark {
+            top: 48%;
+            left: 50%;
+            z-index: 0;
+            transform: translate(-50%, -50%) rotate(-28deg) scale(1.25);
+            color: #0b1f3a;
+            opacity: 0.055;
+            font-size: 112px;
+            font-weight: 900;
+            letter-spacing: 0.08em;
+            white-space: nowrap;
+            pointer-events: none;
+            user-select: none;
+        }
+
+        .invoice-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: flex-start;
+            gap: 18px;
+            padding: 16px 2px 14px;
+            border-bottom: 2px solid #0b1f3a;
+            position: relative;
+            z-index: 2;
+        }
+
+        .invoice-brand { display: flex; align-items: center; gap: 12px; min-width: 0; }
+        .invoice-logo { width: 48px; height: 48px; object-fit: cover; border-radius: 10px; border: 1px solid #d8dee9; background: #fff; }
+        .invoice-title { margin: 0; color: #0b1f3a; font-size: 25px; line-height: 1; font-weight: 900; letter-spacing: 0.04em; }
+        .invoice-subtitle { margin: 4px 0 0; color: #c1121f; font-size: 11px; font-weight: 800; }
+        .invoice-address { margin: 4px 0 0; color: #526078; font-size: 11px; }
+
+        .invoice-order-heading { text-align: right; min-width: 180px; }
+        .invoice-badge { display: inline-block; padding: 7px 10px; background: #0b1f3a; color: #fff; border-radius: 7px; border: 1px solid #d4af37; font-size: 10px; font-weight: 900; letter-spacing: 0.09em; text-transform: uppercase; }
+        .invoice-helpline { margin: 7px 0 0; color: #526078; font-size: 10px; font-weight: 700; }
+
+        .invoice-info-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin: 14px 0; }
+        .invoice-box { background: #f8fafc; border: 1px solid #d8dee9; border-radius: 10px; padding: 11px; min-width: 0; }
+        .invoice-box-title { margin: 0 0 8px; padding-bottom: 6px; border-bottom: 1px solid #e2e8f0; color: #0b1f3a; font-size: 11px; font-weight: 900; letter-spacing: 0.04em; text-transform: uppercase; }
+        .invoice-label { margin: 7px 0 2px; color: #718096; font-size: 9px; font-weight: 800; text-transform: uppercase; letter-spacing: 0.04em; }
+        .invoice-value { margin: 0; color: #172033; font-size: 11px; font-weight: 700; overflow-wrap: anywhere; }
+        .invoice-address-value { white-space: pre-line; }
+        .invoice-order-row { display: flex; justify-content: space-between; gap: 10px; padding: 5px 0; border-bottom: 1px dashed #e2e8f0; }
+        .invoice-order-row:last-of-type { border-bottom: 0; }
+        .invoice-status { padding: 2px 7px; border-radius: 999px; background: #ecfdf5; color: #047857; border: 1px solid #a7f3d0; font-size: 9px; font-weight: 900; text-transform: uppercase; }
+
+        .invoice-table { width: 100%; border-collapse: collapse; margin: 14px 0; font-size: 10px; background: #fff; }
+        .invoice-table th, .invoice-table td { border: 1px solid #d8dee9; padding: 7px 6px; vertical-align: top; }
+        .invoice-table thead th { background: #0b1f3a; color: #fff; font-weight: 900; text-align: left; letter-spacing: 0.03em; text-transform: uppercase; }
+        .invoice-table tbody tr:nth-child(even) { background: #f8fafc; }
+        .invoice-sl { width: 34px; text-align: center; font-weight: 900; }
+        .invoice-center { text-align: center; }
+        .invoice-right { text-align: right; }
+        .invoice-item-meta { margin-top: 3px; color: #718096; font-size: 9px; font-weight: 600; }
+        .invoice-custom-note { margin-top: 5px; padding: 5px 6px; border-left: 3px solid #c1121f; background: #fff7f7; color: #172033; font-size: 9px; white-space: pre-line; }
+        .invoice-custom-note span { display: block; color: #c1121f; font-weight: 900; }
+        .invoice-original-price { color: #94a3b8; text-decoration: line-through; font-size: 9px; }
+
+        .invoice-summary-grid { display: grid; grid-template-columns: 1.1fr 0.9fr; gap: 12px; margin: 12px 0; align-items: start; }
+        .invoice-policy-box { border: 1px solid #d8dee9; background: #f8fafc; border-radius: 10px; padding: 10px; font-size: 10px; }
+        .invoice-policy-box ul { margin: 0; padding-left: 15px; }
+        .invoice-policy-box li { margin: 4px 0; }
+        .invoice-totals { border: 1px solid #d8dee9; border-radius: 10px; padding: 8px; background: #fff; }
+        .invoice-total-row { display: flex; justify-content: space-between; gap: 10px; padding: 5px 4px; border-bottom: 1px dashed #e2e8f0; }
+        .invoice-total-row:last-child { border-bottom: 0; }
+        .invoice-grand-total { background: #0b1f3a; color: #fff; border: 1px solid #d4af37; border-radius: 7px; margin-top: 6px; padding: 7px; font-weight: 900; }
+        .invoice-due-total { background: #fff7ed; color: #9a3412; border: 1px solid #fed7aa; border-radius: 7px; margin-top: 6px; padding: 7px; font-weight: 900; }
+
+        .invoice-payment-box { border: 1px solid #d8dee9; background: #f8fafc; border-radius: 10px; padding: 10px; margin: 12px 0; }
+        .invoice-payment-methods { display: flex; flex-wrap: wrap; gap: 7px; margin-top: 8px; }
+        .invoice-payment-option { display: inline-flex; align-items: center; gap: 6px; padding: 6px 9px; border: 1px solid #d8dee9; border-radius: 8px; background: #fff; color: #526078; font-size: 10px; font-weight: 800; opacity: 0.55; }
+        .invoice-check { display: inline-flex; width: 13px; height: 13px; align-items: center; justify-content: center; border: 1px solid #94a3b8; border-radius: 50%; background: #fff; color: transparent; font-size: 9px; font-weight: 900; }
+        .invoice-payment-option.active { opacity: 1; border-color: #c1121f; background: #fff1f2; color: #9f1239; box-shadow: 0 3px 10px rgba(193,18,31,0.12); }
+        .invoice-payment-option.active .invoice-check { background: #c1121f; border-color: #c1121f; color: #fff; }
+        .invoice-payment-note { margin: 5px 0 0; color: #526078; font-size: 9px; font-weight: 700; }
+
+        .invoice-signatures-footer { margin-top: 18px; }
+        .invoice-signatures { display: grid; grid-template-columns: 1fr 1fr; gap: 24px; padding: 20px 8px 10px; }
+        .invoice-signature { text-align: center; }
+        .invoice-signature-line { display: block; height: 34px; border-bottom: 1px solid #0b1f3a; margin-bottom: 6px; }
+        .invoice-signature p { margin: 0; color: #172033; font-size: 10px; font-weight: 800; }
+        .invoice-footer-bar { padding: 10px 12px; background: #0b1f3a; color: #fff; border-radius: 8px; border-top: 2px solid #c1121f; text-align: center; font-size: 10px; font-weight: 800; letter-spacing: 0.02em; }
+
+        @media print {
+            @page { margin: 8mm; size: A4; }
+            body * { visibility: hidden !important; }
+            #invoice-print-area, #invoice-print-area * { visibility: visible !important; }
+            #invoice-print-area {
+                position: fixed !important;
+                inset: 0 !important;
+                z-index: 9999 !important;
+                width: 100% !important;
+                max-height: none !important;
+                overflow: visible !important;
+                margin: 0 !important;
+                padding: 14px !important;
+                border-radius: 0 !important;
+                box-shadow: none !important;
+                background: #fff !important;
+                color: #172033 !important;
+            }
+            #invoice-modal { position: static !important; max-height: none !important; overflow: visible !important; background: #fff !important; }
+            .no-print { display: none !important; }
+            .invoice-pad { -webkit-print-color-adjust: exact !important; print-color-adjust: exact !important; }
+            .invoice-accent-stripe, .invoice-badge, .invoice-table thead th, .invoice-grand-total, .invoice-footer-bar, .invoice-payment-option.active { -webkit-print-color-adjust: exact !important; print-color-adjust: exact !important; }
+            .invoice-watermark { opacity: 0.05 !important; }
+        }
+
         /* Floating 3D storefront footer */
         .footer-3d {
             position: relative;
@@ -2004,20 +2144,116 @@ INDEX_HTML = r"""<!DOCTYPE html>
             will-change: transform, transform-origin;
         }
         .discount-badge {
+            display: inline-grid;
+            place-items: center;
             z-index: 15;
-            padding: 0.45rem 0.8rem;
-            border-radius: 0.65rem;
-            background: linear-gradient(135deg, #e11d48 0%, #be123c 100%);
-            border: 1px solid rgba(255,255,255,0.35);
+            width: 5.5rem;
+            min-height: 4.25rem;
+            padding: 0;
+            border: 0;
+            background: transparent;
             color: #ffffff;
-            font-size: 0.9rem;
-            line-height: 1;
-            font-weight: 800;
-            letter-spacing: 0.01em;
+            font-weight: 900;
             text-transform: uppercase;
-            box-shadow: 0 10px 24px rgba(190,18,60,0.35), 0 2px 0 rgba(15,23,42,0.25), inset 0 1px 0 rgba(255,255,255,0.35);
-            transform: rotate(3deg);
+            transform: rotate(5deg);
+            transform-style: preserve-3d;
+            isolation: isolate;
+            filter: drop-shadow(0 12px 16px rgba(15,23,42,0.32));
+            pointer-events: none;
         }
+
+        .discount-badge::before {
+            content: "";
+            position: absolute;
+            inset: 0.45rem -0.25rem -0.45rem 0.45rem;
+            z-index: -2;
+            background: linear-gradient(135deg, #fbbf24 0%, #f59e0b 55%, #d97706 100%);
+            clip-path: polygon(10% 0, 90% 0, 100% 18%, 100% 100%, 0 100%, 0 18%);
+        }
+
+        .discount-badge::after {
+            content: "";
+            position: absolute;
+            right: -0.35rem;
+            bottom: -0.3rem;
+            width: 0.95rem;
+            height: 0.95rem;
+            z-index: -1;
+            background: #f59e0b;
+            transform: rotate(45deg);
+            box-shadow: inset 0 1px 0 rgba(255,255,255,0.35);
+        }
+
+        .discount-badge-shadow {
+            position: absolute;
+            inset: 0.55rem -0.5rem -0.55rem 0.55rem;
+            z-index: -3;
+            background: linear-gradient(135deg, #b45309 0%, #92400e 100%);
+            clip-path: polygon(10% 0, 90% 0, 100% 18%, 100% 100%, 0 100%, 0 18%);
+        }
+
+        .discount-badge-layer {
+            position: absolute;
+            inset: 0.25rem -0.3rem -0.25rem 0.25rem;
+            z-index: -1;
+            background: linear-gradient(135deg, #ff6b4a 0%, #f43f5e 55%, #e11d48 100%);
+            clip-path: polygon(10% 0, 90% 0, 100% 18%, 100% 100%, 0 100%, 0 18%);
+            box-shadow: inset 0 1px 0 rgba(255,255,255,0.30);
+        }
+
+        .discount-badge-navy {
+            position: relative;
+            z-index: 2;
+            width: 100%;
+            padding: 0.48rem 0.35rem 0.42rem;
+            background: linear-gradient(135deg, #0f172a 0%, #172554 100%);
+            border: 1px solid rgba(255,255,255,0.24);
+            border-bottom: 0;
+            clip-path: polygon(12% 0, 88% 0, 100% 18%, 100% 100%, 0 100%, 0 18%);
+            color: #ffffff;
+            font-size: 0.98rem;
+            line-height: 1;
+            font-weight: 900;
+            letter-spacing: -0.01em;
+            text-align: center;
+            transform: translateY(-2px);
+            box-shadow: inset 0 1px 0 rgba(255,255,255,0.22), 0 2px 0 rgba(15,23,42,0.45);
+        }
+
+        .discount-badge-ribbon {
+            position: relative;
+            z-index: 3;
+            width: 116%;
+            margin-top: -0.35rem;
+            padding: 0.25rem 0.25rem;
+            background: linear-gradient(135deg, #ff6b4a 0%, #e11d48 100%);
+            border: 1px solid rgba(255,255,255,0.30);
+            border-radius: 0.2rem;
+            color: #ffffff;
+            font-size: 0.58rem;
+            line-height: 1;
+            font-weight: 900;
+            letter-spacing: 0.13em;
+            text-align: center;
+            transform: rotate(-2deg);
+            box-shadow: 0 4px 0 #9f1239, 0 7px 12px rgba(15,23,42,0.22), inset 0 1px 0 rgba(255,255,255,0.28);
+        }
+
+        .discount-badge-accent {
+            position: absolute;
+            z-index: 4;
+            width: 0.48rem;
+            height: 0.48rem;
+            background: #fbbf24;
+            box-shadow: inset 0 1px 0 rgba(255,255,255,0.35), 0 2px 3px rgba(15,23,42,0.25);
+        }
+
+        .discount-badge-accent-one { top: -0.28rem; left: -0.28rem; transform: rotate(45deg); background: #fde68a; }
+        .discount-badge-accent-two { bottom: -0.22rem; left: 0.32rem; border-radius: 50%; background: #ef4444; }
+        .discount-badge-accent-three { top: 0.48rem; right: -0.28rem; transform: rotate(45deg); background: #f59e0b; }
+
+        .stock-switch input:checked + span { background-color: var(--brand-600); }
+        .stock-switch input:checked + span > span { transform: translateX(1.25rem); }
 
         .bg-brand-50 { background-color: var(--brand-50) !important; }
         .bg-brand-100 { background-color: var(--brand-100) !important; }
@@ -2688,6 +2924,19 @@ INDEX_HTML = r"""<!DOCTYPE html>
                                 <div id="theme-selector" class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3" data-selected="classic-pink"></div>
                             </div>
 
+                            <div class="pt-4 border-t border-slate-100">
+                                <label class="flex items-center justify-between gap-4 rounded-xl border border-slate-200 bg-slate-50 p-4 cursor-pointer">
+                                    <span>
+                                        <span class="block text-sm font-bold text-slate-900">Show Stock Count to Customers</span>
+                                        <span class="block text-xs text-slate-500 mt-1">Show or hide `Stock: XX` on public storefront product cards.</span>
+                                    </span>
+                                    <span class="stock-switch relative inline-flex h-7 w-12 shrink-0 items-center rounded-full bg-slate-300 transition-colors">
+                                        <input type="checkbox" id="set-show-stock" checked onchange="renderProducts()" role="switch" aria-label="Show Stock Count to Customers" class="peer sr-only">
+                                        <span class="absolute left-1 h-5 w-5 rounded-full bg-white shadow transition-transform"></span>
+                                    </span>
+                                </label>
+                            </div>
+
                             <button type="submit" class="w-full py-3 rounded-xl bg-slate-900 hover:bg-slate-800 text-white font-bold shadow-md transition-all mt-4">
                                 Save Page Setup
                             </button>
@@ -2977,7 +3226,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
     <!-- ========================================== -->
     <div id="invoice-modal" class="fixed inset-0 z-50 hidden flex items-center justify-center p-4">
         <div onclick="closeInvoiceModal()" class="fixed inset-0 bg-slate-900/75 backdrop-blur-sm no-print"></div>
-        <div class="bg-white rounded-2xl max-w-xl w-full p-6 sm:p-8 relative z-10 shadow-2xl max-h-[92vh] overflow-y-auto">
+        <div class="bg-white rounded-2xl max-w-4xl w-full p-6 sm:p-8 relative z-10 shadow-2xl max-h-[92vh] overflow-y-auto">
             <!-- Printable Area -->
             <div id="invoice-print-area" class="space-y-5 text-slate-800">
                 <div class="flex justify-between items-start border-b-2 border-slate-900 pb-4">
@@ -3958,6 +4207,10 @@ INDEX_HTML = r"""<!DOCTYPE html>
                 const el = document.getElementById(id);
                 if (el) el.value = value || '';
             };
+            const setChecked = (id, checked) => {
+                const el = document.getElementById(id);
+                if (el) el.checked = checked;
+            };
 
             document.title = pageName;
             document.getElementById('header-shop-name').innerText = pageName;
@@ -3985,6 +4238,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
             setValue('set-shop-address', storeSettings.shopAddress);
             setValue('set-admin-user', storeSettings.adminUser || '');
             setValue('set-admin-pass', '');
+            setChecked('set-show-stock', storeSettings.showStockToCustomers !== false && storeSettings.showStockToCustomers !== 'false');
 
             const accessAdmin = document.getElementById('access-admin-user');
             if (accessAdmin) accessAdmin.innerText = storeSettings.adminUser || shopName;
@@ -3996,6 +4250,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
 
             applyTheme(storeSettings.theme || 'classic-pink');
             renderThemeSelector();
+            renderProducts();
         }
 
         function updatePendingBadge() {
@@ -4283,6 +4538,8 @@ INDEX_HTML = r"""<!DOCTYPE html>
                 const sale = Number(product.salePrice ?? product.price);
                 const hasDiscount = sale < price;
                 const pct = hasDiscount ? Math.round((1 - sale / price) * 100) : 0;
+                const stockToggle = document.getElementById('set-show-stock');
+                const showStockToCustomers = storeSettings.showStockToCustomers !== false && storeSettings.showStockToCustomers !== 'false' && (!stockToggle || stockToggle.checked);
 
                 return `
                     <div class="product-card tilt-3d reveal bg-white/90 backdrop-blur-sm rounded-2xl border border-slate-200 overflow-hidden shadow-sm flex flex-col group">
@@ -4295,8 +4552,16 @@ INDEX_HTML = r"""<!DOCTYPE html>
                                  onmouseleave="endInPlaceZoom(this)"
                                  class="product-image-zoom zoomable-image w-full h-full object-cover ${isOutOfStock ? 'grayscale opacity-60' : ''}">
                             <span class="absolute top-3 left-3 bg-white/85 backdrop-blur-md text-slate-800 text-xs font-bold px-3 py-1 rounded-lg shadow-sm border border-white/50">${esc(product.category)}</span>
-                            <span class="absolute right-3 ${hasDiscount ? 'top-14' : 'top-3'} ${isOutOfStock ? 'bg-rose-600 text-white' : (stock < 5 ? 'bg-amber-500 text-white' : 'bg-emerald-600 text-white')} text-[11px] font-bold px-2.5 py-1 rounded-lg shadow-sm">${isOutOfStock ? 'Out of Stock' : esc(t('Stock: {n}', { n: stock }))}</span>
-                            ${hasDiscount ? `<span class="discount-badge absolute top-3 right-3">${esc(t('{pct}% OFF', { pct }))}</span>` : ''}
+                            ${isOutOfStock ? `<span class="absolute right-3 ${hasDiscount ? 'top-20' : 'top-3'} bg-rose-600 text-white text-[11px] font-bold px-2.5 py-1 rounded-lg shadow-sm">${esc(t('Out of Stock'))}</span>` : (showStockToCustomers ? `<span class="absolute right-3 ${hasDiscount ? 'top-20' : 'top-3'} ${stock < 5 ? 'bg-amber-500 text-white' : 'bg-emerald-600 text-white'} text-[11px] font-bold px-2.5 py-1 rounded-lg shadow-sm">${esc(t('Stock: {n}', { n: stock }))}</span>` : '')}
+                            ${hasDiscount ? `<span class="discount-badge absolute top-3 right-3" role="img" aria-label="${esc(`${pct}% discount`)}">
+                                <span class="discount-badge-shadow" aria-hidden="true"></span>
+                                <span class="discount-badge-layer" aria-hidden="true"></span>
+                                <span class="discount-badge-navy">${esc(t('{pct}%', { pct }))}</span>
+                                <span class="discount-badge-ribbon">${esc(t('DISCOUNT'))}</span>
+                                <span class="discount-badge-accent discount-badge-accent-one" aria-hidden="true"></span>
+                                <span class="discount-badge-accent discount-badge-accent-two" aria-hidden="true"></span>
+                                <span class="discount-badge-accent discount-badge-accent-three" aria-hidden="true"></span>
+                            </span>` : ''}
                             ${shownPhoto.color ? `<span class="absolute bottom-3 right-3 bg-white/85 backdrop-blur-md text-slate-800 text-[11px] font-bold px-2.5 py-1 rounded-lg shadow-sm border border-white/50 flex items-center gap-1.5"><span class="w-3 h-3 rounded-full border border-slate-300" style="background:${esc((colors.find(c => c.name === shownPhoto.color) || {}).hex || '#ccc')}"></span><span>${esc(shownPhoto.color)}</span></span>` : ''}
                         </div>
 
@@ -4592,33 +4857,77 @@ INDEX_HTML = r"""<!DOCTYPE html>
         // ==========================================
         window.openInvoiceModal = function(order) {
             currentInvoice = order;
-            document.getElementById('inv-shop-name').innerText = storeSettings.shopName;
-            document.getElementById('inv-shop-address').innerText = storeSettings.shopAddress;
-            document.getElementById('inv-shop-phone').innerText = t('Helpline: {p}', { p: storeSettings.shopPhone });
+            order = order || {};
+            const items = Array.isArray(order.items) ? order.items : [];
+            const paymentRaw = String(order.paymentMethod || '').trim();
+            const paymentLower = paymentRaw.toLowerCase();
+            const isBkash = paymentLower.includes('bkash');
+            const isNagad = paymentLower.includes('nagad');
+            const isCOD = !isBkash && !isNagad;
+            const orderNo = `#${order.orderNumber || (order.id ? order.id.slice(0, 8) : 'ORD-000000')}`;
+            const money = (value) => {
+                const n = Number(value || 0);
+                return `৳ ${(Number.isFinite(n) ? n : 0).toLocaleString('en-US')}`;
+            };
+            const setText = (id, value) => {
+                const el = document.getElementById(id);
+                if (el) el.innerText = value == null ? '' : String(value);
+            };
 
-            document.getElementById('inv-order-id').innerText = `#${order.orderNumber || order.id.slice(0, 8)}`;
-            document.getElementById('inv-order-date').innerText = fmtDate(order.createdAt) || order.dateStr || '';
-            document.getElementById('inv-cust-name').innerText = order.customerName;
-            document.getElementById('inv-cust-phone').innerText = order.customerPhone;
-            document.getElementById('inv-cust-address').innerText = order.customerAddress;
-            document.getElementById('inv-payment').innerText = order.paymentMethod;
-            document.getElementById('inv-trx').innerText = order.trxId ? `TrxID: ${order.trxId}` : '';
-            document.getElementById('inv-status').innerText = order.status;
+            setText('inv-shop-name', 'TAHAM');
+            setText('inv-shop-address', storeSettings.shopAddress || 'Rayerbag, Dhaka, Bangladesh');
+            setText('inv-shop-phone', 'Helpline / WhatsApp: +880 1400-570014');
+            setText('inv-order-id', orderNo);
+            setText('inv-order-no', orderNo);
+            setText('inv-order-date', fmtDate(order.createdAt) || order.dateStr || '');
+            setText('inv-cust-name', order.customerName || '');
+            setText('inv-cust-phone', order.customerPhone || '');
+            setText('inv-cust-address', order.customerAddress || '');
+            setText('inv-courier', order.courier || order.deliveryMethod || order.courierName || order.shippingMethod || order.deliveryType || (isCOD ? 'Cash on Delivery' : paymentRaw) || '');
+            setText('inv-status', order.status || '');
+            setText('inv-payment', paymentRaw);
+            setText('inv-trx', order.trxId ? `TrxID: ${order.trxId}` : '');
+
+            const setPayment = (id, active) => {
+                const el = document.getElementById(id);
+                if (!el) return;
+                el.classList.toggle('active', active);
+                el.setAttribute('aria-checked', active ? 'true' : 'false');
+            };
+            setPayment('inv-payment-cash', isCOD);
+            setPayment('inv-payment-bkash', isBkash);
+            setPayment('inv-payment-nagad', isNagad);
 
             const tbody = document.getElementById('inv-items-tbody');
-            tbody.innerHTML = (order.items || []).map(item => `
+            tbody.innerHTML = items.map((item, k) => {
+                const qty = Number(item.qty || 1) || 1;
+                const rate = Number(item.price || 0) || 0;
+                const total = rate * qty;
+                const customNote = item.customDesignNote || item.customDesignNotes || item.customDesign || item.designNote || (k === 0 ? order.customDesignNotes : '');
+                return `
                 <tr>
-                    <td class="py-2 font-semibold text-slate-900">${esc(item.name)}${item.color ? `<div class="text-[10px] font-normal text-slate-500"><span>Colour:</span> <span>${esc(item.color)}</span></div>` : ''}</td>
-                    <td class="py-2 text-center">${esc(item.size)}</td>
-                    <td class="py-2 text-center">${item.qty}</td>
-                    <td class="py-2 text-right">৳ ${Number(item.price).toLocaleString('en-US')}${Number(item.originalPrice) > Number(item.price) ? `<div class="text-[10px] text-slate-400 line-through">৳ ${Number(item.originalPrice).toLocaleString('en-US')}</div>` : ''}</td>
-                    <td class="py-2 text-right font-bold">৳ ${(item.price * item.qty).toLocaleString('en-US')}</td>
-                </tr>
-            `).join('');
+                    <td class="invoice-sl">${k + 1}</td>
+                    <td><strong>${esc(item.name || '')}</strong>${item.color ? `<div class="invoice-item-meta">Colour: ${esc(item.color)}</div>` : ''}${customNote ? `<div class="invoice-custom-note"><span>Custom Design Note:</span> ${esc(customNote)}</div>` : ''}</td>
+                    <td class="invoice-center">${esc(item.size || '')}</td>
+                    <td class="invoice-center">${qty}</td>
+                    <td class="invoice-right">${money(rate)}${Number(item.originalPrice) > rate ? `<div class="invoice-original-price">${money(item.originalPrice)}</div>` : ''}</td>
+                    <td class="invoice-right"><strong>${money(total)}</strong></td>
+                </tr>`;
+            }).join('');
 
-            document.getElementById('inv-subtotal').innerText = `৳ ${Number(order.subtotal || order.total).toLocaleString('en-US')}`;
-            document.getElementById('inv-delivery').innerText = `৳ ${Number(order.deliveryCharge || 0).toLocaleString('en-US')}`;
-            document.getElementById('inv-total').innerText = `৳ ${Number(order.total).toLocaleString('en-US')}`;
+            const subtotal = order.subtotal !== undefined ? Number(order.subtotal || 0) : items.reduce((sum, item) => sum + (Number(item.price || 0) * (Number(item.qty || 1) || 1)), 0);
+            const delivery = Number(order.deliveryCharge || 0) || 0;
+            const discount = Number(order.discount || order.discountAmount || order.discountValue || 0) || 0;
+            const grandTotal = Number(order.total !== undefined ? order.total : Math.max(0, subtotal + delivery - discount)) || 0;
+            const advance = Number(order.advancePaid || order.advance || order.advancePaidAmount || 0) || 0;
+            const due = Math.max(0, grandTotal - advance);
+
+            setText('inv-subtotal', money(subtotal));
+            setText('inv-discount', money(discount));
+            setText('inv-delivery', money(delivery));
+            setText('inv-total', money(grandTotal));
+            setText('inv-advance', money(advance));
+            setText('inv-due', money(due));
 
             document.getElementById('invoice-modal').classList.remove('hidden');
             lucide.createIcons();
@@ -4742,7 +5051,6 @@ INDEX_HTML = r"""<!DOCTYPE html>
                 `;
             }).join('');
             lucide.createIcons();
-            initScrollReveal(grid);
             initTiltInteractions();
         };
 
@@ -5379,7 +5687,6 @@ INDEX_HTML = r"""<!DOCTYPE html>
                     </div>`;
             }).join('');
             lucide.createIcons();
-            initScrollReveal(grid);
             initTiltInteractions();
         };
 
@@ -5413,6 +5720,8 @@ INDEX_HTML = r"""<!DOCTYPE html>
                 const sale = Number(p.salePrice ?? p.price);
                 const hasDiscount = sale < price;
                 const pct = hasDiscount ? Math.round((1 - sale / price) * 100) : 0;
+                const stockToggle = document.getElementById('set-show-stock');
+                const showStockToCustomers = storeSettings.showStockToCustomers !== false && storeSettings.showStockToCustomers !== 'false' && (!stockToggle || stockToggle.checked);
                 const profitPerUnit = sale - Number(p.buyingPrice || 0);
                 const colorDots = (p.colors || []).map(c => `<span title="${esc(c.name)}" class="inline-block w-3 h-3 rounded-full border border-slate-300 align-middle" style="background:${esc(c.hex)}"></span>`).join(' ');
                 const stock = Number(p.stock ?? 0);
@@ -5450,7 +5759,6 @@ INDEX_HTML = r"""<!DOCTYPE html>
                 `;
             }).join('');
             lucide.createIcons();
-            initScrollReveal(grid);
             initTiltInteractions();
         };
 
@@ -5538,6 +5846,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
                 shopPhone: val('set-shop-phone') || storeSettings.shopPhone,
                 paymentNumber: val('set-payment-number') || storeSettings.paymentNumber,
                 shopAddress: val('set-shop-address') || storeSettings.shopAddress,
+                showStockToCustomers: document.getElementById('set-show-stock') ? document.getElementById('set-show-stock').checked : storeSettings.showStockToCustomers !== false,
                 adminUser: val('set-admin-user') || storeSettings.adminUser || '',
                 adminPass: val('set-admin-pass')
             };
@@ -5669,6 +5978,7 @@ DEFAULT_SETTINGS = {
     "shopPhone": "01400-570014",
     "paymentNumber": "01400-570014",
     "shopAddress": "Rayerbag, Dhaka, Bangladesh.",
+    "showStockToCustomers": True,
 }
 DELIVERY_OPTIONS = (60, 120)           # Dhaka / outside Dhaka (must match the radio buttons)
 PAYMENT_METHODS = ("Cash on Delivery", "bKash", "Nagad")
@@ -6534,12 +6844,17 @@ def settings_put():
     required_keys = ("shopName", "shopPhone", "paymentNumber", "shopAddress", "pageName", "theme")
     for key in DEFAULT_SETTINGS:
         if key in d:
+            if key == "showStockToCustomers":
+                raw = d.get(key)
+                s[key] = raw is True or str(raw).strip().lower() in ("true", "1", "on", "yes")
+                continue
             val = str(d.get(key, "")).strip()[:200]
             if key in required_keys and not val:
                 return err("Please fill in all the shop details.")
             s[key] = val
         elif key not in s:
-            s[key] = str(DEFAULT_SETTINGS.get(key, "")).strip()
+            default = DEFAULT_SETTINGS.get(key, "")
+            s[key] = default if isinstance(default, bool) else str(default).strip()
 
     if not str(s.get("pageName", "")).strip():
         s["pageName"] = str(s.get("shopName", "Taham")).strip() or "Taham"
@@ -7502,6 +7817,140 @@ INDEX_HTML = r"""<!DOCTYPE html>
 
         button:not(:disabled):active { animation: spring-press 180ms ease-out; }
 
+        /* Custom Taham Official Invoice / Cash Memo Pad */
+        .invoice-pad {
+            position: relative;
+            overflow: hidden;
+            background: #ffffff;
+            color: #172033;
+            border: 1px solid #d8dee9;
+            border-radius: 14px;
+            padding: 18px;
+            font-size: 12px;
+            line-height: 1.45;
+            box-shadow: 0 10px 28px rgba(11,31,58,0.10);
+        }
+
+        .invoice-pad * { position: relative; z-index: 1; }
+        .invoice-accent-stripe, .invoice-watermark { position: absolute; }
+
+        .invoice-accent-stripe {
+            top: 0;
+            left: 0;
+            right: 0;
+            height: 7px;
+            z-index: 3;
+            background: linear-gradient(90deg, #0b1f3a 0 33.333%, #c1121f 33.333% 66.666%, #d4af37 66.666% 100%);
+        }
+
+        .invoice-watermark {
+            top: 48%;
+            left: 50%;
+            z-index: 0;
+            transform: translate(-50%, -50%) rotate(-28deg) scale(1.25);
+            color: #0b1f3a;
+            opacity: 0.055;
+            font-size: 112px;
+            font-weight: 900;
+            letter-spacing: 0.08em;
+            white-space: nowrap;
+            pointer-events: none;
+            user-select: none;
+        }
+
+        .invoice-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: flex-start;
+            gap: 18px;
+            padding: 16px 2px 14px;
+            border-bottom: 2px solid #0b1f3a;
+            position: relative;
+            z-index: 2;
+        }
+
+        .invoice-brand { display: flex; align-items: center; gap: 12px; min-width: 0; }
+        .invoice-logo { width: 48px; height: 48px; object-fit: cover; border-radius: 10px; border: 1px solid #d8dee9; background: #fff; }
+        .invoice-title { margin: 0; color: #0b1f3a; font-size: 25px; line-height: 1; font-weight: 900; letter-spacing: 0.04em; }
+        .invoice-subtitle { margin: 4px 0 0; color: #c1121f; font-size: 11px; font-weight: 800; }
+        .invoice-address { margin: 4px 0 0; color: #526078; font-size: 11px; }
+
+        .invoice-order-heading { text-align: right; min-width: 180px; }
+        .invoice-badge { display: inline-block; padding: 7px 10px; background: #0b1f3a; color: #fff; border-radius: 7px; border: 1px solid #d4af37; font-size: 10px; font-weight: 900; letter-spacing: 0.09em; text-transform: uppercase; }
+        .invoice-helpline { margin: 7px 0 0; color: #526078; font-size: 10px; font-weight: 700; }
+
+        .invoice-info-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin: 14px 0; }
+        .invoice-box { background: #f8fafc; border: 1px solid #d8dee9; border-radius: 10px; padding: 11px; min-width: 0; }
+        .invoice-box-title { margin: 0 0 8px; padding-bottom: 6px; border-bottom: 1px solid #e2e8f0; color: #0b1f3a; font-size: 11px; font-weight: 900; letter-spacing: 0.04em; text-transform: uppercase; }
+        .invoice-label { margin: 7px 0 2px; color: #718096; font-size: 9px; font-weight: 800; text-transform: uppercase; letter-spacing: 0.04em; }
+        .invoice-value { margin: 0; color: #172033; font-size: 11px; font-weight: 700; overflow-wrap: anywhere; }
+        .invoice-address-value { white-space: pre-line; }
+        .invoice-order-row { display: flex; justify-content: space-between; gap: 10px; padding: 5px 0; border-bottom: 1px dashed #e2e8f0; }
+        .invoice-order-row:last-of-type { border-bottom: 0; }
+        .invoice-status { padding: 2px 7px; border-radius: 999px; background: #ecfdf5; color: #047857; border: 1px solid #a7f3d0; font-size: 9px; font-weight: 900; text-transform: uppercase; }
+
+        .invoice-table { width: 100%; border-collapse: collapse; margin: 14px 0; font-size: 10px; background: #fff; }
+        .invoice-table th, .invoice-table td { border: 1px solid #d8dee9; padding: 7px 6px; vertical-align: top; }
+        .invoice-table thead th { background: #0b1f3a; color: #fff; font-weight: 900; text-align: left; letter-spacing: 0.03em; text-transform: uppercase; }
+        .invoice-table tbody tr:nth-child(even) { background: #f8fafc; }
+        .invoice-sl { width: 34px; text-align: center; font-weight: 900; }
+        .invoice-center { text-align: center; }
+        .invoice-right { text-align: right; }
+        .invoice-item-meta { margin-top: 3px; color: #718096; font-size: 9px; font-weight: 600; }
+        .invoice-custom-note { margin-top: 5px; padding: 5px 6px; border-left: 3px solid #c1121f; background: #fff7f7; color: #172033; font-size: 9px; white-space: pre-line; }
+        .invoice-custom-note span { display: block; color: #c1121f; font-weight: 900; }
+        .invoice-original-price { color: #94a3b8; text-decoration: line-through; font-size: 9px; }
+
+        .invoice-summary-grid { display: grid; grid-template-columns: 1.1fr 0.9fr; gap: 12px; margin: 12px 0; align-items: start; }
+        .invoice-policy-box { border: 1px solid #d8dee9; background: #f8fafc; border-radius: 10px; padding: 10px; font-size: 10px; }
+        .invoice-policy-box ul { margin: 0; padding-left: 15px; }
+        .invoice-policy-box li { margin: 4px 0; }
+        .invoice-totals { border: 1px solid #d8dee9; border-radius: 10px; padding: 8px; background: #fff; }
+        .invoice-total-row { display: flex; justify-content: space-between; gap: 10px; padding: 5px 4px; border-bottom: 1px dashed #e2e8f0; }
+        .invoice-total-row:last-child { border-bottom: 0; }
+        .invoice-grand-total { background: #0b1f3a; color: #fff; border: 1px solid #d4af37; border-radius: 7px; margin-top: 6px; padding: 7px; font-weight: 900; }
+        .invoice-due-total { background: #fff7ed; color: #9a3412; border: 1px solid #fed7aa; border-radius: 7px; margin-top: 6px; padding: 7px; font-weight: 900; }
+
+        .invoice-payment-box { border: 1px solid #d8dee9; background: #f8fafc; border-radius: 10px; padding: 10px; margin: 12px 0; }
+        .invoice-payment-methods { display: flex; flex-wrap: wrap; gap: 7px; margin-top: 8px; }
+        .invoice-payment-option { display: inline-flex; align-items: center; gap: 6px; padding: 6px 9px; border: 1px solid #d8dee9; border-radius: 8px; background: #fff; color: #526078; font-size: 10px; font-weight: 800; opacity: 0.55; }
+        .invoice-check { display: inline-flex; width: 13px; height: 13px; align-items: center; justify-content: center; border: 1px solid #94a3b8; border-radius: 50%; background: #fff; color: transparent; font-size: 9px; font-weight: 900; }
+        .invoice-payment-option.active { opacity: 1; border-color: #c1121f; background: #fff1f2; color: #9f1239; box-shadow: 0 3px 10px rgba(193,18,31,0.12); }
+        .invoice-payment-option.active .invoice-check { background: #c1121f; border-color: #c1121f; color: #fff; }
+        .invoice-payment-note { margin: 5px 0 0; color: #526078; font-size: 9px; font-weight: 700; }
+
+        .invoice-signatures-footer { margin-top: 18px; }
+        .invoice-signatures { display: grid; grid-template-columns: 1fr 1fr; gap: 24px; padding: 20px 8px 10px; }
+        .invoice-signature { text-align: center; }
+        .invoice-signature-line { display: block; height: 34px; border-bottom: 1px solid #0b1f3a; margin-bottom: 6px; }
+        .invoice-signature p { margin: 0; color: #172033; font-size: 10px; font-weight: 800; }
+        .invoice-footer-bar { padding: 10px 12px; background: #0b1f3a; color: #fff; border-radius: 8px; border-top: 2px solid #c1121f; text-align: center; font-size: 10px; font-weight: 800; letter-spacing: 0.02em; }
+
+        @media print {
+            @page { margin: 8mm; size: A4; }
+            body * { visibility: hidden !important; }
+            #invoice-print-area, #invoice-print-area * { visibility: visible !important; }
+            #invoice-print-area {
+                position: fixed !important;
+                inset: 0 !important;
+                z-index: 9999 !important;
+                width: 100% !important;
+                max-height: none !important;
+                overflow: visible !important;
+                margin: 0 !important;
+                padding: 14px !important;
+                border-radius: 0 !important;
+                box-shadow: none !important;
+                background: #fff !important;
+                color: #172033 !important;
+            }
+            #invoice-modal { position: static !important; max-height: none !important; overflow: visible !important; background: #fff !important; }
+            .no-print { display: none !important; }
+            .invoice-pad { -webkit-print-color-adjust: exact !important; print-color-adjust: exact !important; }
+            .invoice-accent-stripe, .invoice-badge, .invoice-table thead th, .invoice-grand-total, .invoice-footer-bar, .invoice-payment-option.active { -webkit-print-color-adjust: exact !important; print-color-adjust: exact !important; }
+            .invoice-watermark { opacity: 0.05 !important; }
+        }
+
         /* Floating 3D storefront footer */
         .footer-3d {
             position: relative;
@@ -7618,20 +8067,116 @@ INDEX_HTML = r"""<!DOCTYPE html>
             will-change: transform, transform-origin;
         }
         .discount-badge {
+            display: inline-grid;
+            place-items: center;
             z-index: 15;
-            padding: 0.45rem 0.8rem;
-            border-radius: 0.65rem;
-            background: linear-gradient(135deg, #e11d48 0%, #be123c 100%);
-            border: 1px solid rgba(255,255,255,0.35);
+            width: 5.5rem;
+            min-height: 4.25rem;
+            padding: 0;
+            border: 0;
+            background: transparent;
             color: #ffffff;
-            font-size: 0.9rem;
-            line-height: 1;
-            font-weight: 800;
-            letter-spacing: 0.01em;
+            font-weight: 900;
             text-transform: uppercase;
-            box-shadow: 0 10px 24px rgba(190,18,60,0.35), 0 2px 0 rgba(15,23,42,0.25), inset 0 1px 0 rgba(255,255,255,0.35);
-            transform: rotate(3deg);
+            transform: rotate(5deg);
+            transform-style: preserve-3d;
+            isolation: isolate;
+            filter: drop-shadow(0 12px 16px rgba(15,23,42,0.32));
+            pointer-events: none;
         }
+
+        .discount-badge::before {
+            content: "";
+            position: absolute;
+            inset: 0.45rem -0.25rem -0.45rem 0.45rem;
+            z-index: -2;
+            background: linear-gradient(135deg, #fbbf24 0%, #f59e0b 55%, #d97706 100%);
+            clip-path: polygon(10% 0, 90% 0, 100% 18%, 100% 100%, 0 100%, 0 18%);
+        }
+
+        .discount-badge::after {
+            content: "";
+            position: absolute;
+            right: -0.35rem;
+            bottom: -0.3rem;
+            width: 0.95rem;
+            height: 0.95rem;
+            z-index: -1;
+            background: #f59e0b;
+            transform: rotate(45deg);
+            box-shadow: inset 0 1px 0 rgba(255,255,255,0.35);
+        }
+
+        .discount-badge-shadow {
+            position: absolute;
+            inset: 0.55rem -0.5rem -0.55rem 0.55rem;
+            z-index: -3;
+            background: linear-gradient(135deg, #b45309 0%, #92400e 100%);
+            clip-path: polygon(10% 0, 90% 0, 100% 18%, 100% 100%, 0 100%, 0 18%);
+        }
+
+        .discount-badge-layer {
+            position: absolute;
+            inset: 0.25rem -0.3rem -0.25rem 0.25rem;
+            z-index: -1;
+            background: linear-gradient(135deg, #ff6b4a 0%, #f43f5e 55%, #e11d48 100%);
+            clip-path: polygon(10% 0, 90% 0, 100% 18%, 100% 100%, 0 100%, 0 18%);
+            box-shadow: inset 0 1px 0 rgba(255,255,255,0.30);
+        }
+
+        .discount-badge-navy {
+            position: relative;
+            z-index: 2;
+            width: 100%;
+            padding: 0.48rem 0.35rem 0.42rem;
+            background: linear-gradient(135deg, #0f172a 0%, #172554 100%);
+            border: 1px solid rgba(255,255,255,0.24);
+            border-bottom: 0;
+            clip-path: polygon(12% 0, 88% 0, 100% 18%, 100% 100%, 0 100%, 0 18%);
+            color: #ffffff;
+            font-size: 0.98rem;
+            line-height: 1;
+            font-weight: 900;
+            letter-spacing: -0.01em;
+            text-align: center;
+            transform: translateY(-2px);
+            box-shadow: inset 0 1px 0 rgba(255,255,255,0.22), 0 2px 0 rgba(15,23,42,0.45);
+        }
+
+        .discount-badge-ribbon {
+            position: relative;
+            z-index: 3;
+            width: 116%;
+            margin-top: -0.35rem;
+            padding: 0.25rem 0.25rem;
+            background: linear-gradient(135deg, #ff6b4a 0%, #e11d48 100%);
+            border: 1px solid rgba(255,255,255,0.30);
+            border-radius: 0.2rem;
+            color: #ffffff;
+            font-size: 0.58rem;
+            line-height: 1;
+            font-weight: 900;
+            letter-spacing: 0.13em;
+            text-align: center;
+            transform: rotate(-2deg);
+            box-shadow: 0 4px 0 #9f1239, 0 7px 12px rgba(15,23,42,0.22), inset 0 1px 0 rgba(255,255,255,0.28);
+        }
+
+        .discount-badge-accent {
+            position: absolute;
+            z-index: 4;
+            width: 0.48rem;
+            height: 0.48rem;
+            background: #fbbf24;
+            box-shadow: inset 0 1px 0 rgba(255,255,255,0.35), 0 2px 3px rgba(15,23,42,0.25);
+        }
+
+        .discount-badge-accent-one { top: -0.28rem; left: -0.28rem; transform: rotate(45deg); background: #fde68a; }
+        .discount-badge-accent-two { bottom: -0.22rem; left: 0.32rem; border-radius: 50%; background: #ef4444; }
+        .discount-badge-accent-three { top: 0.48rem; right: -0.28rem; transform: rotate(45deg); background: #f59e0b; }
+
+        .stock-switch input:checked + span { background-color: var(--brand-600); }
+        .stock-switch input:checked + span > span { transform: translateX(1.25rem); }
 
         .bg-brand-50 { background-color: var(--brand-50) !important; }
         .bg-brand-100 { background-color: var(--brand-100) !important; }
@@ -8302,6 +8847,19 @@ INDEX_HTML = r"""<!DOCTYPE html>
                                 <div id="theme-selector" class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3" data-selected="classic-pink"></div>
                             </div>
 
+                            <div class="pt-4 border-t border-slate-100">
+                                <label class="flex items-center justify-between gap-4 rounded-xl border border-slate-200 bg-slate-50 p-4 cursor-pointer">
+                                    <span>
+                                        <span class="block text-sm font-bold text-slate-900">Show Stock Count to Customers</span>
+                                        <span class="block text-xs text-slate-500 mt-1">Show or hide `Stock: XX` on public storefront product cards.</span>
+                                    </span>
+                                    <span class="stock-switch relative inline-flex h-7 w-12 shrink-0 items-center rounded-full bg-slate-300 transition-colors">
+                                        <input type="checkbox" id="set-show-stock" checked onchange="renderProducts()" role="switch" aria-label="Show Stock Count to Customers" class="peer sr-only">
+                                        <span class="absolute left-1 h-5 w-5 rounded-full bg-white shadow transition-transform"></span>
+                                    </span>
+                                </label>
+                            </div>
+
                             <button type="submit" class="w-full py-3 rounded-xl bg-slate-900 hover:bg-slate-800 text-white font-bold shadow-md transition-all mt-4">
                                 Save Page Setup
                             </button>
@@ -8591,73 +9149,119 @@ INDEX_HTML = r"""<!DOCTYPE html>
     <!-- ========================================== -->
     <div id="invoice-modal" class="fixed inset-0 z-50 hidden flex items-center justify-center p-4">
         <div onclick="closeInvoiceModal()" class="fixed inset-0 bg-slate-900/75 backdrop-blur-sm no-print"></div>
-        <div class="bg-white rounded-2xl max-w-xl w-full p-6 sm:p-8 relative z-10 shadow-2xl max-h-[92vh] overflow-y-auto">
+        <div class="bg-white rounded-2xl max-w-4xl w-full p-6 sm:p-8 relative z-10 shadow-2xl max-h-[92vh] overflow-y-auto">
             <!-- Printable Area -->
-            <div id="invoice-print-area" class="space-y-5 text-slate-800">
-                <div class="flex justify-between items-start border-b-2 border-slate-900 pb-4">
-                    <div>
-                        <div class="flex items-center gap-2.5"><img src="/logo.png?v=2" alt="" class="w-10 h-10 rounded-lg"><h2 id="inv-shop-name" class="text-2xl font-bold text-slate-900">Taham</h2></div>
-                        <p id="inv-shop-address" class="text-xs text-slate-500 mt-0.5">Dhaka, Bangladesh</p>
-                        <p id="inv-shop-phone" class="text-xs text-slate-600 font-semibold">Mobile: 01700-000000</p>
-                    </div>
-                    <div class="text-right">
-                        <span class="px-3 py-1 bg-slate-900 text-white text-xs font-bold uppercase tracking-wider rounded">CASH MEMO</span>
-                        <p id="inv-order-id" class="text-sm font-bold mt-2 text-slate-900">#ORD-000000</p>
-                        <p id="inv-order-date" class="text-[11px] text-slate-500"></p>
-                    </div>
-                </div>
+            <div id="invoice-print-area" class="invoice-pad">
+                <div class="invoice-accent-stripe" aria-hidden="true"></div>
+                <div class="invoice-watermark" aria-hidden="true">TAHAM</div>
 
-                <div class="grid grid-cols-2 gap-4 bg-slate-50 p-3.5 rounded-xl border border-slate-200 text-xs">
-                    <div>
-                        <p class="text-slate-400 font-semibold uppercase">Bill To:</p>
-                        <p id="inv-cust-name" class="font-bold text-sm text-slate-900 mt-0.5"></p>
-                        <p id="inv-cust-phone" class="text-slate-700 font-medium"></p>
-                        <p id="inv-cust-address" class="text-slate-600 mt-0.5"></p>
+                <header class="invoice-header">
+                    <div class="invoice-brand">
+                        <img src="/logo.png?v=2" alt="TAHAM" class="invoice-logo">
+                        <div>
+                            <h2 id="inv-shop-name" class="invoice-title">TAHAM</h2>
+                            <p class="invoice-subtitle">Premium &amp; Custom Fashion Wear</p>
+                            <p id="inv-shop-address" class="invoice-address">Rayerbag, Dhaka, Bangladesh</p>
+                        </div>
                     </div>
-                    <div class="text-right">
-                        <p class="text-slate-400 font-semibold uppercase">Payment & Status:</p>
-                        <p id="inv-payment" class="font-bold text-slate-900 mt-0.5"></p>
-                        <p id="inv-trx" class="text-slate-500"></p>
-                        <span id="inv-status" class="inline-block mt-1 px-2 py-0.5 rounded bg-emerald-100 text-emerald-800 font-bold"></span>
+                    <div class="invoice-order-heading">
+                        <span class="invoice-badge">INVOICE / CASH MEMO</span>
+                        <p class="invoice-helpline">Helpline / WhatsApp: +880 1400-570014</p>
                     </div>
-                </div>
+                </header>
 
-                <!-- Items Table -->
-                <table class="w-full text-left border-collapse text-xs">
+                <section class="invoice-info-grid">
+                    <div class="invoice-box invoice-customer-box">
+                        <h4 class="invoice-box-title">Customer Information</h4>
+                        <p class="invoice-label">Customer Name</p>
+                        <p id="inv-cust-name" class="invoice-value"></p>
+                        <p class="invoice-label">Phone Number</p>
+                        <p id="inv-cust-phone" class="invoice-value"></p>
+                        <p class="invoice-label">Delivery Address</p>
+                        <p id="inv-cust-address" class="invoice-value invoice-address-value"></p>
+                    </div>
+
+                    <div class="invoice-box invoice-order-box">
+                        <h4 class="invoice-box-title">Order Details</h4>
+                        <div class="invoice-order-row">
+                            <span class="invoice-label">Memo / Invoice No</span>
+                            <span id="inv-order-id" class="invoice-value">#ORD-000000</span>
+                        </div>
+                        <div class="invoice-order-row">
+                            <span class="invoice-label">Order Date</span>
+                            <span id="inv-order-date" class="invoice-value"></span>
+                        </div>
+                        <div class="invoice-order-row">
+                            <span class="invoice-label">Courier / Delivery Method</span>
+                            <span id="inv-courier" class="invoice-value"></span>
+                        </div>
+                        <div class="invoice-order-row">
+                            <span class="invoice-label">Status</span>
+                            <span id="inv-status" class="invoice-status"></span>
+                        </div>
+                        <p id="inv-order-no" class="hidden" aria-hidden="true"></p>
+                        <p id="inv-shop-phone" class="hidden" aria-hidden="true"></p>
+                    </div>
+                </section>
+
+                <table class="invoice-table">
                     <thead>
-                        <tr class="border-b border-slate-300 text-slate-600">
-                            <th class="py-2">Item Description</th>
-                            <th class="py-2 text-center">Size</th>
-                            <th class="py-2 text-center">Qty</th>
-                            <th class="py-2 text-right">Rate</th>
-                            <th class="py-2 text-right">Total</th>
+                        <tr>
+                            <th class="invoice-sl">SL</th>
+                            <th>Item Description &amp; Custom Design Note</th>
+                            <th class="invoice-center">Size</th>
+                            <th class="invoice-center">Qty</th>
+                            <th class="invoice-right">Rate</th>
+                            <th class="invoice-right">Total</th>
                         </tr>
                     </thead>
-                    <tbody id="inv-items-tbody" class="divide-y divide-slate-200">
-                    </tbody>
+                    <tbody id="inv-items-tbody"></tbody>
                 </table>
 
-                <!-- Totals -->
-                <div class="border-t-2 border-slate-900 pt-3 flex justify-end">
-                    <div class="w-56 space-y-1 text-xs">
-                        <div class="flex justify-between">
-                            <span class="text-slate-600">Subtotal:</span>
-                            <span id="inv-subtotal" class="font-semibold">৳ 0</span>
+                <section class="invoice-summary-grid">
+                    <div class="invoice-policy-box">
+                        <h4 class="invoice-box-title">Return &amp; Exchange Policy</h4>
+                        <ul>
+                            <li>Unused items can be returned or exchanged within 3 days with original receipt.</li>
+                            <li>No exchange on custom design, sale, damaged, altered, or used items.</li>
+                            <li>Custom design instructions are recorded on the itemized order line.</li>
+                        </ul>
+                    </div>
+
+                    <div class="invoice-totals">
+                        <div class="invoice-total-row"><span>Sub-Total</span><span id="inv-subtotal">৳ 0</span></div>
+                        <div class="invoice-total-row"><span>Discount</span><span id="inv-discount">৳ 0</span></div>
+                        <div class="invoice-total-row"><span>Delivery Charge</span><span id="inv-delivery">৳ 0</span></div>
+                        <div class="invoice-total-row invoice-grand-total"><span>Grand Total</span><span id="inv-total">৳ 0</span></div>
+                        <div class="invoice-total-row"><span>Advance Paid</span><span id="inv-advance">৳ 0</span></div>
+                        <div class="invoice-total-row invoice-due-total"><span>Due / Cash on Delivery</span><span id="inv-due">৳ 0</span></div>
+                    </div>
+                </section>
+
+                <section class="invoice-payment-box">
+                    <h4 class="invoice-box-title">Payment Method</h4>
+                    <div class="invoice-payment-methods">
+                        <span id="inv-payment-cash" class="invoice-payment-option"><span class="invoice-check">✓</span> COD / Cash on Delivery</span>
+                        <span id="inv-payment-bkash" class="invoice-payment-option"><span class="invoice-check">✓</span> bKash</span>
+                        <span id="inv-payment-nagad" class="invoice-payment-option"><span class="invoice-check">✓</span> Nagad</span>
+                    </div>
+                    <p id="inv-payment" class="invoice-payment-note"></p>
+                    <p id="inv-trx" class="invoice-payment-note"></p>
+                </section>
+
+                <footer class="invoice-signatures-footer">
+                    <div class="invoice-signatures">
+                        <div class="invoice-signature">
+                            <span class="invoice-signature-line"></span>
+                            <p>Customer Signature</p>
                         </div>
-                        <div class="flex justify-between">
-                            <span class="text-slate-600">Delivery Charge:</span>
-                            <span id="inv-delivery" class="font-semibold">৳ 0</span>
-                        </div>
-                        <div class="flex justify-between text-base font-bold text-slate-900 pt-1.5 border-t border-slate-200">
-                            <span>Total Bill:</span>
-                            <span id="inv-total">৳ 0</span>
+                        <div class="invoice-signature">
+                            <span class="invoice-signature-line"></span>
+                            <p>Authorized Signature (Taham)</p>
                         </div>
                     </div>
-                </div>
-
-                <div class="text-center text-[11px] text-slate-400 pt-4 border-t border-dashed border-slate-200">
-                    Thank you for shopping with us! To exchange a product, contact us with the receipt within 3 days.
-                </div>
+                    <div class="invoice-footer-bar">Thank you for shopping with TAHAM! For any query, call or WhatsApp: +880 1400-570014</div>
+                </footer>
             </div>
 
             <!-- Modal Action Buttons -->
@@ -9572,6 +10176,10 @@ INDEX_HTML = r"""<!DOCTYPE html>
                 const el = document.getElementById(id);
                 if (el) el.value = value || '';
             };
+            const setChecked = (id, checked) => {
+                const el = document.getElementById(id);
+                if (el) el.checked = checked;
+            };
 
             document.title = pageName;
             document.getElementById('header-shop-name').innerText = pageName;
@@ -9599,6 +10207,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
             setValue('set-shop-address', storeSettings.shopAddress);
             setValue('set-admin-user', storeSettings.adminUser || '');
             setValue('set-admin-pass', '');
+            setChecked('set-show-stock', storeSettings.showStockToCustomers !== false && storeSettings.showStockToCustomers !== 'false');
 
             const accessAdmin = document.getElementById('access-admin-user');
             if (accessAdmin) accessAdmin.innerText = storeSettings.adminUser || shopName;
@@ -9610,6 +10219,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
 
             applyTheme(storeSettings.theme || 'classic-pink');
             renderThemeSelector();
+            renderProducts();
         }
 
         function updatePendingBadge() {
@@ -9897,6 +10507,8 @@ INDEX_HTML = r"""<!DOCTYPE html>
                 const sale = Number(product.salePrice ?? product.price);
                 const hasDiscount = sale < price;
                 const pct = hasDiscount ? Math.round((1 - sale / price) * 100) : 0;
+                const stockToggle = document.getElementById('set-show-stock');
+                const showStockToCustomers = storeSettings.showStockToCustomers !== false && storeSettings.showStockToCustomers !== 'false' && (!stockToggle || stockToggle.checked);
 
                 return `
                     <div class="product-card tilt-3d reveal bg-white/90 backdrop-blur-sm rounded-2xl border border-slate-200 overflow-hidden shadow-sm flex flex-col group">
@@ -9909,8 +10521,16 @@ INDEX_HTML = r"""<!DOCTYPE html>
                                  onmouseleave="endInPlaceZoom(this)"
                                  class="product-image-zoom zoomable-image w-full h-full object-cover ${isOutOfStock ? 'grayscale opacity-60' : ''}">
                             <span class="absolute top-3 left-3 bg-white/85 backdrop-blur-md text-slate-800 text-xs font-bold px-3 py-1 rounded-lg shadow-sm border border-white/50">${esc(product.category)}</span>
-                            <span class="absolute right-3 ${hasDiscount ? 'top-14' : 'top-3'} ${isOutOfStock ? 'bg-rose-600 text-white' : (stock < 5 ? 'bg-amber-500 text-white' : 'bg-emerald-600 text-white')} text-[11px] font-bold px-2.5 py-1 rounded-lg shadow-sm">${isOutOfStock ? 'Out of Stock' : esc(t('Stock: {n}', { n: stock }))}</span>
-                            ${hasDiscount ? `<span class="discount-badge absolute top-3 right-3">${esc(t('{pct}% OFF', { pct }))}</span>` : ''}
+                            ${isOutOfStock ? `<span class="absolute right-3 ${hasDiscount ? 'top-20' : 'top-3'} bg-rose-600 text-white text-[11px] font-bold px-2.5 py-1 rounded-lg shadow-sm">${esc(t('Out of Stock'))}</span>` : (showStockToCustomers ? `<span class="absolute right-3 ${hasDiscount ? 'top-20' : 'top-3'} ${stock < 5 ? 'bg-amber-500 text-white' : 'bg-emerald-600 text-white'} text-[11px] font-bold px-2.5 py-1 rounded-lg shadow-sm">${esc(t('Stock: {n}', { n: stock }))}</span>` : '')}
+                            ${hasDiscount ? `<span class="discount-badge absolute top-3 right-3" role="img" aria-label="${esc(`${pct}% discount`)}">
+                                <span class="discount-badge-shadow" aria-hidden="true"></span>
+                                <span class="discount-badge-layer" aria-hidden="true"></span>
+                                <span class="discount-badge-navy">${esc(t('{pct}%', { pct }))}</span>
+                                <span class="discount-badge-ribbon">${esc(t('DISCOUNT'))}</span>
+                                <span class="discount-badge-accent discount-badge-accent-one" aria-hidden="true"></span>
+                                <span class="discount-badge-accent discount-badge-accent-two" aria-hidden="true"></span>
+                                <span class="discount-badge-accent discount-badge-accent-three" aria-hidden="true"></span>
+                            </span>` : ''}
                             ${shownPhoto.color ? `<span class="absolute bottom-3 right-3 bg-white/85 backdrop-blur-md text-slate-800 text-[11px] font-bold px-2.5 py-1 rounded-lg shadow-sm border border-white/50 flex items-center gap-1.5"><span class="w-3 h-3 rounded-full border border-slate-300" style="background:${esc((colors.find(c => c.name === shownPhoto.color) || {}).hex || '#ccc')}"></span><span>${esc(shownPhoto.color)}</span></span>` : ''}
                         </div>
 
@@ -10206,33 +10826,77 @@ INDEX_HTML = r"""<!DOCTYPE html>
         // ==========================================
         window.openInvoiceModal = function(order) {
             currentInvoice = order;
-            document.getElementById('inv-shop-name').innerText = storeSettings.shopName;
-            document.getElementById('inv-shop-address').innerText = storeSettings.shopAddress;
-            document.getElementById('inv-shop-phone').innerText = t('Helpline: {p}', { p: storeSettings.shopPhone });
+            order = order || {};
+            const items = Array.isArray(order.items) ? order.items : [];
+            const paymentRaw = String(order.paymentMethod || '').trim();
+            const paymentLower = paymentRaw.toLowerCase();
+            const isBkash = paymentLower.includes('bkash');
+            const isNagad = paymentLower.includes('nagad');
+            const isCOD = !isBkash && !isNagad;
+            const orderNo = `#${order.orderNumber || (order.id ? order.id.slice(0, 8) : 'ORD-000000')}`;
+            const money = (value) => {
+                const n = Number(value || 0);
+                return `৳ ${(Number.isFinite(n) ? n : 0).toLocaleString('en-US')}`;
+            };
+            const setText = (id, value) => {
+                const el = document.getElementById(id);
+                if (el) el.innerText = value == null ? '' : String(value);
+            };
 
-            document.getElementById('inv-order-id').innerText = `#${order.orderNumber || order.id.slice(0, 8)}`;
-            document.getElementById('inv-order-date').innerText = fmtDate(order.createdAt) || order.dateStr || '';
-            document.getElementById('inv-cust-name').innerText = order.customerName;
-            document.getElementById('inv-cust-phone').innerText = order.customerPhone;
-            document.getElementById('inv-cust-address').innerText = order.customerAddress;
-            document.getElementById('inv-payment').innerText = order.paymentMethod;
-            document.getElementById('inv-trx').innerText = order.trxId ? `TrxID: ${order.trxId}` : '';
-            document.getElementById('inv-status').innerText = order.status;
+            setText('inv-shop-name', 'TAHAM');
+            setText('inv-shop-address', storeSettings.shopAddress || 'Rayerbag, Dhaka, Bangladesh');
+            setText('inv-shop-phone', 'Helpline / WhatsApp: +880 1400-570014');
+            setText('inv-order-id', orderNo);
+            setText('inv-order-no', orderNo);
+            setText('inv-order-date', fmtDate(order.createdAt) || order.dateStr || '');
+            setText('inv-cust-name', order.customerName || '');
+            setText('inv-cust-phone', order.customerPhone || '');
+            setText('inv-cust-address', order.customerAddress || '');
+            setText('inv-courier', order.courier || order.deliveryMethod || order.courierName || order.shippingMethod || order.deliveryType || (isCOD ? 'Cash on Delivery' : paymentRaw) || '');
+            setText('inv-status', order.status || '');
+            setText('inv-payment', paymentRaw);
+            setText('inv-trx', order.trxId ? `TrxID: ${order.trxId}` : '');
+
+            const setPayment = (id, active) => {
+                const el = document.getElementById(id);
+                if (!el) return;
+                el.classList.toggle('active', active);
+                el.setAttribute('aria-checked', active ? 'true' : 'false');
+            };
+            setPayment('inv-payment-cash', isCOD);
+            setPayment('inv-payment-bkash', isBkash);
+            setPayment('inv-payment-nagad', isNagad);
 
             const tbody = document.getElementById('inv-items-tbody');
-            tbody.innerHTML = (order.items || []).map(item => `
+            tbody.innerHTML = items.map((item, k) => {
+                const qty = Number(item.qty || 1) || 1;
+                const rate = Number(item.price || 0) || 0;
+                const total = rate * qty;
+                const customNote = item.customDesignNote || item.customDesignNotes || item.customDesign || item.designNote || (k === 0 ? order.customDesignNotes : '');
+                return `
                 <tr>
-                    <td class="py-2 font-semibold text-slate-900">${esc(item.name)}${item.color ? `<div class="text-[10px] font-normal text-slate-500"><span>Colour:</span> <span>${esc(item.color)}</span></div>` : ''}</td>
-                    <td class="py-2 text-center">${esc(item.size)}</td>
-                    <td class="py-2 text-center">${item.qty}</td>
-                    <td class="py-2 text-right">৳ ${Number(item.price).toLocaleString('en-US')}${Number(item.originalPrice) > Number(item.price) ? `<div class="text-[10px] text-slate-400 line-through">৳ ${Number(item.originalPrice).toLocaleString('en-US')}</div>` : ''}</td>
-                    <td class="py-2 text-right font-bold">৳ ${(item.price * item.qty).toLocaleString('en-US')}</td>
-                </tr>
-            `).join('');
+                    <td class="invoice-sl">${k + 1}</td>
+                    <td><strong>${esc(item.name || '')}</strong>${item.color ? `<div class="invoice-item-meta">Colour: ${esc(item.color)}</div>` : ''}${customNote ? `<div class="invoice-custom-note"><span>Custom Design Note:</span> ${esc(customNote)}</div>` : ''}</td>
+                    <td class="invoice-center">${esc(item.size || '')}</td>
+                    <td class="invoice-center">${qty}</td>
+                    <td class="invoice-right">${money(rate)}${Number(item.originalPrice) > rate ? `<div class="invoice-original-price">${money(item.originalPrice)}</div>` : ''}</td>
+                    <td class="invoice-right"><strong>${money(total)}</strong></td>
+                </tr>`;
+            }).join('');
 
-            document.getElementById('inv-subtotal').innerText = `৳ ${Number(order.subtotal || order.total).toLocaleString('en-US')}`;
-            document.getElementById('inv-delivery').innerText = `৳ ${Number(order.deliveryCharge || 0).toLocaleString('en-US')}`;
-            document.getElementById('inv-total').innerText = `৳ ${Number(order.total).toLocaleString('en-US')}`;
+            const subtotal = order.subtotal !== undefined ? Number(order.subtotal || 0) : items.reduce((sum, item) => sum + (Number(item.price || 0) * (Number(item.qty || 1) || 1)), 0);
+            const delivery = Number(order.deliveryCharge || 0) || 0;
+            const discount = Number(order.discount || order.discountAmount || order.discountValue || 0) || 0;
+            const grandTotal = Number(order.total !== undefined ? order.total : Math.max(0, subtotal + delivery - discount)) || 0;
+            const advance = Number(order.advancePaid || order.advance || order.advancePaidAmount || 0) || 0;
+            const due = Math.max(0, grandTotal - advance);
+
+            setText('inv-subtotal', money(subtotal));
+            setText('inv-discount', money(discount));
+            setText('inv-delivery', money(delivery));
+            setText('inv-total', money(grandTotal));
+            setText('inv-advance', money(advance));
+            setText('inv-due', money(due));
 
             document.getElementById('invoice-modal').classList.remove('hidden');
             lucide.createIcons();
@@ -10356,7 +11020,6 @@ INDEX_HTML = r"""<!DOCTYPE html>
                 `;
             }).join('');
             lucide.createIcons();
-            initScrollReveal(grid);
             initTiltInteractions();
         };
 
@@ -10993,7 +11656,6 @@ INDEX_HTML = r"""<!DOCTYPE html>
                     </div>`;
             }).join('');
             lucide.createIcons();
-            initScrollReveal(grid);
             initTiltInteractions();
         };
 
@@ -11027,6 +11689,8 @@ INDEX_HTML = r"""<!DOCTYPE html>
                 const sale = Number(p.salePrice ?? p.price);
                 const hasDiscount = sale < price;
                 const pct = hasDiscount ? Math.round((1 - sale / price) * 100) : 0;
+                const stockToggle = document.getElementById('set-show-stock');
+                const showStockToCustomers = storeSettings.showStockToCustomers !== false && storeSettings.showStockToCustomers !== 'false' && (!stockToggle || stockToggle.checked);
                 const profitPerUnit = sale - Number(p.buyingPrice || 0);
                 const colorDots = (p.colors || []).map(c => `<span title="${esc(c.name)}" class="inline-block w-3 h-3 rounded-full border border-slate-300 align-middle" style="background:${esc(c.hex)}"></span>`).join(' ');
                 const stock = Number(p.stock ?? 0);
@@ -11064,7 +11728,6 @@ INDEX_HTML = r"""<!DOCTYPE html>
                 `;
             }).join('');
             lucide.createIcons();
-            initScrollReveal(grid);
             initTiltInteractions();
         };
 
@@ -11152,6 +11815,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
                 shopPhone: val('set-shop-phone') || storeSettings.shopPhone,
                 paymentNumber: val('set-payment-number') || storeSettings.paymentNumber,
                 shopAddress: val('set-shop-address') || storeSettings.shopAddress,
+                showStockToCustomers: document.getElementById('set-show-stock') ? document.getElementById('set-show-stock').checked : storeSettings.showStockToCustomers !== false,
                 adminUser: val('set-admin-user') || storeSettings.adminUser || '',
                 adminPass: val('set-admin-pass')
             };
