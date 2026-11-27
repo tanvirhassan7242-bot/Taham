@@ -50,9 +50,11 @@ DEFAULT_ADMIN_USER = "taham@1234"      # used only the FIRST time (when taham.db
 DEFAULT_ADMIN_PASS = "taham@1234"      # change it later from Admin > Settings
 DEFAULT_SETTINGS = {
     "shopName": "Taham",
-    "shopPhone": "01700-000000",
-    "paymentNumber": "01700-000000",
-    "shopAddress": "New Market, Dhaka, Bangladesh",
+    "pageName": "Taham",
+    "theme": "classic-pink",
+    "shopPhone": "01400-570014",
+    "paymentNumber": "01400-570014",
+    "shopAddress": "Rayerbag, Dhaka, Bangladesh.",
 }
 DELIVERY_OPTIONS = (60, 120)           # Dhaka / outside Dhaka (must match the radio buttons)
 PAYMENT_METHODS = ("Cash on Delivery", "bKash", "Nagad")
@@ -220,11 +222,24 @@ def is_admin():
     return session.get("admin") is True
 
 
+def is_super_admin():
+    return session.get("admin") is True
+
+
 def admin_required(fn):
     @wraps(fn)
     def wrapper(*args, **kwargs):
         if not is_admin():
             return err("Admin login required", 401)
+        return fn(*args, **kwargs)
+    return wrapper
+
+
+def super_admin_required(fn):
+    @wraps(fn)
+    def wrapper(*args, **kwargs):
+        if not is_super_admin():
+            return err("Only the Super Admin can perform this action.", 403)
         return fn(*args, **kwargs)
     return wrapper
 
@@ -279,6 +294,17 @@ def _logo_bytes():
 @app.get("/logo.png")
 @app.get("/favicon.ico")
 def logo():
+    db = get_db()
+    logo_doc = get_doc(db, "settings", "logo")
+    if logo_doc and logo_doc.get("data"):
+        try:
+            image_bytes = base64.b64decode(logo_doc["data"])
+        except Exception:
+            image_bytes = _logo_bytes()
+        resp = Response(image_bytes, mimetype=logo_doc.get("mimetype") or "image/png")
+        resp.headers["Cache-Control"] = "no-store"
+        return resp
+
     resp = Response(_logo_bytes(), mimetype="image/png")
     resp.headers["Cache-Control"] = "public, max-age=86400"
     return resp
@@ -305,12 +331,66 @@ def no_cache_api(resp):
 
 
 # ------------------------------- auth -----------------------------------
+SUPER_ADMIN_ROLE = "Super Admin"
+USER_ROLES = ("Admin", "Manager", "Salesman", "Marketing")
+PERMISSION_DEFS = (
+    {"key": "viewOrders", "label": "View Orders"},
+    {"key": "editOrders", "label": "Edit Orders"},
+    {"key": "manageProducts", "label": "Manage Products & Stock"},
+    {"key": "addCollections", "label": "Add Collections"},
+    {"key": "deleteCollections", "label": "Delete Collections"},
+    {"key": "manageExpenses", "label": "Manage Daily Expenses"},
+    {"key": "viewProfit", "label": "View Profit/Revenue Stats"},
+    {"key": "accessSettings", "label": "Access Settings"},
+    {"key": "userManagement", "label": "User Management"},
+)
+PERMISSION_KEYS = tuple(p["key"] for p in PERMISSION_DEFS)
+DEFAULT_PERMISSIONS = {key: False for key in PERMISSION_KEYS}
+EMAIL_RE = re.compile(r"^[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}$")
+STRONG_PASSWORD_RE = re.compile(r"^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[^A-Za-z0-9]).{10,}$")
+
+
+def sanitize_permissions(d):
+    src = d if isinstance(d, dict) else {}
+    return {key: bool(src.get(key, False)) for key in PERMISSION_KEYS}
+
+
+def public_user(u):
+    return {
+        "id": u.get("id", ""),
+        "fullName": u.get("fullName", ""),
+        "role": u.get("role", "Marketing"),
+        "email": u.get("email", ""),
+        "permissions": sanitize_permissions(u.get("permissions")),
+        "isSuperAdmin": False,
+    }
+
+
+def super_admin_user():
+    db = get_db()
+    row = db.execute("SELECT username FROM admin WHERE id=1").fetchone()
+    username = row["username"] if row else "Super Admin"
+    return {
+        "id": "super-admin",
+        "fullName": username,
+        "role": SUPER_ADMIN_ROLE,
+        "email": "",
+        "permissions": {key: True for key in PERMISSION_KEYS},
+        "isSuperAdmin": True,
+    }
+
 _FAILS = {}
 
 
 @app.get("/api/me")
 def me():
-    return jsonify(admin=is_admin())
+    admin = is_admin()
+    return jsonify(
+        admin=admin,
+        role=SUPER_ADMIN_ROLE if admin else None,
+        isSuperAdmin=admin,
+        permissions={key: admin for key in PERMISSION_KEYS},
+    )
 
 
 @app.post("/api/login")
@@ -330,6 +410,7 @@ def login():
         return err("Wrong username or password!", 401)
     session.clear()
     session["admin"] = True
+    session["role"] = SUPER_ADMIN_ROLE
     session.permanent = True
     return jsonify(ok=True)
 
@@ -337,6 +418,80 @@ def login():
 @app.post("/api/logout")
 def logout():
     session.clear()
+    return jsonify(ok=True)
+
+
+@app.get("/api/users")
+@admin_required
+def users_list():
+    db = get_db()
+    users = [public_user(u) for u in list_docs(db, "users")]
+    users.sort(key=lambda u: (u.get("fullName") or u.get("email") or "").lower())
+    return jsonify(
+        users=users,
+        superAdmin=super_admin_user(),
+        roles=list(USER_ROLES),
+        permissionDefs=list(PERMISSION_DEFS),
+        isSuperAdmin=is_super_admin(),
+    )
+
+
+@app.post("/api/users")
+@admin_required
+def users_add():
+    d = body()
+    full_name = str(d.get("fullName", "")).strip()[:120]
+    role = str(d.get("role", "")).strip()
+    email = str(d.get("email", "")).strip().lower()[:200]
+    password = str(d.get("password", ""))
+
+    if not full_name:
+        return err("Full name is required.")
+    if role not in USER_ROLES or role == SUPER_ADMIN_ROLE:
+        return err("Invalid role. Super Admin is reserved for the primary owner account.")
+    if not EMAIL_RE.fullmatch(email):
+        return err("Please enter a strict valid email address.")
+    if not STRONG_PASSWORD_RE.fullmatch(password):
+        return err("Password must be at least 10 characters and include uppercase, lowercase, number, and special character.")
+
+    db = get_db()
+    if any(str(u.get("email", "")).lower() == email for u in list_docs(db, "users")):
+        return err("A user with this email already exists.", 409)
+
+    user = {
+        "id": secrets.token_hex(8),
+        "fullName": full_name,
+        "role": role,
+        "email": email,
+        "pw_hash": generate_password_hash(password),
+        "permissions": sanitize_permissions(d.get("permissions")),
+        "createdAt": now_ms(),
+    }
+    saved = save_doc(db, "users", user["id"], user)
+    return jsonify(public_user(saved)), 201
+
+
+@app.put("/api/users/<user_id>/permissions")
+@super_admin_required
+def user_permissions_update(user_id):
+    db = get_db()
+    user = get_doc(db, "users", user_id)
+    if not user:
+        return err("User not found.", 404)
+    user["permissions"] = sanitize_permissions(body().get("permissions"))
+    saved = save_doc(db, "users", user_id, user)
+    return jsonify(public_user(saved))
+
+
+@app.delete("/api/users/<user_id>")
+@super_admin_required
+def users_delete(user_id):
+    if user_id == "super-admin":
+        return err("Super Admin cannot be deleted.", 403)
+    db = get_db()
+    if not get_doc(db, "users", user_id):
+        return err("User not found.", 404)
+    db.execute("DELETE FROM docs WHERE col='users' AND id=?", (user_id,))
     return jsonify(ok=True)
 
 
@@ -513,6 +668,11 @@ def clean_collection(d):
         if len(img) > 3_000_000:
             raise ValueError("Image is too large, please use a smaller one.")
         out["image"] = img
+    if "productIds" in d:
+        ids = d.get("productIds") or []
+        if not isinstance(ids, list):
+            raise ValueError("Assigned products must be a list.")
+        out["productIds"] = [str(x) for x in ids if str(x).strip()]
     return out
 
 
@@ -657,6 +817,8 @@ def order_create():
             "orderNumber": "ORD-" + str(random.randint(100000, 999999)),
             "customerName": name, "customerPhone": phone, "customerAddress": address,
             "paymentMethod": method, "trxId": str(d.get("trxId", "")).strip()[:40],
+            "customDesignNotes": str(d.get("customDesignNotes", "")).strip()[:2000],
+            "referenceImage": str(d.get("referenceImage") or d.get("customDesignReferenceImage") or "").strip()[:8000000],
             "items": items, "subtotal": subtotal, "deliveryCharge": delivery,
             "total": subtotal + delivery, "totalCost": cost,
             "status": "Pending", "stockDeducted": True,
@@ -752,22 +914,65 @@ def settings_get():
 @admin_required
 def settings_put():
     d = body()
-    s = {}
+    db = get_db()
+    s = dict(get_doc(db, "settings", "store_config") or DEFAULT_SETTINGS)
+
+    required_keys = ("shopName", "shopPhone", "paymentNumber", "shopAddress", "pageName", "theme")
     for key in DEFAULT_SETTINGS:
-        val = str(d.get(key, "")).strip()[:200]
-        if not val:
-            return err("Please fill in all the shop details.")
-        s[key] = val
+        if key in d:
+            val = str(d.get(key, "")).strip()[:200]
+            if key in required_keys and not val:
+                return err("Please fill in all the shop details.")
+            s[key] = val
+        elif key not in s:
+            s[key] = str(DEFAULT_SETTINGS.get(key, "")).strip()
+
+    if not str(s.get("pageName", "")).strip():
+        s["pageName"] = str(s.get("shopName", "Taham")).strip() or "Taham"
+    if not str(s.get("theme", "")).strip():
+        s["theme"] = "classic-pink"
+
+    s.pop("id", None)
+    s.pop("adminUser", None)
+    s.pop("adminPass", None)
+
     user, pw = str(d.get("adminUser", "")).strip()[:60], str(d.get("adminPass", ""))
     if pw and len(pw) < 4:
         return err("Password must be at least 4 characters.")
-    db = get_db()
+
     save_doc(db, "settings", "store_config", s)
     if user:
         db.execute("UPDATE admin SET username=? WHERE id=1", (user,))
     if pw:
         db.execute("UPDATE admin SET pw_hash=? WHERE id=1", (generate_password_hash(pw),))
     return jsonify(ok=True)
+
+
+@app.post("/api/logo")
+@admin_required
+def logo_upload():
+    data_url = str(body().get("dataUrl", "")).strip()
+    if not data_url.startswith("data:image/") or "," not in data_url:
+        return err("Please choose an image file.")
+
+    header, encoded = data_url.split(",", 1)
+    mimetype = header[5:].split(";")[0].lower() or "image/png"
+    if not mimetype.startswith("image/"):
+        return err("Please choose an image file.")
+
+    try:
+        image_bytes = base64.b64decode(encoded)
+    except Exception:
+        return err("Could not read the image file.")
+
+    if not image_bytes:
+        return err("Could not read the image file.")
+    if len(image_bytes) > 8 * 1024 * 1024:
+        return err("Image must be smaller than 8 MB.")
+
+    db = get_db()
+    save_doc(db, "settings", "logo", {"mimetype": mimetype, "data": base64.b64encode(image_bytes).decode("ascii"), "updatedAt": now_ms()})
+    return jsonify(ok=True, logoUrl=f"/logo.png?v={now_ms()}")
 
 
 # ------------------------------- delete ---------------------------------
@@ -1515,7 +1720,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
     <!-- Google Fonts: Hind Siliguri & Inter -->
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Hind+Siliguri:wght@400;500;600;700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Hind+Siliguri:wght@400;500;600;700&family=Inter:wght@400;500;600;700&family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet">
     <!-- Lucide Icons -->
     <script src="https://unpkg.com/lucide@0.469.0/dist/umd/lucide.min.js"></script>
     <script>if (!window.lucide) window.lucide = { createIcons: function () {} };</script>
@@ -1524,16 +1729,17 @@ INDEX_HTML = r"""<!DOCTYPE html>
             theme: {
                 extend: {
                     fontFamily: {
-                        sans: ['"Hind Siliguri"', '"Inter"', 'sans-serif'],
+                        sans: ['"Plus Jakarta Sans"', '"Inter"', '"Hind Siliguri"', 'sans-serif'],
                     },
                     colors: {
                         brand: {
-                            50: '#fdf2f8',
-                            100: '#fce7f3',
-                            500: '#ec4899',
-                            600: '#db2777',
-                            700: '#be185d',
-                            900: '#831843',
+                            50: 'var(--brand-50)',
+                            100: 'var(--brand-100)',
+                            300: 'var(--brand-300)',
+                            500: 'var(--brand-500)',
+                            600: 'var(--brand-600)',
+                            700: 'var(--brand-700)',
+                            900: 'var(--brand-900)',
                         }
                     }
                 }
@@ -1541,6 +1747,304 @@ INDEX_HTML = r"""<!DOCTYPE html>
         }
     </script>
     <style>
+        :root {
+            --brand-50: #fdf2f8;
+            --brand-100: #fce7f3;
+            --brand-300: #fbcfe8;
+            --brand-500: #ec4899;
+            --brand-600: #db2777;
+            --brand-700: #be185d;
+            --brand-900: #831843;
+            --app-bg: #f8fafc;
+            --app-surface: #ffffff;
+            --app-text: #0f172a;
+        }
+
+        html {
+            font-family: "Plus Jakarta Sans", Inter, "Hind Siliguri", ui-sans-serif, system-ui, sans-serif;
+            font-size: 16px;
+        }
+
+        body {
+            background-color: var(--app-bg) !important;
+            color: var(--app-text);
+            font-family: "Plus Jakarta Sans", Inter, "Hind Siliguri", ui-sans-serif, system-ui, sans-serif;
+            font-weight: 400;
+            line-height: 1.5;
+            -webkit-font-smoothing: antialiased;
+            -moz-osx-font-smoothing: grayscale;
+        }
+
+        h1, h2, h3, h4, h5, h6 {
+            font-weight: 700;
+            letter-spacing: -0.012em;
+        }
+
+        h1 { font-weight: 800; letter-spacing: -0.02em; }
+        .text-\[11px\], .text-xs { font-weight: 500; }
+        .font-bold { font-weight: 700 !important; }
+        .font-semibold { font-weight: 600 !important; }
+
+        html { scroll-behavior: smooth; }
+        body { overflow-x: hidden; }
+        ::selection { background: var(--brand-500); color: #ffffff; }
+
+        /* Modern digital 3D + glassmorphism */
+        .glass,
+        .glass-card {
+            background: rgba(255, 255, 255, 0.72);
+            border: 1px solid rgba(255, 255, 255, 0.55);
+            box-shadow: 0 12px 34px rgba(15, 23, 42, 0.10), inset 0 1px 0 rgba(255, 255, 255, 0.70);
+            backdrop-filter: blur(16px) saturate(140%);
+            -webkit-backdrop-filter: blur(16px) saturate(140%);
+        }
+
+        .product-card {
+            position: relative;
+            border-radius: 1.25rem;
+            border: 1px solid rgba(148, 163, 184, 0.22);
+            background: rgba(255, 255, 255, 0.90);
+            box-shadow: 0 10px 28px rgba(15, 23, 42, 0.08), 0 2px 8px rgba(15, 23, 42, 0.05), inset 0 1px 0 rgba(255, 255, 255, 0.85);
+            transition: transform 240ms cubic-bezier(0.22, 1.18, 0.36, 1), box-shadow 240ms ease, border-color 240ms ease;
+            transform-style: preserve-3d;
+            will-change: transform;
+            backdrop-filter: blur(10px);
+        }
+
+        .product-card:hover {
+            border-color: rgba(var(--brand-rgb, 99, 102, 241), 0.30);
+            box-shadow: 0 22px 48px rgba(15, 23, 42, 0.16), 0 8px 18px rgba(15, 23, 42, 0.08), inset 0 1px 0 rgba(255, 255, 255, 0.90);
+        }
+
+        .tilt-3d {
+            transform-style: preserve-3d;
+            transition: transform 160ms cubic-bezier(0.22, 1.18, 0.36, 1), box-shadow 160ms ease, background-color 160ms ease, border-color 160ms ease;
+            will-change: transform;
+        }
+
+        .size-selector {
+            min-width: 2rem;
+            min-height: 2rem;
+            box-shadow: 0 4px 10px rgba(15, 23, 42, 0.08), inset 0 1px 0 rgba(255, 255, 255, 0.75);
+        }
+
+        .size-selector[aria-pressed="true"],
+        .size-selector.active,
+        .is-active {
+            box-shadow: 0 8px 18px rgba(var(--brand-rgb, 99, 102, 241), 0.32), 0 0 0 3px rgba(var(--brand-rgb, 99, 102, 241), 0.14), inset 0 1px 0 rgba(255, 255, 255, 0.35);
+        }
+
+        .action-button {
+            position: relative;
+            overflow: hidden;
+            box-shadow: 0 8px 18px rgba(var(--brand-rgb, 99, 102, 241), 0.24), inset 0 1px 0 rgba(255, 255, 255, 0.25);
+            transition: transform 160ms cubic-bezier(0.22, 1.18, 0.36, 1), box-shadow 160ms ease, background-color 160ms ease;
+        }
+
+        .action-button:hover:not(:disabled) {
+            box-shadow: 0 12px 26px rgba(var(--brand-rgb, 99, 102, 241), 0.32), 0 0 0 3px rgba(var(--brand-rgb, 99, 102, 241), 0.12), inset 0 1px 0 rgba(255, 255, 255, 0.30);
+        }
+
+        .action-button:active:not(:disabled) {
+            transform: translateY(1px) scale(0.97);
+            box-shadow: 0 4px 10px rgba(var(--brand-rgb, 99, 102, 241), 0.22);
+        }
+
+        .cat-btn.active,
+        .admin-sub-btn.bg-brand-600,
+        .admin-sub-btn.is-active {
+            box-shadow: 0 8px 18px rgba(var(--brand-rgb, 99, 102, 241), 0.28), 0 0 0 3px rgba(var(--brand-rgb, 99, 102, 241), 0.12);
+        }
+
+        button,
+        .tilt-3d {
+            -webkit-tap-highlight-color: transparent;
+        }
+
+        button:not(:disabled) { transition-property: transform, box-shadow, background-color, color, border-color, opacity; transition-duration: 160ms; }
+        button:not(:disabled):active { transform: translateY(1px) scale(0.97); }
+        button:disabled { cursor: not-allowed; }
+
+        .reveal {
+            opacity: 0;
+            transform: translateY(18px) scale(0.995);
+            will-change: opacity, transform;
+        }
+
+        .reveal-visible {
+            animation: reveal-up 520ms cubic-bezier(0.22, 1, 0.36, 1) both;
+        }
+
+        @keyframes reveal-up {
+            from { opacity: 0; transform: translateY(18px) scale(0.995); }
+            to { opacity: 1; transform: translateY(0) scale(1); }
+        }
+
+        @keyframes spring-press {
+            0% { transform: scale(1); }
+            45% { transform: scale(0.955); }
+            100% { transform: scale(1); }
+        }
+
+        button:not(:disabled):active { animation: spring-press 180ms ease-out; }
+
+        /* Floating 3D storefront footer */
+        .footer-3d {
+            position: relative;
+            z-index: 10;
+            max-width: 72rem;
+            margin: 2rem auto 1.5rem;
+            border-radius: 1.5rem;
+            border: 1px solid rgba(148, 163, 184, 0.22);
+            background: linear-gradient(145deg, #111827 0%, #0b1220 48%, #030712 100%);
+            color: #cbd5e1;
+            box-shadow:
+                0 28px 70px rgba(2, 6, 23, 0.45),
+                0 10px 24px rgba(15, 23, 42, 0.35),
+                inset 0 1px 0 rgba(255, 255, 255, 0.16),
+                inset 0 -1px 0 rgba(255, 255, 255, 0.04);
+            transform-style: preserve-3d;
+            overflow: hidden;
+        }
+
+        .footer-3d::before {
+            content: "";
+            position: absolute;
+            top: 0;
+            left: 1.5rem;
+            right: 1.5rem;
+            height: 1px;
+            background: linear-gradient(90deg, transparent, rgba(255,255,255,0.55), transparent);
+            pointer-events: none;
+        }
+
+        .footer-3d::after {
+            content: "";
+            position: absolute;
+            inset: auto -10% -45% -10%;
+            height: 8rem;
+            background: radial-gradient(ellipse at center, rgba(255,255,255,0.10), transparent 68%);
+            pointer-events: none;
+        }
+
+        .footer-title {
+            text-shadow: 0 1px 0 rgba(255,255,255,0.12), 0 8px 22px rgba(0,0,0,0.35);
+            letter-spacing: -0.02em;
+        }
+
+        .footer-address {
+            color: #94a3b8;
+            line-height: 1.45;
+            text-shadow: 0 1px 1px rgba(0,0,0,0.35);
+        }
+
+        .footer-phone-pill {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.55rem;
+            padding: 0.75rem 1.05rem;
+            border-radius: 999px;
+            border: 1px solid rgba(255,255,255,0.16);
+            background: linear-gradient(145deg, rgba(255,255,255,0.12), rgba(255,255,255,0.04));
+            color: #ffffff;
+            font-weight: 800;
+            font-size: 0.8rem;
+            letter-spacing: 0.01em;
+            box-shadow: 0 10px 24px rgba(0,0,0,0.28), inset 0 1px 0 rgba(255,255,255,0.22), inset 0 -1px 0 rgba(0,0,0,0.25);
+            backdrop-filter: blur(10px);
+            transition: transform 180ms cubic-bezier(0.22, 1.18, 0.36, 1), box-shadow 180ms ease, border-color 180ms ease, background 180ms ease;
+            text-decoration: none;
+        }
+
+        .footer-phone-pill:hover {
+            transform: translateY(-3px) scale(1.02);
+            border-color: rgba(255,255,255,0.34);
+            background: linear-gradient(145deg, rgba(255,255,255,0.18), rgba(255,255,255,0.07));
+            box-shadow: 0 16px 34px rgba(0,0,0,0.34), 0 0 0 3px rgba(255,255,255,0.06), inset 0 1px 0 rgba(255,255,255,0.28);
+        }
+
+        .footer-phone-pill:active { transform: translateY(1px) scale(0.98); }
+
+        @media (prefers-reduced-motion: reduce) {
+            html { scroll-behavior: auto; }
+            *, *::before, *::after {
+                animation-duration: 0.001ms !important;
+                animation-iteration-count: 1 !important;
+                transition-duration: 0.001ms !important;
+                scroll-behavior: auto !important;
+            }
+            .reveal { opacity: 1; transform: none; }
+            .tilt-3d, .product-card, .size-selector, .action-button, .footer-phone-pill { transform: none !important; }
+        }
+
+        .bg-slate-50 { background-color: var(--app-bg) !important; }
+        .bg-white { background-color: var(--app-surface) !important; }
+
+        .admin-sidebar,
+        .admin-subtab-panel.bg-white,
+        .settings-section {
+            box-shadow: var(--app-shadow);
+        }
+
+        .admin-sidebar {
+            position: sticky;
+            top: 1rem;
+            max-height: calc(100vh - 2rem);
+            overflow-y: auto;
+        }
+
+        .admin-sub-btn { text-align: left; }
+        .settings-submenu-btn { text-align: left; }
+        .theme-option { cursor: pointer; }
+
+        .product-image-zoom { cursor: zoom-in; }
+        .zoomable-image {
+            transform-origin: center center;
+            transition: transform 180ms ease-out;
+            will-change: transform, transform-origin;
+        }
+        .discount-badge {
+            z-index: 15;
+            padding: 0.45rem 0.8rem;
+            border-radius: 0.65rem;
+            background: linear-gradient(135deg, #e11d48 0%, #be123c 100%);
+            border: 1px solid rgba(255,255,255,0.35);
+            color: #ffffff;
+            font-size: 0.9rem;
+            line-height: 1;
+            font-weight: 800;
+            letter-spacing: 0.01em;
+            text-transform: uppercase;
+            box-shadow: 0 10px 24px rgba(190,18,60,0.35), 0 2px 0 rgba(15,23,42,0.25), inset 0 1px 0 rgba(255,255,255,0.35);
+            transform: rotate(3deg);
+        }
+
+        .bg-brand-50 { background-color: var(--brand-50) !important; }
+        .bg-brand-100 { background-color: var(--brand-100) !important; }
+        .bg-brand-300 { background-color: var(--brand-300) !important; }
+        .bg-brand-500 { background-color: var(--brand-500) !important; }
+        .bg-brand-600 { background-color: var(--brand-600) !important; }
+        .bg-brand-700 { background-color: var(--brand-700) !important; }
+        .bg-brand-900 { background-color: var(--brand-900) !important; }
+
+        .text-brand-500 { color: var(--brand-500) !important; }
+        .text-brand-600 { color: var(--brand-600) !important; }
+        .text-brand-700 { color: var(--brand-700) !important; }
+        .text-brand-900 { color: var(--brand-900) !important; }
+
+        .border-brand-300 { border-color: var(--brand-300) !important; }
+        .border-brand-500 { border-color: var(--brand-500) !important; }
+        .border-brand-600 { border-color: var(--brand-600) !important; }
+        .border-brand-700 { border-color: var(--brand-700) !important; }
+
+        .hover\:bg-brand-50:hover { background-color: var(--brand-50) !important; }
+        .hover\:bg-brand-600:hover { background-color: var(--brand-600) !important; }
+        .hover\:bg-brand-700:hover { background-color: var(--brand-700) !important; }
+        .hover\:border-brand-300:hover { border-color: var(--brand-300) !important; }
+        .hover\:border-brand-600:hover { border-color: var(--brand-600) !important; }
+        .ring-brand-500 { --tw-ring-color: var(--brand-500) !important; }
+        .selection\:bg-brand-500::selection { background-color: var(--brand-500) !important; }
+
         @media print {
             body * { visibility: hidden !important; }
             #invoice-print-area, #invoice-print-area * { visibility: visible !important; }
@@ -1569,7 +2073,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
                 <!-- Brand Logo -->
                 <div class="flex items-center gap-3 cursor-pointer" onclick="switchView('store')">
                     <div class="w-11 h-11 sm:w-12 sm:h-12 rounded-xl overflow-hidden bg-black shadow-md shrink-0">
-                        <img src="/logo.png?v=2" alt="Taham" class="w-full h-full object-cover">
+                        <img id="site-logo" src="/logo.png?v=2" alt="Taham" class="w-full h-full object-cover">
                     </div>
                     <div>
                         <h1 id="header-shop-name" class="text-lg sm:text-2xl font-bold bg-gradient-to-r from-brand-700 to-slate-900 bg-clip-text text-transparent leading-tight">
@@ -1691,41 +2195,20 @@ INDEX_HTML = r"""<!DOCTYPE html>
     <!-- 2. SUPER ADMIN ERP DASHBOARD VIEW          -->
     <!-- ========================================== -->
     <main id="admin-view" class="hidden max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8 pb-20 no-print">
-        <!-- Admin Top Banner -->
-        <div class="bg-slate-900 text-white p-6 rounded-2xl shadow-lg mb-8 flex flex-col md:flex-row justify-between items-start md:items-center gap-4">
-            <div>
-                <div class="flex items-center gap-2">
-                    <span class="px-2.5 py-0.5 rounded-md bg-pink-600 text-xs font-bold uppercase tracking-wider">Super Admin ERP</span>
-                    <span class="text-xs text-slate-400">Real-Time Cloud Sync Active</span>
-                </div>
-                <h2 class="text-2xl sm:text-3xl font-bold mt-1">Business & Accounts Management Panel</h2>
-            </div>
-            <div class="flex flex-wrap gap-2">
-                <button onclick="switchView('store')" class="px-4 py-2 rounded-xl bg-white/10 hover:bg-white/20 text-white text-xs sm:text-sm font-semibold transition-all flex items-center gap-1.5">
-                    <i data-lucide="store" class="w-4 h-4"></i>
-                    <span>View Store</span>
-                </button>
-                <button onclick="logoutAdmin()" class="px-4 py-2 rounded-xl bg-rose-600 hover:bg-rose-700 text-white text-xs sm:text-sm font-semibold transition-all flex items-center gap-1.5">
-                    <i data-lucide="lock" class="w-4 h-4"></i>
-                    <span>Lock / Logout</span>
-                </button>
-            </div>
-        </div>
-
         <!-- Business Analytics Overview Cards -->
         <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-4 mb-8">
-            <div class="bg-white p-5 rounded-2xl border border-slate-200 shadow-sm">
+            <button type="button" onclick="openAdminSummary('orders')" class="bg-white p-5 rounded-2xl border border-slate-200 shadow-sm text-left w-full hover:border-brand-300 hover:shadow-md transition-all">
                 <div class="flex items-center justify-between">
-                    <p class="text-xs font-semibold text-slate-500">Total Sales (Revenue)</p>
+                    <p class="text-xs font-semibold text-slate-500">Total Sales</p>
                     <div class="w-9 h-9 rounded-xl bg-blue-50 text-blue-600 flex items-center justify-center">
                         <i data-lucide="banknote" class="w-5 h-5"></i>
                     </div>
                 </div>
                 <p id="stat-revenue" class="text-2xl font-bold text-slate-900 mt-2">৳ 0</p>
                 <p class="text-[11px] text-slate-400 mt-1">Total sales including delivery charge</p>
-            </div>
+            </button>
 
-            <div class="bg-white p-5 rounded-2xl border border-emerald-200 shadow-sm bg-gradient-to-br from-white to-emerald-50/40">
+            <button type="button" onclick="openAdminSummary('orders')" class="bg-white p-5 rounded-2xl border border-emerald-200 shadow-sm bg-gradient-to-br from-white to-emerald-50/40 text-left w-full hover:border-emerald-400 hover:shadow-md transition-all">
                 <div class="flex items-center justify-between">
                     <p class="text-xs font-semibold text-emerald-700">Net Profit</p>
                     <div class="w-9 h-9 rounded-xl bg-emerald-100 text-emerald-700 flex items-center justify-center">
@@ -1734,9 +2217,9 @@ INDEX_HTML = r"""<!DOCTYPE html>
                 </div>
                 <p id="stat-profit" class="text-2xl font-bold text-emerald-700 mt-2">৳ 0</p>
                 <p class="text-[11px] text-emerald-600/80 mt-1">Net profit after purchase cost and expenses</p>
-            </div>
+            </button>
 
-            <div class="bg-white p-5 rounded-2xl border border-slate-200 shadow-sm">
+            <button type="button" onclick="openAdminSummary('expenses')" class="bg-white p-5 rounded-2xl border border-slate-200 shadow-sm text-left w-full hover:border-rose-300 hover:shadow-md transition-all">
                 <div class="flex items-center justify-between">
                     <p class="text-xs font-semibold text-slate-500">Total Expenses</p>
                     <div class="w-9 h-9 rounded-xl bg-rose-50 text-rose-600 flex items-center justify-center">
@@ -1745,9 +2228,9 @@ INDEX_HTML = r"""<!DOCTYPE html>
                 </div>
                 <p id="stat-expenses" class="text-2xl font-bold text-rose-600 mt-2">৳ 0</p>
                 <p class="text-[11px] text-slate-400 mt-1">Shop & other expenses</p>
-            </div>
+            </button>
 
-            <div class="bg-white p-5 rounded-2xl border border-slate-200 shadow-sm">
+            <button type="button" onclick="openAdminSummary('orders', 'Pending')" class="bg-white p-5 rounded-2xl border border-slate-200 shadow-sm text-left w-full hover:border-amber-300 hover:shadow-md transition-all">
                 <div class="flex items-center justify-between">
                     <p class="text-xs font-semibold text-slate-500">Pending Orders</p>
                     <div class="w-9 h-9 rounded-xl bg-amber-50 text-amber-600 flex items-center justify-center">
@@ -1756,44 +2239,50 @@ INDEX_HTML = r"""<!DOCTYPE html>
                 </div>
                 <p id="stat-pending" class="text-2xl font-bold text-amber-600 mt-2">0</p>
                 <p id="stat-total-orders" class="text-[11px] text-slate-400 mt-1">Total Orders: 0</p>
-            </div>
+            </button>
 
-            <div class="bg-white p-5 rounded-2xl border border-slate-200 shadow-sm">
+            <button type="button" onclick="openAdminSummary('inventory')" class="bg-white p-5 rounded-2xl border border-slate-200 shadow-sm text-left w-full hover:border-purple-300 hover:shadow-md transition-all">
                 <div class="flex items-center justify-between">
-                    <p class="text-xs font-semibold text-slate-500">Low Stock Alert (&lt;5)</p>
+                    <p class="text-xs font-semibold text-slate-500">Low Stock Alert</p>
                     <div class="w-9 h-9 rounded-xl bg-purple-50 text-purple-600 flex items-center justify-center">
                         <i data-lucide="alert-triangle" class="w-5 h-5"></i>
                     </div>
                 </div>
                 <p id="stat-low-stock" class="text-2xl font-bold text-purple-700 mt-2">0</p>
                 <p id="stat-total-products" class="text-[11px] text-slate-400 mt-1">Total Items: 0</p>
-            </div>
+            </button>
         </div>
 
         <!-- Admin Sub-Navigation Tabs -->
-        <div class="flex items-center gap-2 overflow-x-auto pb-2 mb-6 border-b border-slate-200">
-            <button onclick="switchAdminSubTab('orders')" data-subtab="orders" class="admin-sub-btn px-4 py-2.5 rounded-xl text-sm font-bold bg-brand-600 text-white shadow-sm whitespace-nowrap flex items-center gap-2">
-                <i data-lucide="package-check" class="w-4 h-4"></i>
-                <span>Orders & Invoices</span>
-            </button>
-            <button onclick="switchAdminSubTab('inventory')" data-subtab="inventory" class="admin-sub-btn px-4 py-2.5 rounded-xl text-sm font-bold bg-white text-slate-700 hover:bg-slate-100 border border-slate-200 whitespace-nowrap flex items-center gap-2">
-                <i data-lucide="shirt" class="w-4 h-4"></i>
-                <span>Products & Stock (Inventory)</span>
-            </button>
-            <button onclick="switchAdminSubTab('collections')" data-subtab="collections" class="admin-sub-btn px-4 py-2.5 rounded-xl text-sm font-bold bg-white text-slate-700 hover:bg-slate-100 border border-slate-200 whitespace-nowrap flex items-center gap-2">
-                <i data-lucide="layout-grid" class="w-4 h-4"></i>
-                <span>Collections</span>
-            </button>
-            <button onclick="switchAdminSubTab('expenses')" data-subtab="expenses" class="admin-sub-btn px-4 py-2.5 rounded-xl text-sm font-bold bg-white text-slate-700 hover:bg-slate-100 border border-slate-200 whitespace-nowrap flex items-center gap-2">
-                <i data-lucide="wallet" class="w-4 h-4"></i>
-                <span>Daily Expenses</span>
-            </button>
-            <button onclick="switchAdminSubTab('settings')" data-subtab="settings" class="admin-sub-btn px-4 py-2.5 rounded-xl text-sm font-bold bg-white text-slate-700 hover:bg-slate-100 border border-slate-200 whitespace-nowrap flex items-center gap-2">
-                <i data-lucide="settings" class="w-4 h-4"></i>
-                <span>Shop Settings & Password</span>
-            </button>
-        </div>
+        <div class="admin-layout flex flex-col lg:flex-row gap-6 items-start">
+            <nav id="admin-sidebar" class="admin-sidebar w-full lg:w-64 lg:flex-shrink-0 bg-white rounded-2xl border border-slate-200 shadow-sm p-3 space-y-1" aria-label="Admin navigation">
+                <button type="button" onclick="switchAdminSubTab('orders')" data-subtab="orders" class="admin-sub-btn w-full px-4 py-2.5 rounded-xl text-sm font-bold bg-brand-600 text-white shadow-sm flex items-center justify-start gap-2">
+                    <i data-lucide="package-check" class="w-4 h-4"></i>
+                    <span>Orders & Invoices</span>
+                </button>
+                <button type="button" onclick="switchAdminSubTab('inventory')" data-subtab="inventory" class="admin-sub-btn w-full px-4 py-2.5 rounded-xl text-sm font-bold bg-white text-slate-700 hover:bg-slate-100 border border-slate-200 flex items-center justify-start gap-2">
+                    <i data-lucide="shirt" class="w-4 h-4"></i>
+                    <span>Products & Stock (Inventory)</span>
+                </button>
+                <button type="button" onclick="switchAdminSubTab('collections')" data-subtab="collections" class="admin-sub-btn w-full px-4 py-2.5 rounded-xl text-sm font-bold bg-white text-slate-700 hover:bg-slate-100 border border-slate-200 flex items-center justify-start gap-2">
+                    <i data-lucide="layout-grid" class="w-4 h-4"></i>
+                    <span>Collections</span>
+                </button>
+                <button type="button" onclick="switchAdminSubTab('expenses')" data-subtab="expenses" class="admin-sub-btn w-full px-4 py-2.5 rounded-xl text-sm font-bold bg-white text-slate-700 hover:bg-slate-100 border border-slate-200 flex items-center justify-start gap-2">
+                    <i data-lucide="wallet" class="w-4 h-4"></i>
+                    <span>Daily Expenses</span>
+                </button>
+                <button type="button" onclick="switchAdminSubTab('settings')" data-subtab="settings" class="admin-sub-btn w-full px-4 py-2.5 rounded-xl text-sm font-bold bg-white text-slate-700 hover:bg-slate-100 border border-slate-200 flex items-center justify-start gap-2">
+                    <i data-lucide="settings" class="w-4 h-4"></i>
+                    <span>Settings</span>
+                </button>
+                <button type="button" onclick="switchAdminSubTab('reports')" data-subtab="reports" class="admin-sub-btn w-full px-4 py-2.5 rounded-xl text-sm font-bold bg-white text-slate-700 hover:bg-slate-100 border border-slate-200 flex items-center justify-start gap-2">
+                    <i data-lucide="bar-chart-3" class="w-4 h-4"></i>
+                    <span>Reports</span>
+                </button>
+            </nav>
 
+            <div class="admin-content flex-1 min-w-0 w-full space-y-6">
         <!-- SUB-TAB 1: ORDERS & INVOICE PRINTING -->
         <div id="subtab-orders" class="admin-subtab-panel space-y-6">
             <div class="bg-white p-6 rounded-2xl border border-slate-200 shadow-sm">
@@ -1932,133 +2421,352 @@ INDEX_HTML = r"""<!DOCTYPE html>
         </div>
 
         <!-- SUB-TAB: COLLECTIONS (photo + name) -->
-        <div id="subtab-collections" class="admin-subtab-panel hidden grid grid-cols-1 lg:grid-cols-3 gap-8">
-            <div class="lg:col-span-1">
-                <div class="bg-white p-6 rounded-2xl border border-slate-200 shadow-sm sticky top-24">
-                    <div class="flex items-center justify-between mb-5 pb-3 border-b border-slate-100">
-                        <div class="flex items-center gap-2">
-                            <i data-lucide="layout-grid" class="w-5 h-5 text-brand-600"></i>
-                            <h3 id="col-form-title" class="text-lg font-bold text-slate-900">Add New Collection</h3>
-                        </div>
-                        <button id="col-cancel-btn" onclick="resetCollectionForm()" class="hidden text-xs text-rose-600 font-bold hover:underline">Cancel</button>
-                    </div>
-                    <form id="collection-form" onsubmit="handleSaveCollection(event)" class="space-y-4">
-                        <input type="hidden" id="edit-col-id">
-                        <div>
-                            <label class="block text-xs font-bold text-slate-700 mb-1">Collection Name *</label>
-                            <input type="text" id="col-name" required maxlength="40" placeholder="e.g. Winter Wear" class="w-full px-3.5 py-2.5 rounded-xl border border-slate-200 focus:outline-none focus:ring-2 focus:ring-brand-500 text-sm">
-                        </div>
-                        <div class="p-3.5 rounded-xl border border-dashed border-brand-300 bg-brand-50/30 space-y-2">
-                            <label class="block text-xs font-bold text-brand-900">Upload a cover photo from your gallery/computer:</label>
-                            <input type="file" id="col-image-file" accept="image/*" onchange="handleCollectionImageUpload(event)" class="w-full text-xs text-slate-600 file:mr-3 file:py-1.5 file:px-3 file:rounded-lg file:border-0 file:text-xs file:font-semibold file:bg-brand-600 file:text-white hover:file:bg-brand-700 cursor-pointer">
-                            <div id="col-image-preview-box" class="hidden pt-2">
-                                <img id="col-image-preview-img" src="" class="h-28 w-24 object-cover rounded-lg border border-slate-200 shadow-sm">
-                            </div>
-                            <input type="text" id="col-image-url" placeholder="Or paste an image link (URL)..." class="w-full px-3 py-2 rounded-lg border border-slate-200 bg-white text-xs mt-1">
-                        </div>
-                        <button type="submit" class="w-full py-3 rounded-xl bg-brand-600 hover:bg-brand-700 text-white font-semibold shadow-md transition-all flex items-center justify-center gap-2">
-                            <i data-lucide="save" class="w-4 h-4"></i>
-                            <span>Save Collection</span>
-                        </button>
-                    </form>
-                </div>
-            </div>
-            <div class="lg:col-span-2">
-                <div class="bg-white p-6 rounded-2xl border border-slate-200 shadow-sm">
-                    <div class="mb-5 pb-3 border-b border-slate-100">
+        <div id="subtab-collections" class="admin-subtab-panel hidden">
+            <div class="bg-white p-6 rounded-2xl border border-slate-200 shadow-sm">
+                <div class="flex items-center justify-between gap-4 mb-5 pb-3 border-b border-slate-100">
+                    <div>
                         <h3 class="text-lg font-bold text-slate-900">Your Collections</h3>
                         <p class="text-xs text-slate-500 mt-1">These photos appear on the storefront. Customers tap a collection to see its clothes.</p>
                     </div>
-                    <div id="admin-collections-list" class="divide-y divide-slate-100"></div>
+                    <button type="button" onclick="openCollectionModal()" class="px-4 py-2.5 rounded-xl bg-brand-600 hover:bg-brand-700 text-white text-sm font-bold shadow-sm flex items-center gap-2 whitespace-nowrap">
+                        <i data-lucide="plus" class="w-4 h-4"></i>
+                        <span>Add New Collection</span>
+                    </button>
                 </div>
+                <div id="admin-collections-list" class="divide-y divide-slate-100"></div>
+            </div>
+        </div>
+
+        <!-- Collection Modal -->
+        <div id="collection-modal" class="fixed inset-0 z-50 hidden flex items-center justify-center p-4 no-print">
+            <div onclick="closeCollectionModal()" class="fixed inset-0 bg-slate-900/75 backdrop-blur-sm"></div>
+            <div class="bg-white rounded-2xl max-w-2xl w-full p-6 sm:p-8 relative z-10 shadow-2xl max-h-[90vh] overflow-y-auto">
+                <div class="flex justify-between items-start gap-4 pb-4 border-b border-slate-100 mb-5">
+                    <div class="flex items-center gap-2">
+                        <i data-lucide="layout-grid" class="w-5 h-5 text-brand-600"></i>
+                        <h3 id="col-form-title" class="text-lg font-bold text-slate-900">Add New Collection</h3>
+                    </div>
+                    <div class="flex items-center gap-2">
+                        <button id="col-cancel-btn" onclick="closeCollectionModal()" class="hidden text-xs text-rose-600 font-bold hover:underline">Cancel</button>
+                        <button type="button" onclick="closeCollectionModal()" class="p-2 rounded-xl text-slate-400 hover:bg-slate-100"><i data-lucide="x" class="w-4 h-4"></i></button>
+                    </div>
+                </div>
+                <form id="collection-form" onsubmit="handleSaveCollection(event)" class="space-y-4">
+                    <input type="hidden" id="edit-col-id">
+                    <div>
+                        <label class="block text-xs font-bold text-slate-700 mb-1">Collection Name *</label>
+                        <input type="text" id="col-name" required maxlength="40" placeholder="e.g. Winter Wear" class="w-full px-3.5 py-2.5 rounded-xl border border-slate-200 focus:outline-none focus:ring-2 focus:ring-brand-500 text-sm" oninput="renderCollectionProductSelector()">
+                    </div>
+                    <div class="p-3.5 rounded-xl border border-dashed border-brand-300 bg-brand-50/30 space-y-2">
+                        <label class="block text-xs font-bold text-brand-900">Cover Photo (upload or URL)</label>
+                        <input type="file" id="col-image-file" accept="image/*" onchange="handleCollectionImageUpload(event)" class="w-full text-xs text-slate-600 file:mr-3 file:py-1.5 file:px-3 file:rounded-lg file:border-0 file:text-xs file:font-semibold file:bg-brand-600 file:text-white hover:file:bg-brand-700 cursor-pointer">
+                        <div id="col-image-preview-box" class="hidden pt-2">
+                            <img id="col-image-preview-img" src="" class="h-28 w-24 object-cover rounded-lg border border-slate-200 shadow-sm">
+                        </div>
+                        <input type="text" id="col-image-url" placeholder="Or paste an image link (URL)..." class="w-full px-3 py-2 rounded-lg border border-slate-200 bg-white text-xs mt-1">
+                    </div>
+                    <div>
+                        <label class="block text-xs font-bold text-slate-700 mb-1">Assign Products to Collection</label>
+                        <div id="col-product-selector" class="max-h-48 overflow-y-auto rounded-xl border border-slate-200 divide-y divide-slate-100 bg-white"></div>
+                        <p class="text-[11px] text-slate-400 mt-1">Select products to assign. Products removed here will be unassigned from this collection.</p>
+                    </div>
+                    <button type="submit" class="w-full py-3 rounded-xl bg-brand-600 hover:bg-brand-700 text-white font-semibold shadow-md transition-all flex items-center justify-center gap-2">
+                        <i data-lucide="save" class="w-4 h-4"></i>
+                        <span>Save Collection</span>
+                    </button>
+                </form>
             </div>
         </div>
 
         <!-- SUB-TAB 3: DAILY EXPENSE TRACKER -->
-        <div id="subtab-expenses" class="admin-subtab-panel hidden grid grid-cols-1 lg:grid-cols-3 gap-8">
-            <div class="lg:col-span-1">
-                <div class="bg-white p-6 rounded-2xl border border-slate-200 shadow-sm">
-                    <h3 class="text-lg font-bold text-slate-900 mb-4 pb-3 border-b border-slate-100">Add New Expense</h3>
-                    <form onsubmit="handleAddExpense(event)" class="space-y-4">
-                        <div>
-                            <label class="block text-xs font-bold text-slate-700 mb-1">Expense Description *</label>
-                            <input type="text" id="exp-title" required placeholder="e.g. Shop rent / Packaging bags" class="w-full px-3.5 py-2.5 rounded-xl border border-slate-200 text-sm">
-                        </div>
-                        <div>
-                            <label class="block text-xs font-bold text-slate-700 mb-1">Expense Category *</label>
-                            <select id="exp-category" class="w-full px-3.5 py-2.5 rounded-xl border border-slate-200 text-sm bg-white">
-                                <option value="Shop rent & bills">Shop rent & electricity bill</option>
-                                <option value="Packaging & delivery">Packaging & courier cost</option>
-                                <option value="Marketing & boosting">Facebook boosting / marketing</option>
-                                <option value="Staff & hospitality">Staff salary & hospitality</option>
-                                <option value="Other">Other expenses</option>
-                            </select>
-                        </div>
-                        <div>
-                            <label class="block text-xs font-bold text-slate-700 mb-1">Amount (৳) *</label>
-                            <input type="number" id="exp-amount" required min="1" placeholder="500" class="w-full px-3.5 py-2.5 rounded-xl border border-slate-200 text-sm">
-                        </div>
-                        <button type="submit" class="w-full py-3 rounded-xl bg-rose-600 hover:bg-rose-700 text-white font-semibold shadow-sm transition-all">
-                            Add Expense
-                        </button>
-                    </form>
-                </div>
-            </div>
-
-            <div class="lg:col-span-2">
-                <div class="bg-white p-6 rounded-2xl border border-slate-200 shadow-sm">
-                    <h3 class="text-lg font-bold text-slate-900 mb-4 pb-3 border-b border-slate-100">Daily Expense List</h3>
-                    <div id="admin-expenses-list" class="divide-y divide-slate-100">
-                        <!-- Expenses injected here -->
+        <div id="subtab-expenses" class="admin-subtab-panel hidden">
+            <div class="bg-white p-6 rounded-2xl border border-slate-200 shadow-sm">
+                <div class="flex items-center justify-between gap-4 mb-5 pb-3 border-b border-slate-100">
+                    <div>
+                        <h3 class="text-lg font-bold text-slate-900">Daily Expense List</h3>
                     </div>
+                    <button type="button" onclick="openExpenseModal()" class="px-4 py-2.5 rounded-xl bg-brand-600 hover:bg-brand-700 text-white text-sm font-bold shadow-sm flex items-center gap-2 whitespace-nowrap">
+                        <i data-lucide="plus" class="w-4 h-4"></i>
+                        <span>Add New Expense</span>
+                    </button>
+                </div>
+                <div id="admin-expenses-list" class="divide-y divide-slate-100">
+                    <!-- Expenses injected here -->
                 </div>
             </div>
         </div>
 
-        <!-- SUB-TAB 4: STORE SETTINGS & ADMIN PASSWORD -->
-        <div id="subtab-settings" class="admin-subtab-panel hidden max-w-2xl mx-auto">
-            <div class="bg-white p-6 sm:p-8 rounded-2xl border border-slate-200 shadow-sm">
-                <h3 class="text-xl font-bold text-slate-900 mb-2">Shop Information & Super Admin Security</h3>
-                <p class="text-xs text-slate-500 mb-6 pb-4 border-b border-slate-100">Change the shop name, bKash/Nagad number and admin password from here.</p>
-
-                <form onsubmit="handleSaveSettings(event)" class="space-y-4">
+        <!-- Expense Modal -->
+        <div id="expense-modal" class="fixed inset-0 z-50 hidden flex items-center justify-center p-4 no-print">
+            <div onclick="closeExpenseModal()" class="fixed inset-0 bg-slate-900/75 backdrop-blur-sm"></div>
+            <div class="bg-white rounded-2xl max-w-lg w-full p-6 sm:p-8 relative z-10 shadow-2xl max-h-[90vh] overflow-y-auto">
+                <div class="flex justify-between items-center pb-4 border-b border-slate-100 mb-5">
+                    <h3 class="text-lg font-bold text-slate-900">Add New Expense</h3>
+                    <button type="button" onclick="closeExpenseModal()" class="p-2 rounded-xl text-slate-400 hover:bg-slate-100"><i data-lucide="x" class="w-4 h-4"></i></button>
+                </div>
+                <form onsubmit="handleAddExpense(event)" class="space-y-4">
                     <div>
-                        <label class="block text-xs font-bold text-slate-700 mb-1">Shop Name</label>
-                        <input type="text" id="set-shop-name" required class="w-full px-4 py-2.5 rounded-xl border border-slate-200 text-sm">
-                    </div>
-                    <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
-                        <div>
-                            <label class="block text-xs font-bold text-slate-700 mb-1">Shop Mobile Number</label>
-                            <input type="text" id="set-shop-phone" required class="w-full px-4 py-2.5 rounded-xl border border-slate-200 text-sm">
-                        </div>
-                        <div>
-                            <label class="block text-xs font-bold text-slate-700 mb-1">bKash / Nagad Payment Number</label>
-                            <input type="text" id="set-payment-number" required class="w-full px-4 py-2.5 rounded-xl border border-slate-200 text-sm">
-                        </div>
+                        <label class="block text-xs font-bold text-slate-700 mb-1">Expense Description *</label>
+                        <input type="text" id="exp-title" required placeholder="e.g. Shop rent / Packaging bags" class="w-full px-3.5 py-2.5 rounded-xl border border-slate-200 text-sm">
                     </div>
                     <div>
-                        <label class="block text-xs font-bold text-slate-700 mb-1">Shop Address (shown on invoice)</label>
-                        <input type="text" id="set-shop-address" required class="w-full px-4 py-2.5 rounded-xl border border-slate-200 text-sm">
+                        <label class="block text-xs font-bold text-slate-700 mb-1">Expense Category *</label>
+                        <select id="exp-category" class="w-full px-3.5 py-2.5 rounded-xl border border-slate-200 text-sm bg-white">
+                            <option value="Shop rent & bills">Shop rent & electricity bill</option>
+                            <option value="Packaging & delivery">Packaging & courier cost</option>
+                            <option value="Marketing & boosting">Facebook boosting / marketing</option>
+                            <option value="Staff & hospitality">Staff salary & hospitality</option>
+                            <option value="Other">Other expenses</option>
+                        </select>
                     </div>
-
-                    <div class="pt-4 border-t border-slate-100">
-                        <h4 class="text-sm font-bold text-rose-700 mb-3">Change Super Admin Login Details</h4>
-                        <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
-                            <div>
-                                <label class="block text-xs font-bold text-slate-700 mb-1">Admin Username</label>
-                                <input type="text" id="set-admin-user" required class="w-full px-4 py-2.5 rounded-xl border border-slate-200 text-sm">
-                            </div>
-                            <div>
-                                <label class="block text-xs font-bold text-slate-700 mb-1">New Password</label>
-                                <input type="password" id="set-admin-pass" autocomplete="new-password" placeholder="Leave empty to keep the current password" class="w-full px-4 py-2.5 rounded-xl border border-slate-200 text-sm">
-                            </div>
-                        </div>
+                    <div>
+                        <label class="block text-xs font-bold text-slate-700 mb-1">Amount (৳) *</label>
+                        <input type="number" id="exp-amount" required min="1" placeholder="500" class="w-full px-3.5 py-2.5 rounded-xl border border-slate-200 text-sm">
                     </div>
-
-                    <button type="submit" class="w-full py-3 rounded-xl bg-slate-900 hover:bg-slate-800 text-white font-bold shadow-md transition-all mt-4">
-                        Save Settings
+                    <button type="submit" class="w-full py-3 rounded-xl bg-rose-600 hover:bg-rose-700 text-white font-semibold shadow-sm transition-all">
+                        Add Expense
                     </button>
                 </form>
+            </div>
+        </div>
+
+        <!-- SUB-TAB 4: SETTINGS -->
+        <div id="subtab-settings" class="admin-subtab-panel hidden w-full">
+            <div class="settings-layout grid grid-cols-1 lg:grid-cols-[220px_1fr] gap-6 items-start">
+                <nav class="settings-submenu bg-white rounded-2xl border border-slate-200 shadow-sm p-3 space-y-1" aria-label="Settings sections">
+                    <button type="button" onclick="switchSettingsSection('user-management')" data-settings-section="user-management" class="settings-submenu-btn w-full px-4 py-2.5 rounded-xl text-sm font-bold bg-brand-600 text-white flex items-center justify-start gap-2">
+                        <i data-lucide="users" class="w-4 h-4"></i>
+                        <span>User Management</span>
+                    </button>
+                    <button type="button" onclick="switchSettingsSection('access-control')" data-settings-section="access-control" class="settings-submenu-btn w-full px-4 py-2.5 rounded-xl text-sm font-bold bg-white text-slate-700 hover:bg-slate-100 border border-slate-200 flex items-center justify-start gap-2">
+                        <i data-lucide="shield-check" class="w-4 h-4"></i>
+                        <span>Access Control</span>
+                    </button>
+                    <button type="button" onclick="switchSettingsSection('page-setup')" data-settings-section="page-setup" class="settings-submenu-btn w-full px-4 py-2.5 rounded-xl text-sm font-bold bg-white text-slate-700 hover:bg-slate-100 border border-slate-200 flex items-center justify-start gap-2">
+                        <i data-lucide="file-cog" class="w-4 h-4"></i>
+                        <span>Page Setup</span>
+                    </button>
+                </nav>
+
+                <div class="settings-content min-w-0 space-y-6">
+                    <section id="settings-user-management" class="settings-section bg-white p-6 sm:p-8 rounded-2xl border border-slate-200 shadow-sm">
+                        <div class="flex items-start justify-between gap-4 mb-6 pb-4 border-b border-slate-100">
+                            <div>
+                                <h3 class="text-xl font-bold text-slate-900 mb-2">User Management</h3>
+                                <p class="text-xs text-slate-500">Manage users, roles, and the primary Super Admin account.</p>
+                            </div>
+                            <button type="button" onclick="openUserModal()" class="px-4 py-2.5 rounded-xl bg-brand-600 hover:bg-brand-700 text-white text-sm font-bold shadow-sm flex items-center gap-2 whitespace-nowrap">
+                                <i data-lucide="user-plus" class="w-4 h-4"></i>
+                                <span>Add New User</span>
+                            </button>
+                        </div>
+
+                        <form onsubmit="handleSaveSettings(event)" class="space-y-4 mb-8">
+                            <h4 class="text-sm font-bold text-slate-900">Super Admin Account</h4>
+                            <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                                <div>
+                                    <label class="block text-xs font-bold text-slate-700 mb-1">Admin Username</label>
+                                    <input type="text" id="set-admin-user" required class="w-full px-4 py-2.5 rounded-xl border border-slate-200 text-sm">
+                                </div>
+                                <div>
+                                    <label class="block text-xs font-bold text-slate-700 mb-1">New Password</label>
+                                    <input type="password" id="set-admin-pass" autocomplete="new-password" placeholder="Leave empty to keep the current password" class="w-full px-4 py-2.5 rounded-xl border border-slate-200 text-sm">
+                                </div>
+                            </div>
+
+                            <button type="submit" class="w-full py-3 rounded-xl bg-slate-900 hover:bg-slate-800 text-white font-bold shadow-md transition-all mt-4">
+                                Save Super Admin
+                            </button>
+                        </form>
+
+                        <div id="users-list" class="divide-y divide-slate-100 rounded-xl border border-slate-200 overflow-hidden"></div>
+                    </section>
+
+                    <!-- Add New User Modal -->
+                    <div id="user-modal" class="fixed inset-0 z-50 hidden flex items-center justify-center p-4 no-print">
+                        <div onclick="closeUserModal()" class="fixed inset-0 bg-slate-900/75 backdrop-blur-sm"></div>
+                        <div class="bg-white rounded-2xl max-w-lg w-full p-6 sm:p-8 relative z-10 shadow-2xl max-h-[90vh] overflow-y-auto">
+                            <div class="flex justify-between items-center pb-4 border-b border-slate-100 mb-5">
+                                <h3 class="text-lg font-bold text-slate-900">Add New User</h3>
+                                <button type="button" onclick="closeUserModal()" class="p-2 rounded-xl text-slate-400 hover:bg-slate-100"><i data-lucide="x" class="w-4 h-4"></i></button>
+                            </div>
+                            <form id="add-user-form" onsubmit="handleAddUser(event)" class="space-y-4">
+                                <div>
+                                    <label class="block text-xs font-bold text-slate-700 mb-1">Full Name *</label>
+                                    <input type="text" id="user-full-name" required maxlength="120" autocomplete="name" class="w-full px-4 py-2.5 rounded-xl border border-slate-200 text-sm" placeholder="Full name">
+                                </div>
+                                <div>
+                                    <label class="block text-xs font-bold text-slate-700 mb-1">Role *</label>
+                                    <select id="user-role" required class="w-full px-4 py-2.5 rounded-xl border border-slate-200 text-sm bg-white">
+                                        <option value="Admin">Admin</option>
+                                        <option value="Manager">Manager</option>
+                                        <option value="Salesman">Salesman</option>
+                                        <option value="Marketing">Marketing</option>
+                                    </select>
+                                </div>
+                                <div>
+                                    <label class="block text-xs font-bold text-slate-700 mb-1">Email ID *</label>
+                                    <input type="email" id="user-email" required autocomplete="email" class="w-full px-4 py-2.5 rounded-xl border border-slate-200 text-sm" placeholder="name@example.com" pattern="^[A-Za-z0-9._%+\\-]+@[A-Za-z0-9.\\-]+\\.[A-Za-z]{2,}$">
+                                </div>
+                                <div>
+                                    <label class="block text-xs font-bold text-slate-700 mb-1">Password *</label>
+                                    <input type="password" id="user-password" required minlength="10" autocomplete="new-password" class="w-full px-4 py-2.5 rounded-xl border border-slate-200 text-sm" placeholder="At least 10 characters">
+                                    <p class="text-[11px] text-slate-400 mt-1">Must include uppercase, lowercase, number, and special character.</p>
+                                </div>
+                                <button type="submit" class="w-full py-3 rounded-xl bg-brand-600 hover:bg-brand-700 text-white font-bold shadow-md transition-all">
+                                    Add New User
+                                </button>
+                            </form>
+                        </div>
+                    </div>
+
+                    <section id="settings-access-control" class="settings-section hidden bg-white p-6 sm:p-8 rounded-2xl border border-slate-200 shadow-sm">
+                        <h3 class="text-xl font-bold text-slate-900 mb-2">Access Control</h3>
+                        <p class="text-xs text-slate-500 mb-6 pb-4 border-b border-slate-100">Customize exact permissions individually for each user. Super Admin always has full access and cannot be removed.</p>
+
+                        <div class="rounded-xl border border-slate-200 bg-slate-50 p-4 mb-5">
+                            <p class="text-xs font-bold uppercase tracking-wider text-slate-500">Super Admin</p>
+                            <p id="access-admin-user" class="text-sm font-bold text-slate-900 mt-1">—</p>
+                            <p class="text-xs text-slate-500 mt-1">Full access. Only Super Admin can delete user accounts.</p>
+                        </div>
+
+                        <div class="grid grid-cols-1 lg:grid-cols-[240px_1fr] gap-5">
+                            <div>
+                                <label class="block text-xs font-bold text-slate-700 mb-1">Select User</label>
+                                <select id="access-user-id" onchange="renderAccessMatrix()" class="w-full px-3.5 py-2.5 rounded-xl border border-slate-200 text-sm bg-white"></select>
+                                <p class="text-[11px] text-slate-400 mt-2">Choose a specific user to view and edit their permission matrix.</p>
+                            </div>
+                            <div id="access-permissions-matrix" class="space-y-2"></div>
+                        </div>
+                    </section>
+
+                    <section id="settings-page-setup" class="settings-section hidden bg-white p-6 sm:p-8 rounded-2xl border border-slate-200 shadow-sm">
+                        <h3 class="text-xl font-bold text-slate-900 mb-2">Page Setup</h3>
+                        <p class="text-xs text-slate-500 mb-6 pb-4 border-b border-slate-100">Customize the panel title, shop details, logo, and dashboard theme.</p>
+
+                        <form onsubmit="handleSaveSettings(event)" class="space-y-4">
+                            <div>
+                                <label class="block text-xs font-bold text-slate-700 mb-1">Page Name</label>
+                                <input type="text" id="page-name" required class="w-full px-4 py-2.5 rounded-xl border border-slate-200 text-sm" placeholder="Website / panel title">
+                            </div>
+
+                            <div>
+                                <label class="block text-xs font-bold text-slate-700 mb-1">Shop Name</label>
+                                <input type="text" id="set-shop-name" required class="w-full px-4 py-2.5 rounded-xl border border-slate-200 text-sm">
+                            </div>
+                            <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                                <div>
+                                    <label class="block text-xs font-bold text-slate-700 mb-1">Shop Mobile Number</label>
+                                    <input type="text" id="set-shop-phone" required class="w-full px-4 py-2.5 rounded-xl border border-slate-200 text-sm">
+                                </div>
+                                <div>
+                                    <label class="block text-xs font-bold text-slate-700 mb-1">bKash / Nagad Payment Number</label>
+                                    <input type="text" id="set-payment-number" required class="w-full px-4 py-2.5 rounded-xl border border-slate-200 text-sm">
+                                </div>
+                            </div>
+                            <div>
+                                <label class="block text-xs font-bold text-slate-700 mb-1">Shop Address (shown on invoice)</label>
+                                <input type="text" id="set-shop-address" required class="w-full px-4 py-2.5 rounded-xl border border-slate-200 text-sm">
+                            </div>
+
+                            <div class="pt-4 border-t border-slate-100">
+                                <h4 class="text-sm font-bold text-slate-900 mb-3">Logo Upload</h4>
+                                <div class="flex flex-col sm:flex-row items-start sm:items-center gap-4">
+                                    <img id="settings-logo-preview" src="/logo.png?v=2" alt="Current site logo" class="w-16 h-16 rounded-xl object-cover border border-slate-200 bg-white">
+                                    <div class="space-y-2 w-full">
+                                        <input type="file" id="logo-upload" accept="image/*" class="block w-full text-sm text-slate-500 file:mr-3 file:py-2 file:px-4 file:rounded-xl file:border-0 file:text-sm file:font-bold file:bg-slate-900 file:text-white hover:file:bg-slate-800">
+                                        <button type="button" onclick="uploadSiteLogo()" class="px-4 py-2.5 rounded-xl bg-brand-600 hover:bg-brand-700 text-white text-sm font-bold">
+                                            Upload Logo
+                                        </button>
+                                    </div>
+                                </div>
+                            </div>
+
+                            <div class="pt-4 border-t border-slate-100">
+                                <h4 class="text-sm font-bold text-slate-900 mb-3">Theme Selector</h4>
+                                <p class="text-xs text-slate-500 mb-3">Choose from 24 distinct color and UI themes. Selecting a theme applies it to the dashboard immediately.</p>
+                                <div id="theme-selector" class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3" data-selected="classic-pink"></div>
+                            </div>
+
+                            <button type="submit" class="w-full py-3 rounded-xl bg-slate-900 hover:bg-slate-800 text-white font-bold shadow-md transition-all mt-4">
+                                Save Page Setup
+                            </button>
+                        </form>
+                    </section>
+                </div>
+            </div>
+        </div>
+
+        <!-- SUB-TAB: REPORTS -->
+        <div id="subtab-reports" class="admin-subtab-panel hidden w-full">
+            <div class="bg-white p-6 rounded-2xl border border-slate-200 shadow-sm space-y-6">
+                <div class="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4 pb-4 border-b border-slate-100">
+                    <div>
+                        <h3 class="text-xl font-bold text-slate-900">Reports</h3>
+                        <p class="text-xs text-slate-500 mt-1">Financial summaries, order summaries, and calendar filtering.</p>
+                    </div>
+                    <div class="flex gap-2" role="tablist">
+                        <button type="button" onclick="switchReportView('daily')" data-report-tab="daily" class="report-tab px-4 py-2 rounded-xl text-sm font-bold bg-brand-600 text-white">Daily Report</button>
+                        <button type="button" onclick="switchReportView('monthly')" data-report-tab="monthly" class="report-tab px-4 py-2 rounded-xl text-sm font-bold bg-white text-slate-700 border border-slate-200">Monthly Report</button>
+                    </div>
+                </div>
+
+                <div id="report-daily" class="report-view space-y-4">
+                    <div class="rounded-xl border border-slate-200 bg-slate-50 p-4">
+                        <h4 class="text-sm font-bold text-slate-900 mb-3">Calendar Date Filter</h4>
+                        <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
+                            <div>
+                                <label class="block text-xs font-bold text-slate-700 mb-1">Specific Date</label>
+                                <input type="date" id="daily-report-date" onchange="renderReports()" class="w-full px-3 py-2 rounded-xl border border-slate-200 bg-white text-sm">
+                            </div>
+                            <div>
+                                <label class="block text-xs font-bold text-slate-700 mb-1">From Date</label>
+                                <input type="date" id="daily-report-from" onchange="renderReports()" class="w-full px-3 py-2 rounded-xl border border-slate-200 bg-white text-sm">
+                            </div>
+                            <div>
+                                <label class="block text-xs font-bold text-slate-700 mb-1">To Date</label>
+                                <input type="date" id="daily-report-to" onchange="renderReports()" class="w-full px-3 py-2 rounded-xl border border-slate-200 bg-white text-sm">
+                            </div>
+                            <div class="flex items-end">
+                                <button type="button" onclick="clearReportFilters('daily')" class="w-full px-3 py-2 rounded-xl bg-white text-slate-700 border border-slate-200 text-sm font-bold hover:bg-slate-100">Clear Filters</button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <div id="report-monthly" class="report-view hidden space-y-4">
+                    <div class="rounded-xl border border-slate-200 bg-slate-50 p-4">
+                        <h4 class="text-sm font-bold text-slate-900 mb-3">Calendar Month Filter</h4>
+                        <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
+                            <div>
+                                <label class="block text-xs font-bold text-slate-700 mb-1">Month</label>
+                                <input type="month" id="monthly-report-month" onchange="renderReports()" class="w-full px-3 py-2 rounded-xl border border-slate-200 bg-white text-sm">
+                            </div>
+                            <div>
+                                <label class="block text-xs font-bold text-slate-700 mb-1">From Date</label>
+                                <input type="date" id="monthly-report-from" onchange="renderReports()" class="w-full px-3 py-2 rounded-xl border border-slate-200 bg-white text-sm">
+                            </div>
+                            <div>
+                                <label class="block text-xs font-bold text-slate-700 mb-1">To Date</label>
+                                <input type="date" id="monthly-report-to" onchange="renderReports()" class="w-full px-3 py-2 rounded-xl border border-slate-200 bg-white text-sm">
+                            </div>
+                            <div class="flex items-end">
+                                <button type="button" onclick="clearReportFilters('monthly')" class="w-full px-3 py-2 rounded-xl bg-white text-slate-700 border border-slate-200 text-sm font-bold hover:bg-slate-100">Clear Filters</button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <div id="report-metrics" class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4"></div>
+
+                <div class="bg-white rounded-2xl border border-slate-200 shadow-sm">
+                    <div class="p-4 border-b border-slate-100">
+                        <h4 class="text-lg font-bold text-slate-900">Order Summaries</h4>
+                    </div>
+                    <div id="report-orders" class="divide-y divide-slate-100"></div>
+                </div>
+            </div>
+        </div>
             </div>
         </div>
     </main>
@@ -2196,6 +2904,29 @@ INDEX_HTML = r"""<!DOCTYPE html>
                     <textarea id="cust-address" rows="2" required placeholder="House no, road, area, thana and district..." class="w-full px-4 py-2.5 rounded-xl border border-slate-200 text-sm"></textarea>
                 </div>
 
+                <!-- Optional Custom Design Instructions -->
+                <div id="custom-design-section" class="rounded-2xl border border-slate-200 bg-slate-50 p-4 space-y-3">
+                    <div class="flex items-center justify-between gap-3">
+                        <div>
+                            <h4 class="text-sm font-bold text-slate-900">Custom Design Instructions</h4>
+                            <p class="text-[11px] text-slate-500">Optional. Add print placement, text, color changes, sizing notes, or attach a mockup.</p>
+                        </div>
+                        <span class="text-[10px] font-bold uppercase tracking-wider text-slate-400 bg-white px-2 py-1 rounded-lg border border-slate-200">Optional</span>
+                    </div>
+                    <div>
+                        <label class="block text-xs font-bold text-slate-700 mb-1">Custom Design Notes</label>
+                        <textarea id="custom-design-notes" rows="3" maxlength="2000" placeholder="e.g. Place logo on left chest, use black thread, change sleeve color, custom text..." class="w-full px-3.5 py-2.5 rounded-xl border border-slate-200 bg-white text-sm"></textarea>
+                    </div>
+                    <div>
+                        <label class="block text-xs font-bold text-slate-700 mb-1">Reference Image / Mockup</label>
+                        <input type="file" id="custom-design-reference" accept="image/*" onchange="handleCustomDesignReferenceUpload(event)" class="block w-full text-sm text-slate-500 file:mr-3 file:py-2 file:px-4 file:rounded-xl file:border-0 file:text-sm file:font-bold file:bg-slate-900 file:text-white hover:file:bg-slate-800">
+                        <div id="custom-design-reference-preview" class="hidden pt-2">
+                            <img id="custom-design-reference-img" src="" alt="Custom design reference" class="h-28 w-28 object-cover rounded-xl border border-slate-200 bg-white">
+                            <button type="button" onclick="clearCustomDesignReference()" class="mt-2 text-xs text-rose-600 font-bold hover:underline">Remove reference image</button>
+                        </div>
+                    </div>
+                </div>
+
                 <div>
                     <label class="block text-xs font-bold text-slate-700 mb-2">Choose payment method *</label>
                     <div class="grid grid-cols-3 gap-2.5">
@@ -2329,14 +3060,17 @@ INDEX_HTML = r"""<!DOCTYPE html>
     </div>
 
     <!-- Footer -->
-    <footer class="bg-slate-900 text-slate-400 py-10 border-t border-slate-800 no-print">
-        <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 flex flex-col sm:flex-row justify-between items-center gap-4">
-            <div class="text-center sm:text-left">
-                <h4 id="footer-shop-name" class="text-white font-bold text-lg">Taham</h4>
-                <p id="footer-shop-address" class="text-xs mt-1">We deliver the best quality clothing all over Bangladesh with trust.</p>
+    <footer class="footer-3d no-print">
+        <div class="max-w-7xl mx-auto px-5 sm:px-7 lg:px-9 py-7 flex flex-col sm:flex-row justify-between items-center gap-5">
+            <div class="footer-brand text-center sm:text-left">
+                <h4 id="footer-shop-name" class="footer-title text-white font-extrabold text-xl">Taham</h4>
+                <p id="footer-shop-address" class="footer-address text-sm mt-2 text-slate-300">Rayerbag, Dhaka, Bangladesh.</p>
             </div>
             <div class="flex items-center gap-4 text-xs">
-                <span id="footer-shop-phone">Helpline: 01700-000000</span>
+                <a id="footer-shop-phone" class="footer-phone-pill" href="tel:01400570014" title="Call / WhatsApp Helpline" aria-label="Call or WhatsApp helpline">
+                    <i data-lucide="phone" class="w-4 h-4"></i>
+                    <span id="footer-shop-phone-text">Helpline: 01400-570014</span>
+                </a>
             </div>
         </div>
     </footer>
@@ -2375,7 +3109,6 @@ INDEX_HTML = r"""<!DOCTYPE html>
          "Search clothes by name...": "পোশাকের নাম খুঁজুন...",
          "All Collections": "সকল কালেকশন",
          "Loading...": "লোড হচ্ছে...",
-         "Business & Accounts Management Panel": "ব্যবসা পরিচালনা ও হিসাব-নিকাশ প্যানেল",
          "View Store": "দোকান দেখুন",
          "Lock / Logout": "লক / লগআউট",
          "Total Sales (Revenue)": "মোট বিক্রি (Revenue)",
@@ -2391,7 +3124,6 @@ INDEX_HTML = r"""<!DOCTYPE html>
          "Orders & Invoices": "অর্ডার ও ইনভয়েস (Orders)",
          "Products & Stock (Inventory)": "পণ্য ও স্টক ম্যানেজমেন্ট (Inventory)",
          "Daily Expenses": "দৈনিক খরচের হিসাব (Expenses)",
-         "Shop Settings & Password": "দোকানের সেটিংস ও পাসওয়ার্ড",
          "All Customer Orders": "সকল কাস্টমার অর্ডার তালিকা",
          "Changing the order status updates stock automatically, and you can print the receipt": "অর্ডার স্ট্যাটাস পরিবর্তন করলে স্টক অটোমেটিক আপডেট হবে এবং রসিদ প্রিন্ট করা যাবে",
          "All Orders": "সব অর্ডার (All Orders)",
@@ -2625,7 +3357,6 @@ INDEX_HTML = r"""<!DOCTYPE html>
          "Discount value": "ছাড়ের পরিমাণ",
          "CASH MEMO": "ক্যাশ মেমো",
          "Send Money": "সেন্ড মানি",
-         "Super Admin ERP": "সুপার অ্যাডমিন প্যানেল",
          "Real-Time Cloud Sync Active": "রিয়েল-টাইম সিঙ্ক চালু আছে",
          "Colours (optional)": "রঙ (ঐচ্ছিক)",
          "Pick from the list or add your own colour:": "তালিকা থেকে বেছে নিন বা নিজের রঙ যোগ করুন:",
@@ -2861,6 +3592,8 @@ INDEX_HTML = r"""<!DOCTYPE html>
         let expenses = [];
         let storeSettings = {
             shopName: 'Taham',
+            pageName: 'Taham',
+            theme: 'classic-pink',
             shopPhone: '01700-000000',
             paymentNumber: '01700-000000',
             shopAddress: 'New Market, Dhaka, Bangladesh',
@@ -2870,6 +3603,12 @@ INDEX_HTML = r"""<!DOCTYPE html>
         let selectedCategory = 'All';
         let selectedSizes = {};
         let isAdminAuthenticated = false;
+        let isSuperAdmin = false;
+        let users = [];
+        let permissionDefs = [];
+        let currentAccessUserId = '';
+        let currentReportView = 'daily';
+        let customDesignReferenceImage = '';
         let uploadedImageBase64 = '';
         let uploadedCollectionImage = '';
         let collections = [];
@@ -2891,10 +3630,12 @@ INDEX_HTML = r"""<!DOCTYPE html>
                 const me = await api('GET', '/api/me');
                 if (me.admin) {
                     isAdminAuthenticated = true;
+                    isSuperAdmin = !!me.isSuperAdmin || !!me.admin;
                     document.getElementById('admin-logout-btn').classList.remove('hidden');
                 }
                 setCloudStatus('online', 'Connected to server');
                 setupRealtimeListeners();
+                await loadUsers();
                 backend.startPolling();
             } catch (error) {
                 console.error('Server error:', error);
@@ -2968,20 +3709,293 @@ INDEX_HTML = r"""<!DOCTYPE html>
             }, (err) => console.error("Settings snapshot error:", err));
         }
 
+        const THEMES = [
+            { id: 'classic-pink', name: 'Classic Pink', description: 'Warm pink accent with clean enterprise contrast', brand50: '#fdf2f8', brand100: '#fce7f3', brand300: '#f9a8d4', brand500: '#e879a9', brand600: '#db2777', brand700: '#be185d', brand900: '#831843', appBg: '#f8fafc', appSurface: '#ffffff', appText: '#0f172a' },
+            { id: 'enterprise-indigo', name: 'Enterprise Indigo', description: 'Balanced indigo for a polished SaaS dashboard', brand50: '#eef2ff', brand100: '#e0e7ff', brand300: '#a5b4fc', brand500: '#6366f1', brand600: '#4f46e5', brand700: '#4338ca', brand900: '#312e81', appBg: '#f8fafc', appSurface: '#ffffff', appText: '#0f172a' },
+            { id: 'corporate-navy', name: 'Corporate Navy', description: 'Deep navy accents with crisp light surfaces', brand50: '#f1f5f9', brand100: '#e2e8f0', brand300: '#94a3b8', brand500: '#334155', brand600: '#1e3a5f', brand700: '#172a46', brand900: '#0b1726', appBg: '#f8fafc', appSurface: '#ffffff', appText: '#0f172a' },
+            { id: 'slate-emerald', name: 'Slate Emerald', description: 'Calm emerald accents with neutral contrast', brand50: '#ecfdf5', brand100: '#d1fae5', brand300: '#86efac', brand500: '#10b981', brand600: '#059669', brand700: '#047857', brand900: '#064e3b', appBg: '#f8fafc', appSurface: '#ffffff', appText: '#0f172a' },
+            { id: 'warm-sand', name: 'Warm Sand', description: 'Soft sand neutrals with restrained warmth', brand50: '#fefce8', brand100: '#fef9c3', brand300: '#fde68a', brand500: '#d97706', brand600: '#b45309', brand700: '#92400e', brand900: '#78350f', appBg: '#fafaf9', appSurface: '#ffffff', appText: '#1c1917' },
+            { id: 'graphite-slate', name: 'Graphite Slate', description: 'Neutral graphite for a minimal professional UI', brand50: '#f8fafc', brand100: '#f1f5f9', brand300: '#cbd5e1', brand500: '#64748b', brand600: '#475569', brand700: '#334155', brand900: '#1e293b', appBg: '#f8fafc', appSurface: '#ffffff', appText: '#0f172a' },
+            { id: 'deep-teal', name: 'Deep Teal', description: 'Sophisticated teal with cool clean backgrounds', brand50: '#f0fdfa', brand100: '#ccfbf1', brand300: '#5eead4', brand500: '#14b8a6', brand600: '#0f766e', brand700: '#115e59', brand900: '#134e4a', appBg: '#f8fafc', appSurface: '#ffffff', appText: '#0f172a' },
+            { id: 'royal-blue', name: 'Royal Blue', description: 'Refined blue accents with high readability', brand50: '#eff6ff', brand100: '#dbeafe', brand300: '#93c5fd', brand500: '#3b82f6', brand600: '#2563eb', brand700: '#1d4ed8', brand900: '#1e3a8a', appBg: '#f8fafc', appSurface: '#ffffff', appText: '#0f172a' },
+            { id: 'violet-indigo', name: 'Violet Indigo', description: 'Elegant violet harmonized with cool surfaces', brand50: '#f5f3ff', brand100: '#ede9fe', brand300: '#c4b5fd', brand500: '#8b5cf6', brand600: '#7c3aed', brand700: '#6d28d9', brand900: '#4c1d95', appBg: '#f8fafc', appSurface: '#ffffff', appText: '#0f172a' },
+            { id: 'crimson', name: 'Crimson', description: 'Confident crimson with clean neutral contrast', brand50: '#fef2f2', brand100: '#fee2e2', brand300: '#fca5a5', brand500: '#ef4444', brand600: '#dc2626', brand700: '#b91c1c', brand900: '#7f1d1d', appBg: '#f8fafc', appSurface: '#ffffff', appText: '#0f172a' },
+            { id: 'amber-gold', name: 'Amber Gold', description: 'Premium amber with restrained gold accents', brand50: '#fffbeb', brand100: '#fef3c7', brand300: '#fcd34d', brand500: '#f59e0b', brand600: '#d97706', brand700: '#b45309', brand900: '#78350f', appBg: '#fffbeb', appSurface: '#ffffff', appText: '#0f172a' },
+            { id: 'forest-green', name: 'Forest Green', description: 'Muted forest accent for a grounded feel', brand50: '#f0fdf4', brand100: '#dcfce7', brand300: '#86efac', brand500: '#22c55e', brand600: '#16a34a', brand700: '#15803d', brand900: '#14532d', appBg: '#f0fdf4', appSurface: '#ffffff', appText: '#0f172a' },
+            { id: 'ocean-blue', name: 'Ocean Blue', description: 'Clear blue accents with airy backgrounds', brand50: '#f0f9ff', brand100: '#e0f2fe', brand300: '#7dd3fc', brand500: '#0ea5e9', brand600: '#0284c7', brand700: '#0369a1', brand900: '#0c4a6e', appBg: '#f0f9ff', appSurface: '#ffffff', appText: '#0f172a' },
+            { id: 'rose-quartz', name: 'Rose Quartz', description: 'Soft rose accent with elegant contrast', brand50: '#fff1f2', brand100: '#ffe4e6', brand300: '#fda4af', brand500: '#f43f5e', brand600: '#e11d48', brand700: '#be123c', brand900: '#881337', appBg: '#fff1f2', appSurface: '#ffffff', appText: '#0f172a' },
+            { id: 'copper-warm', name: 'Copper Warm', description: 'Warm copper accent with soft neutral base', brand50: '#fff7ed', brand100: '#ffedd5', brand300: '#fdba74', brand500: '#f97316', brand600: '#c2410c', brand700: '#9a3412', brand900: '#7c2d12', appBg: '#fff7ed', appSurface: '#ffffff', appText: '#0f172a' },
+            { id: 'midnight', name: 'Midnight', description: 'Dark midnight accent with strong clean contrast', brand50: '#f1f5f9', brand100: '#e2e8f0', brand300: '#64748b', brand500: '#0f172a', brand600: '#020617', brand700: '#000000', brand900: '#000000', appBg: '#f8fafc', appSurface: '#ffffff', appText: '#0f172a' },
+            { id: 'lavender', name: 'Lavender', description: 'Soft lavender with calm cool backgrounds', brand50: '#f5f3ff', brand100: '#ede9fe', brand300: '#c4b5fd', brand500: '#a78bfa', brand600: '#8b5cf6', brand700: '#7c3aed', brand900: '#4c1d95', appBg: '#f5f3ff', appSurface: '#ffffff', appText: '#0f172a' },
+            { id: 'sky', name: 'Sky', description: 'Light sky accent with open spacing', brand50: '#f0f9ff', brand100: '#e0f2fe', brand300: '#bae6fd', brand500: '#38bdf8', brand600: '#0ea5e9', brand700: '#0284c7', brand900: '#0369a1', appBg: '#f0f9ff', appSurface: '#ffffff', appText: '#0f172a' },
+            { id: 'plum', name: 'Plum', description: 'Deep plum accent with refined contrast', brand50: '#fdf4ff', brand100: '#fae8ff', brand300: '#e9d5ff', brand500: '#a855f7', brand600: '#9333ea', brand700: '#7e22ce', brand900: '#581c87', appBg: '#fdf4ff', appSurface: '#ffffff', appText: '#0f172a' },
+            { id: 'carbon-gold', name: 'Carbon Gold', description: 'Carbon accent with restrained gold highlights', brand50: '#f8fafc', brand100: '#f1f5f9', brand300: '#cbd5e1', brand500: '#d4af37', brand600: '#b8962f', brand700: '#8a6d1f', brand900: '#1f2937', appBg: '#f8fafc', appSurface: '#ffffff', appText: '#0f172a' },
+            { id: 'aqua-mint', name: 'Aqua Mint', description: 'Cool aqua accent with fresh clean backgrounds', brand50: '#ecfeff', brand100: '#cffafe', brand300: '#a5f3fc', brand500: '#06b6d4', brand600: '#0891b2', brand700: '#0e7490', brand900: '#164e63', appBg: '#ecfeff', appSurface: '#ffffff', appText: '#0f172a' },
+            { id: 'coral', name: 'Coral', description: 'Warm coral accent with bright clean surfaces', brand50: '#fff1f2', brand100: '#ffe4e6', brand300: '#fecdd3', brand500: '#fb7185', brand600: '#f43f5e', brand700: '#e11d48', brand900: '#881337', appBg: '#fff1f2', appSurface: '#ffffff', appText: '#0f172a' },
+            { id: 'muted-sage', name: 'Muted Sage', description: 'Muted sage green for a calm enterprise palette', brand50: '#f0fdf4', brand100: '#dcfce7', brand300: '#bbf7d0', brand500: '#4d7c0f', brand600: '#3f6212', brand700: '#365314', brand900: '#1a2e05', appBg: '#f0fdf4', appSurface: '#ffffff', appText: '#0f172a' },
+            { id: 'ruby', name: 'Ruby', description: 'Rich ruby accent with polished neutral contrast', brand50: '#fef2f2', brand100: '#fee2e2', brand300: '#fecaca', brand500: '#ef4444', brand600: '#b91c1c', brand700: '#991b1b', brand900: '#7f1d1d', appBg: '#f8fafc', appSurface: '#ffffff', appText: '#0f172a' },
+        ];
+
+        window.applyTheme = function(themeId) {
+            const theme = THEMES.find(t => t.id === themeId) || THEMES[0];
+            const root = document.documentElement;
+            root.setAttribute('data-theme', theme.id);
+            root.style.setProperty('--brand-50', theme.brand50);
+            root.style.setProperty('--brand-100', theme.brand100);
+            root.style.setProperty('--brand-300', theme.brand300);
+            root.style.setProperty('--brand-500', theme.brand500);
+            root.style.setProperty('--brand-600', theme.brand600);
+            root.style.setProperty('--brand-700', theme.brand700);
+            root.style.setProperty('--brand-900', theme.brand900);
+            root.style.setProperty('--app-bg', theme.appBg);
+            root.style.setProperty('--app-surface', theme.appSurface);
+            root.style.setProperty('--app-text', theme.appText);
+            root.style.setProperty('--app-shadow', '0 1px 3px rgba(15, 23, 42, 0.06), 0 1px 2px rgba(15, 23, 42, 0.04)');
+            storeSettings.theme = theme.id;
+
+            const selector = document.getElementById('theme-selector');
+            if (selector) selector.dataset.selected = theme.id;
+            document.querySelectorAll('.theme-option').forEach(btn => {
+                const active = btn.dataset.theme === theme.id;
+                btn.setAttribute('aria-pressed', active ? 'true' : 'false');
+                btn.className = active
+                    ? 'theme-option rounded-xl border border-brand-600 bg-brand-50 p-3 text-left ring-2 ring-brand-500'
+                    : 'theme-option rounded-xl border border-slate-200 bg-white p-3 text-left hover:border-brand-300 hover:bg-slate-50';
+            });
+            if (window.lucide) lucide.createIcons();
+        };
+
+        window.renderThemeSelector = function() {
+            const container = document.getElementById('theme-selector');
+            if (!container) return;
+            const selected = storeSettings.theme || 'classic-pink';
+            container.dataset.selected = selected;
+            container.innerHTML = THEMES.map(theme => `
+                <button type="button" class="theme-option rounded-xl border border-slate-200 bg-white p-3 text-left hover:border-brand-300 hover:bg-slate-50"
+                    data-theme="${esc(theme.id)}" onclick="applyTheme('${esc(theme.id)}')" aria-pressed="${theme.id === selected ? 'true' : 'false'}">
+                    <span class="theme-swatch block h-8 rounded-lg mb-2" style="background: linear-gradient(135deg, ${esc(theme.brand500)} 0%, ${esc(theme.brand600)} 55%, ${esc(theme.brand700)} 100%);"></span>
+                    <span class="block text-sm font-bold text-slate-900">${esc(theme.name)}</span>
+                    <span class="block text-xs text-slate-500 mt-1">${esc(theme.description)}</span>
+                </button>
+            `).join('');
+            window.applyTheme(selected);
+        };
+
+        window.switchSettingsSection = function(sectionName) {
+            document.querySelectorAll('.settings-section').forEach(section => {
+                section.classList.toggle('hidden', section.id !== `settings-${sectionName}`);
+            });
+            document.querySelectorAll('.settings-submenu-btn').forEach(btn => {
+                const active = btn.dataset.settingsSection === sectionName;
+                btn.className = active
+                    ? 'settings-submenu-btn w-full px-4 py-2.5 rounded-xl text-sm font-bold bg-brand-600 text-white flex items-center justify-start gap-2'
+                    : 'settings-submenu-btn w-full px-4 py-2.5 rounded-xl text-sm font-bold bg-white text-slate-700 hover:bg-slate-100 border border-slate-200 flex items-center justify-start gap-2';
+            });
+            if (sectionName === 'access-control') renderAccessControl();
+            if (sectionName === 'user-management') loadUsers();
+            if (window.lucide) lucide.createIcons();
+        };
+
+        const FALLBACK_PERMISSION_DEFS = [
+            { key: 'viewOrders', label: 'View Orders' },
+            { key: 'editOrders', label: 'Edit Orders' },
+            { key: 'manageProducts', label: 'Manage Products & Stock' },
+            { key: 'addCollections', label: 'Add Collections' },
+            { key: 'deleteCollections', label: 'Delete Collections' },
+            { key: 'manageExpenses', label: 'Manage Daily Expenses' },
+            { key: 'viewProfit', label: 'View Profit/Revenue Stats' },
+            { key: 'accessSettings', label: 'Access Settings' },
+            { key: 'userManagement', label: 'User Management' },
+        ];
+
+        function isValidEmail(email) {
+            return /^[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}$/.test(email);
+        }
+
+        function isStrongPassword(password) {
+            return password.length >= 10 && /[a-z]/.test(password) && /[A-Z]/.test(password) && /\d/.test(password) && /[^A-Za-z0-9]/.test(password);
+        }
+
+        window.openUserModal = function() {
+            document.getElementById('user-modal').classList.remove('hidden');
+            if (window.lucide) lucide.createIcons();
+        };
+
+        window.closeUserModal = function() {
+            document.getElementById('user-modal').classList.add('hidden');
+        };
+
+        window.handleAddUser = async function(e) {
+            e.preventDefault();
+            const fullName = document.getElementById('user-full-name').value.trim();
+            const role = document.getElementById('user-role').value;
+            const email = document.getElementById('user-email').value.trim();
+            const password = document.getElementById('user-password').value;
+
+            if (!fullName) { showToast('Full name is required.', 'error'); return; }
+            if (['Admin', 'Manager', 'Salesman', 'Marketing'].indexOf(role) < 0) { showToast('Invalid role. Super Admin is reserved for the primary owner.', 'error'); return; }
+            if (!isValidEmail(email)) { showToast('Please enter a strict valid email address.', 'error'); return; }
+            if (!isStrongPassword(password)) { showToast('Password must be at least 10 characters and include uppercase, lowercase, number, and special character.', 'error'); return; }
+
+            try {
+                await api('POST', '/api/users', { fullName, role, email, password });
+                e.target.reset();
+                closeUserModal();
+                await loadUsers();
+                showToast('User added successfully!');
+            } catch (err) {
+                showToast(err.message || 'Could not add user.', 'error');
+            }
+        };
+
+        window.deleteUser = async function(userId) {
+            if (!isSuperAdmin) { showToast('Only Super Admin can delete user accounts.', 'error'); return; }
+            if (!confirm('Delete this user account?')) return;
+            try {
+                await api('DELETE', `/api/users/${encodeURIComponent(userId)}`);
+                await loadUsers();
+                showToast('User deleted.');
+            } catch (err) {
+                showToast(err.message || 'Could not delete user.', 'error');
+            }
+        };
+
+        async function loadUsers() {
+            if (!isAdminAuthenticated) return;
+            try {
+                const data = await api('GET', '/api/users');
+                users = data.users || [];
+                permissionDefs = data.permissionDefs || FALLBACK_PERMISSION_DEFS;
+                renderUserManagement();
+                renderAccessControl();
+            } catch (err) {
+                console.error('Users error:', err);
+            }
+        }
+
+        window.renderUserManagement = function() {
+            const box = document.getElementById('users-list');
+            if (!box) return;
+            const superAdminHtml = `
+                <div class="p-4 flex items-center justify-between gap-3 bg-slate-50">
+                    <div class="min-w-0">
+                        <p class="text-sm font-bold text-slate-900 truncate">${esc(storeSettings.adminUser || 'Super Admin')}</p>
+                        <p class="text-xs text-slate-500">Super Admin</p>
+                    </div>
+                    <span class="text-xs font-bold text-emerald-700 bg-emerald-50 px-2 py-1 rounded-lg">Protected</span>
+                </div>`;
+            if (!users.length) {
+                box.innerHTML = superAdminHtml + `<p class="p-4 text-center text-xs text-slate-400">No additional users yet.</p>`;
+                if (window.lucide) lucide.createIcons();
+                return;
+            }
+            box.innerHTML = superAdminHtml + users.map(u => `
+                <div class="p-4 flex items-center justify-between gap-3">
+                    <div class="min-w-0">
+                        <p class="text-sm font-bold text-slate-900 truncate">${esc(u.fullName || u.email)}</p>
+                        <p class="text-xs text-slate-500 truncate">${esc(u.email)}</p>
+                    </div>
+                    <div class="flex items-center gap-2 shrink-0">
+                        <span class="text-xs font-bold text-slate-600 bg-slate-100 px-2 py-1 rounded-lg">${esc(u.role)}</span>
+                        ${isSuperAdmin ? `<button type="button" onclick="deleteUser('${esc(u.id)}')" class="p-2 rounded-xl text-rose-600 hover:bg-rose-50" title="Delete user"><i data-lucide="trash-2" class="w-4 h-4"></i></button>` : ''}
+                    </div>
+                </div>
+            `).join('');
+            if (window.lucide) lucide.createIcons();
+        };
+
+        window.renderAccessControl = function() {
+            const select = document.getElementById('access-user-id');
+            if (!select) return;
+            const defs = permissionDefs.length ? permissionDefs : FALLBACK_PERMISSION_DEFS;
+            permissionDefs = defs;
+            const superAdmin = { id: 'super-admin', fullName: storeSettings.adminUser || 'Super Admin', role: 'Super Admin', permissions: Object.fromEntries(defs.map(d => [d.key, true])), isSuperAdmin: true };
+            const allUsers = [superAdmin, ...users];
+            if (!currentAccessUserId || !allUsers.some(u => u.id === currentAccessUserId)) currentAccessUserId = superAdmin.id;
+            select.innerHTML = allUsers.map(u => `<option value="${esc(u.id)}">${esc(u.fullName || u.email || u.id)} (${esc(u.role)})</option>`).join('');
+            select.value = currentAccessUserId;
+            renderAccessMatrix();
+        };
+
+        window.renderAccessMatrix = function() {
+            const matrix = document.getElementById('access-permissions-matrix');
+            if (!matrix) return;
+            const select = document.getElementById('access-user-id');
+            if (select) currentAccessUserId = select.value;
+            const defs = permissionDefs.length ? permissionDefs : FALLBACK_PERMISSION_DEFS;
+            const superAdmin = { id: 'super-admin', fullName: storeSettings.adminUser || 'Super Admin', role: 'Super Admin', permissions: Object.fromEntries(defs.map(d => [d.key, true])), isSuperAdmin: true };
+            const allUsers = [superAdmin, ...users];
+            const user = allUsers.find(u => u.id === currentAccessUserId) || superAdmin;
+            const superAdminUser = user.id === 'super-admin';
+            matrix.innerHTML = defs.map(def => `
+                <label class="flex items-center justify-between gap-3 rounded-xl border border-slate-200 bg-white p-3 hover:bg-slate-50">
+                    <span class="text-sm text-slate-700">${esc(def.label)}</span>
+                    <input type="checkbox" class="w-4 h-4 rounded border-slate-300 text-brand-600" data-permission-key="${esc(def.key)}"
+                        ${superAdminUser || user.permissions[def.key] ? 'checked' : ''}
+                        ${superAdminUser || !isSuperAdmin ? 'disabled' : ''}
+                        onchange="togglePermission('${esc(user.id)}', '${esc(def.key)}', this.checked)">
+                </label>
+            `).join('');
+        };
+
+        window.togglePermission = async function(userId, key, checked) {
+            if (!isSuperAdmin) return;
+            const user = users.find(u => u.id === userId);
+            if (!user) return;
+            user.permissions = { ...(user.permissions || {}), [key]: checked };
+            try {
+                await api('PUT', `/api/users/${encodeURIComponent(userId)}/permissions`, { permissions: user.permissions });
+            } catch (err) {
+                showToast(err.message || 'Could not update permission.', 'error');
+            }
+            renderAccessMatrix();
+        };
+
         function applyStoreSettingsToUI() {
-            document.getElementById('header-shop-name').innerText = storeSettings.shopName;
-            document.getElementById('footer-shop-name').innerText = storeSettings.shopName;
-            document.getElementById('footer-shop-address').innerText = storeSettings.shopAddress;
-            document.getElementById('footer-shop-phone').innerText = t('Helpline: {p}', { p: storeSettings.shopPhone });
-            document.getElementById('checkout-merchant-num').innerText = storeSettings.paymentNumber;
+            const shopName = storeSettings.shopName || 'Taham';
+            const pageName = storeSettings.pageName || shopName || 'Taham';
+            const setValue = (id, value) => {
+                const el = document.getElementById(id);
+                if (el) el.value = value || '';
+            };
+
+            document.title = pageName;
+            document.getElementById('header-shop-name').innerText = pageName;
+            document.getElementById('footer-shop-name').innerText = shopName;
+            document.getElementById('footer-shop-address').innerText = storeSettings.shopAddress || 'Rayerbag, Dhaka, Bangladesh.';
+
+            const footerPhoneNumber = storeSettings.shopPhone || '01400-570014';
+            const footerPhoneLink = document.getElementById('footer-shop-phone');
+            const footerPhoneText = document.getElementById('footer-shop-phone-text');
+            if (footerPhoneLink) {
+                const phoneDigits = footerPhoneNumber.replace(/[^\d+]/g, '');
+                footerPhoneLink.href = `tel:${phoneDigits}`;
+                footerPhoneLink.setAttribute('aria-label', `Call or WhatsApp helpline ${footerPhoneNumber}`);
+                footerPhoneLink.title = 'Call / WhatsApp Helpline';
+            }
+            if (footerPhoneText) footerPhoneText.innerText = t('Helpline: {p}', { p: footerPhoneNumber });
+
+            document.getElementById('checkout-merchant-num').innerText = storeSettings.paymentNumber || '';
 
             // Populate settings form inputs
-            document.getElementById('set-shop-name').value = storeSettings.shopName;
-            document.getElementById('set-shop-phone').value = storeSettings.shopPhone;
-            document.getElementById('set-payment-number').value = storeSettings.paymentNumber;
-            document.getElementById('set-shop-address').value = storeSettings.shopAddress;
-            document.getElementById('set-admin-user').value = storeSettings.adminUser || '';
-            document.getElementById('set-admin-pass').value = '';
+            setValue('page-name', pageName);
+            setValue('set-shop-name', shopName);
+            setValue('set-shop-phone', storeSettings.shopPhone);
+            setValue('set-payment-number', storeSettings.paymentNumber);
+            setValue('set-shop-address', storeSettings.shopAddress);
+            setValue('set-admin-user', storeSettings.adminUser || '');
+            setValue('set-admin-pass', '');
+
+            const accessAdmin = document.getElementById('access-admin-user');
+            if (accessAdmin) accessAdmin.innerText = storeSettings.adminUser || shopName;
+            renderUserManagement();
+            renderAccessControl();
+
+            const preview = document.getElementById('settings-logo-preview');
+            if (preview) preview.src = `/logo.png?v=${Date.now()}`;
+
+            applyTheme(storeSettings.theme || 'classic-pink');
+            renderThemeSelector();
         }
 
         function updatePendingBadge() {
@@ -3058,10 +4072,12 @@ INDEX_HTML = r"""<!DOCTYPE html>
             try {
                 await api('POST', '/api/login', { username, password });
                 isAdminAuthenticated = true;
+                isSuperAdmin = true;
                 document.getElementById('login-password').value = '';
                 document.getElementById('admin-logout-btn').classList.remove('hidden');
                 closeAdminLoginModal();
                 await window.__refreshAll();
+                await loadUsers();
                 showToast('Welcome to the Super Admin panel!');
                 switchView('admin');
             } catch (err) {
@@ -3072,6 +4088,9 @@ INDEX_HTML = r"""<!DOCTYPE html>
         window.logoutAdmin = async function() {
             try { await api('POST', '/api/logout'); } catch (e) { /* ignore */ }
             isAdminAuthenticated = false;
+            isSuperAdmin = false;
+            users = [];
+            currentAccessUserId = '';
             document.getElementById('admin-logout-btn').classList.add('hidden');
             await window.__refreshAll();
             showToast('Logged out successfully.');
@@ -3083,13 +4102,33 @@ INDEX_HTML = r"""<!DOCTYPE html>
             document.getElementById(`subtab-${tabName}`).classList.remove('hidden');
 
             document.querySelectorAll('.admin-sub-btn').forEach(btn => {
-                if (btn.dataset.subtab === tabName) {
-                    btn.className = "admin-sub-btn px-4 py-2.5 rounded-xl text-sm font-bold bg-brand-600 text-white shadow-sm whitespace-nowrap flex items-center gap-2";
-                } else {
-                    btn.className = "admin-sub-btn px-4 py-2.5 rounded-xl text-sm font-bold bg-white text-slate-700 hover:bg-slate-100 border border-slate-200 whitespace-nowrap flex items-center gap-2";
-                }
+                const active = btn.dataset.subtab === tabName;
+                btn.className = active
+                    ? "admin-sub-btn w-full px-4 py-2.5 rounded-xl text-sm font-bold bg-brand-600 text-white shadow-sm flex items-center justify-start gap-2"
+                    : "admin-sub-btn w-full px-4 py-2.5 rounded-xl text-sm font-bold bg-white text-slate-700 hover:bg-slate-100 border border-slate-200 flex items-center justify-start gap-2";
             });
+            if (tabName === 'settings' && typeof window.switchSettingsSection === 'function') {
+                window.switchSettingsSection('user-management');
+            }
+            if (tabName === 'reports' && typeof window.renderReports === 'function') {
+                window.switchReportView(currentReportView || 'daily');
+            }
             lucide.createIcons();
+        };
+
+        window.openAdminSummary = function(tabName, orderFilter) {
+            window.switchAdminSubTab(tabName);
+            if (tabName === 'orders') {
+                const filter = document.getElementById('admin-order-filter');
+                if (filter) {
+                    filter.value = orderFilter || 'All';
+                    window.renderAdminOrders();
+                }
+            } else if (tabName === 'inventory' && typeof window.renderAdminInventory === 'function') {
+                window.renderAdminInventory();
+            } else if (tabName === 'expenses' && typeof window.renderAdminExpenses === 'function') {
+                window.renderAdminExpenses();
+            }
         };
 
         // ==========================================
@@ -3129,7 +4168,8 @@ INDEX_HTML = r"""<!DOCTYPE html>
             if (!collections.length) { section.classList.add('hidden'); return; }
             section.classList.remove('hidden');
             grid.innerHTML = collections.map(c => {
-                const n = products.filter(p => p.category === c.name).length;
+                const assigned = Array.isArray(c.productIds) ? c.productIds : [];
+                const n = products.filter(p => assigned.includes(p.id) || p.category === c.name).length;
                 return `
                     <button data-cat="${esc(c.name)}" onclick="selectCollection(this.dataset.cat)"
                         class="group relative overflow-hidden rounded-2xl aspect-[4/5] bg-slate-200 shadow-sm hover:shadow-xl transition-all text-left">
@@ -3143,6 +4183,57 @@ INDEX_HTML = r"""<!DOCTYPE html>
                         </div>
                     </button>`;
             }).join('');
+        };
+
+        window.initTiltInteractions = function() {
+            if (window.__tiltInitialized) return;
+            window.__tiltInitialized = true;
+
+            document.addEventListener('mousemove', function(event) {
+                const el = event.target.closest && event.target.closest('.tilt-3d');
+                if (!el) return;
+                const rect = el.getBoundingClientRect();
+                if (!rect.width || !rect.height) return;
+                const x = Math.max(0, Math.min(1, (event.clientX - rect.left) / rect.width));
+                const y = Math.max(0, Math.min(1, (event.clientY - rect.top) / rect.height));
+                const maxTilt = el.classList.contains('size-selector') ? 4 : 7;
+                const rotateX = (0.5 - y) * maxTilt;
+                const rotateY = (x - 0.5) * maxTilt;
+                const lift = el.classList.contains('size-selector') ? 'translateY(-3px) scale(1.08)' : 'translateY(-8px) scale(1.018)';
+                el.style.transform = `perspective(900px) rotateX(${rotateX.toFixed(2)}deg) rotateY(${rotateY.toFixed(2)}deg) ${lift}`;
+            });
+
+            document.addEventListener('mouseout', function(event) {
+                const el = event.target.closest && event.target.closest('.tilt-3d');
+                if (!el) return;
+                if (event.relatedTarget && el.contains(event.relatedTarget)) return;
+                el.style.transform = '';
+            });
+        };
+
+        window.initScrollReveal = function(root) {
+            const scope = root && root.querySelectorAll ? root : document;
+            const items = scope.querySelectorAll ? scope.querySelectorAll('.reveal') : [];
+            if (!items.length) return;
+
+            const reduceMotion = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+            if (reduceMotion || !('IntersectionObserver' in window)) {
+                items.forEach(item => item.classList.add('reveal-visible'));
+                return;
+            }
+
+            if (!window.__revealObserver) {
+                window.__revealObserver = new IntersectionObserver((entries) => {
+                    entries.forEach(entry => {
+                        if (entry.isIntersecting) {
+                            entry.target.classList.add('reveal-visible');
+                            window.__revealObserver.unobserve(entry.target);
+                        }
+                    });
+                }, { threshold: 0.08, rootMargin: '0px 0px -40px 0px' });
+            }
+
+            items.forEach(item => window.__revealObserver.observe(item));
         };
 
         window.selectProductSize = function(productId, size) {
@@ -3194,16 +4285,19 @@ INDEX_HTML = r"""<!DOCTYPE html>
                 const pct = hasDiscount ? Math.round((1 - sale / price) * 100) : 0;
 
                 return `
-                    <div class="bg-white rounded-2xl border border-slate-200 overflow-hidden shadow-sm hover:shadow-xl transition-all duration-300 flex flex-col group">
+                    <div class="product-card tilt-3d reveal bg-white/90 backdrop-blur-sm rounded-2xl border border-slate-200 overflow-hidden shadow-sm flex flex-col group">
                         <div class="relative aspect-[4/4] bg-slate-100 overflow-hidden">
                             <img src="${esc(shownPhoto.src)}"
                                  alt="${esc(product.name)}"
                                  onerror="this.onerror=null;this.src='/placeholder.svg?w=600&h=700&text=Taham'"
-                                 class="w-full h-full object-cover ${isOutOfStock ? 'grayscale opacity-60' : 'group-hover:scale-105'} transition-transform duration-500">
-                            <span class="absolute top-3 left-3 bg-white/95 backdrop-blur-sm text-slate-800 text-xs font-bold px-3 py-1 rounded-lg shadow-sm">${esc(product.category)}</span>
-                            <span class="absolute top-3 right-3 ${isOutOfStock ? 'bg-rose-600 text-white' : (stock < 5 ? 'bg-amber-500 text-white' : 'bg-emerald-600 text-white')} text-[11px] font-bold px-2.5 py-1 rounded-lg shadow-sm">${isOutOfStock ? 'Out of Stock' : esc(t('Stock: {n}', { n: stock }))}</span>
-                            ${shownPhoto.color ? `<span class="absolute bottom-3 right-3 bg-white/95 text-slate-800 text-[11px] font-bold px-2.5 py-1 rounded-lg shadow-sm flex items-center gap-1.5"><span class="w-3 h-3 rounded-full border border-slate-300" style="background:${esc((colors.find(c => c.name === shownPhoto.color) || {}).hex || '#ccc')}"></span><span>${esc(shownPhoto.color)}</span></span>` : ''}
-                            ${hasDiscount ? `<span class="absolute bottom-3 left-3 bg-rose-600 text-white text-xs font-bold px-2.5 py-1 rounded-lg shadow-md">${esc(t('{pct}% OFF', { pct }))}</span>` : ''}
+                                 onmouseenter="startInPlaceZoom(this)"
+                                 onmousemove="updateInPlaceZoom(event, this)"
+                                 onmouseleave="endInPlaceZoom(this)"
+                                 class="product-image-zoom zoomable-image w-full h-full object-cover ${isOutOfStock ? 'grayscale opacity-60' : ''}">
+                            <span class="absolute top-3 left-3 bg-white/85 backdrop-blur-md text-slate-800 text-xs font-bold px-3 py-1 rounded-lg shadow-sm border border-white/50">${esc(product.category)}</span>
+                            <span class="absolute right-3 ${hasDiscount ? 'top-14' : 'top-3'} ${isOutOfStock ? 'bg-rose-600 text-white' : (stock < 5 ? 'bg-amber-500 text-white' : 'bg-emerald-600 text-white')} text-[11px] font-bold px-2.5 py-1 rounded-lg shadow-sm">${isOutOfStock ? 'Out of Stock' : esc(t('Stock: {n}', { n: stock }))}</span>
+                            ${hasDiscount ? `<span class="discount-badge absolute top-3 right-3">${esc(t('{pct}% OFF', { pct }))}</span>` : ''}
+                            ${shownPhoto.color ? `<span class="absolute bottom-3 right-3 bg-white/85 backdrop-blur-md text-slate-800 text-[11px] font-bold px-2.5 py-1 rounded-lg shadow-sm border border-white/50 flex items-center gap-1.5"><span class="w-3 h-3 rounded-full border border-slate-300" style="background:${esc((colors.find(c => c.name === shownPhoto.color) || {}).hex || '#ccc')}"></span><span>${esc(shownPhoto.color)}</span></span>` : ''}
                         </div>
 
                         ${photos.length > 1 ? `<div class="flex gap-2 overflow-x-auto px-4 pt-3">
@@ -3225,7 +4319,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
                                     <div class="flex gap-1.5">
                                         ${sizes.map(sz => `
                                             <button onclick="selectProductSize('${product.id}', '${sz}')"
-                                                class="w-7 h-7 rounded-lg text-xs font-bold transition-all ${activeSize === sz ? 'bg-slate-900 text-white' : 'bg-slate-100 text-slate-600 hover:bg-slate-200'}">${sz}</button>
+                                                class="size-selector tilt-3d w-8 h-8 rounded-lg text-xs font-bold transition-all ${activeSize === sz ? 'bg-slate-900 text-white' : 'bg-slate-100 text-slate-600 hover:bg-slate-200'}">${sz}</button>
                                         `).join('')}
                                     </div>
                                 </div>
@@ -3249,7 +4343,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
                                         </div>
                                     </div>
                                     <button onclick="addToCart('${product.id}')" ${isOutOfStock ? 'disabled' : ''}
-                                        class="px-4 py-2.5 rounded-xl ${isOutOfStock ? 'bg-slate-200 text-slate-400 cursor-not-allowed' : 'bg-brand-600 hover:bg-brand-700 active:scale-95 text-white shadow-sm'} text-sm font-semibold transition-all flex items-center gap-1.5">
+                                        class="action-button tilt-3d px-4 py-2.5 rounded-xl ${isOutOfStock ? 'bg-slate-200 text-slate-400 cursor-not-allowed' : 'bg-brand-600 hover:bg-brand-700 text-white shadow-sm'} text-sm font-semibold transition-all flex items-center gap-1.5">
                                         <i data-lucide="shopping-bag" class="w-4 h-4"></i>
                                         <span>${isOutOfStock ? 'Out of stock' : 'Add to Bag'}</span>
                                     </button>
@@ -3260,6 +4354,8 @@ INDEX_HTML = r"""<!DOCTYPE html>
                 `;
             }).join('');
             lucide.createIcons();
+            initScrollReveal(grid);
+            initTiltInteractions();
         };
 
         window.addToCart = function(productId) {
@@ -3383,8 +4479,59 @@ INDEX_HTML = r"""<!DOCTYPE html>
             lucide.createIcons();
         };
 
+        window.startInPlaceZoom = function(img) {
+            if (!img) return;
+            img.style.transform = 'scale(1.55)';
+        };
+
+        window.updateInPlaceZoom = function(event, img) {
+            if (!img) return;
+            const rect = img.getBoundingClientRect();
+            if (!rect.width || !rect.height) return;
+            const x = Math.max(0, Math.min(100, ((event.clientX - rect.left) / rect.width) * 100));
+            const y = Math.max(0, Math.min(100, ((event.clientY - rect.top) / rect.height) * 100));
+            img.style.transformOrigin = `${x}% ${y}%`;
+            img.style.transform = 'scale(1.55)';
+        };
+
+        window.endInPlaceZoom = function(img) {
+            if (!img) return;
+            img.style.transform = 'scale(1)';
+            img.style.transformOrigin = 'center center';
+        };
+
+        window.handleCustomDesignReferenceUpload = async function(event) {
+            const file = event.target.files && event.target.files[0];
+            if (!file) return;
+            if (!file.type.startsWith('image/')) {
+                showToast('Please choose an image reference.', 'error');
+                event.target.value = '';
+                return;
+            }
+            try {
+                customDesignReferenceImage = await readImageFile(file, 1600, 0.85);
+                document.getElementById('custom-design-reference-img').src = customDesignReferenceImage;
+                document.getElementById('custom-design-reference-preview').classList.remove('hidden');
+                showToast('Reference image attached.');
+            } catch (err) {
+                showToast(err.message || 'Could not read the reference image.', 'error');
+                clearCustomDesignReference();
+            }
+        };
+
+        window.clearCustomDesignReference = function() {
+            customDesignReferenceImage = '';
+            const input = document.getElementById('custom-design-reference');
+            const preview = document.getElementById('custom-design-reference-preview');
+            const img = document.getElementById('custom-design-reference-img');
+            if (input) input.value = '';
+            if (preview) preview.classList.add('hidden');
+            if (img) img.src = '';
+        };
+
         window.openCheckoutModal = function() {
             toggleCart(false);
+            clearCustomDesignReference();
             document.getElementById('checkout-modal').classList.remove('hidden');
         };
 
@@ -3415,6 +4562,9 @@ INDEX_HTML = r"""<!DOCTYPE html>
                     customerAddress: document.getElementById('cust-address').value.trim(),
                     paymentMethod: document.querySelector('input[name="payment_method"]:checked').value,
                     trxId: document.getElementById('cust-trx-id').value.trim(),
+                    customDesignNotes: document.getElementById('custom-design-notes').value.trim(),
+                    referenceImage: customDesignReferenceImage,
+                    customDesignReferenceImage: customDesignReferenceImage,
                     deliveryCharge: getSelectedDeliveryCharge(),
                     items: cart.map((i) => ({ productId: i.productId, size: i.size, color: i.color || '', qty: i.qty }))
                 });
@@ -3422,6 +4572,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
                 cart = [];
                 updateCartUI();
                 document.getElementById('checkout-form').reset();
+                clearCustomDesignReference();
                 closeCheckoutModal();
                 showToast(t('Thank you {name}! Your order ({num}) is complete.', { name, num: order.orderNumber }));
                 window.__refreshAll();
@@ -3514,6 +4665,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
             renderAdminInventory();
             renderAdminExpenses();
             renderAdminCollections();
+            renderReports();
         };
 
         window.renderAdminOrders = function() {
@@ -3570,6 +4722,13 @@ INDEX_HTML = r"""<!DOCTYPE html>
                             <p><strong class="text-slate-700">Address:</strong> ${esc(order.customerAddress)}</p>
                         </div>
 
+                        ${(order.customDesignNotes || order.referenceImage) ? `
+                        <div class="bg-white p-3 rounded-xl border border-slate-200 text-xs space-y-2">
+                            <p class="font-bold text-slate-700">Custom Design Instructions</p>
+                            ${order.customDesignNotes ? `<p class="whitespace-pre-line text-slate-700">${esc(order.customDesignNotes)}</p>` : ''}
+                            ${order.referenceImage ? `<div><p class="text-slate-500 mb-1">Reference Image / Mockup:</p><img src="${esc(order.referenceImage)}" alt="Custom design reference" class="h-32 w-32 object-cover rounded-xl border border-slate-200 bg-slate-50"></div>` : ''}
+                        </div>` : ''}
+
                         <div class="flex flex-wrap justify-between items-center gap-2 pt-1 text-xs">
                             <div>
                                 ${(order.items || []).map(i => `<span class="inline-block bg-white border border-slate-200 px-2.5 py-1 rounded-lg mr-1.5 mb-1 font-medium">${esc(i.name)} (${esc(i.size)}${i.color ? ', ' + esc(i.color) : ''}) × ${Number(i.qty)}</span>`).join('')}
@@ -3583,7 +4742,192 @@ INDEX_HTML = r"""<!DOCTYPE html>
                 `;
             }).join('');
             lucide.createIcons();
+            initScrollReveal(grid);
+            initTiltInteractions();
         };
+
+        window.switchReportView = function(view) {
+            currentReportView = view === 'monthly' ? 'monthly' : 'daily';
+            document.querySelectorAll('.report-view').forEach(el => el.classList.toggle('hidden', el.id !== `report-${currentReportView}`));
+            document.querySelectorAll('.report-tab').forEach(btn => {
+                const active = btn.dataset.reportTab === currentReportView;
+                btn.className = active
+                    ? 'report-tab px-4 py-2 rounded-xl text-sm font-bold bg-brand-600 text-white'
+                    : 'report-tab px-4 py-2 rounded-xl text-sm font-bold bg-white text-slate-700 border border-slate-200';
+            });
+            if (currentReportView === 'daily') {
+                const dateEl = document.getElementById('daily-report-date');
+                if (dateEl && !dateEl.value) dateEl.value = todayKey();
+            } else {
+                const monthEl = document.getElementById('monthly-report-month');
+                if (monthEl && !monthEl.value) monthEl.value = monthKey(new Date());
+            }
+            renderReports();
+        };
+
+        window.clearReportFilters = function(view) {
+            const prefix = view === 'monthly' ? 'monthly' : 'daily';
+            if (prefix === 'daily') {
+                document.getElementById('daily-report-date').value = todayKey();
+                document.getElementById('daily-report-from').value = '';
+                document.getElementById('daily-report-to').value = '';
+            } else {
+                document.getElementById('monthly-report-month').value = monthKey(new Date());
+                document.getElementById('monthly-report-from').value = '';
+                document.getElementById('monthly-report-to').value = '';
+            }
+            renderReports();
+        };
+
+        window.renderReports = function() {
+            const metricsBox = document.getElementById('report-metrics');
+            const ordersBox = document.getElementById('report-orders');
+            if (!metricsBox || !ordersBox) return;
+
+            const range = getReportRange(currentReportView);
+            const filteredOrders = orders.filter(o => inReportRange(orderTime(o), range));
+            const filteredExpenses = expenses.filter(e => inReportRange(expenseTime(e), range));
+            const activeOrders = filteredOrders.filter(o => o.status !== 'Cancelled');
+
+            const totalSales = activeOrders.reduce((sum, o) => sum + Number(o.total || 0), 0);
+            const totalProductCost = activeOrders.reduce((sum, o) => sum + Number(o.totalCost || 0), 0);
+            const totalDeliveryCost = activeOrders.reduce((sum, o) => sum + Number(o.deliveryCharge || 0), 0);
+            const totalExpenses = filteredExpenses.reduce((sum, e) => sum + Number(e.amount || 0), 0);
+            const netProfit = totalSales - totalProductCost - totalDeliveryCost - totalExpenses;
+            const orderCount = filteredOrders.length;
+            const totalItems = activeOrders.reduce((sum, o) => sum + (o.items || []).reduce((n, i) => n + Number(i.qty || 0), 0), 0);
+            const cancelledCount = filteredOrders.filter(o => o.status === 'Cancelled').length;
+            const pendingCount = filteredOrders.filter(o => o.status === 'Pending').length;
+
+            metricsBox.innerHTML = `
+                ${reportMetricCard('Total Sales', money(totalSales), 'banknote', 'text-brand-700')}
+                ${reportMetricCard('Total Expenses', money(totalExpenses), 'receipt', 'text-rose-600')}
+                ${reportMetricCard('Net Profit', money(netProfit), 'trending-up', netProfit < 0 ? 'text-rose-600' : 'text-emerald-700')}
+                ${reportMetricCard('Orders', String(orderCount), 'package-check', 'text-slate-900')}
+                ${reportMetricCard('Items Sold', String(totalItems), 'shirt', 'text-slate-900')}
+                ${reportMetricCard('Pending', String(pendingCount), 'clock', 'text-amber-600')}
+                ${reportMetricCard('Cancelled', String(cancelledCount), 'x-circle', 'text-rose-600')}
+                ${reportMetricCard('Expenses Count', String(filteredExpenses.length), 'wallet', 'text-slate-900')}
+            `;
+
+            if (!filteredOrders.length) {
+                ordersBox.innerHTML = `<div class="p-8 text-center text-sm text-slate-400">No order summaries in this date range.</div>`;
+            } else {
+                ordersBox.innerHTML = filteredOrders.map(o => `
+                    <div class="p-4 grid grid-cols-1 sm:grid-cols-5 gap-3 items-center text-sm">
+                        <div>
+                            <p class="font-bold text-slate-900">${esc(o.orderNumber || o.id.slice(0, 8))}</p>
+                            <p class="text-xs text-slate-500">${esc(fmtDate(orderTime(o)))}</p>
+                        </div>
+                        <p class="text-slate-700">${esc(o.customerName || '')}</p>
+                        <span class="text-xs font-bold text-slate-600">${esc(o.status)}</span>
+                        <span class="text-xs text-slate-500">${(o.items || []).length} item(s)</span>
+                        <p class="font-bold text-brand-700 sm:text-right">${money(o.total)}</p>
+                    </div>
+                `).join('');
+            }
+            if (window.lucide) lucide.createIcons();
+        };
+
+        function reportMetricCard(label, value, icon, colorClass) {
+            return `
+                <div class="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
+                    <div class="flex items-center justify-between">
+                        <p class="text-xs font-semibold text-slate-500">${esc(label)}</p>
+                        <i data-lucide="${esc(icon)}" class="w-5 h-5 text-slate-400"></i>
+                    </div>
+                    <p class="text-2xl font-bold mt-2 ${colorClass || 'text-slate-900'}">${esc(value)}</p>
+                </div>`;
+        }
+
+        function money(value) {
+            return `৳ ${Number(value || 0).toLocaleString('en-US')}`;
+        }
+
+        function todayKey() {
+            return dateKey(new Date());
+        }
+
+        function monthKey(date) {
+            const d = date instanceof Date ? date : parseLooseDate(date);
+            if (!d) return '';
+            return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
+        }
+
+        function dateKey(date) {
+            const d = date instanceof Date ? date : parseLooseDate(date);
+            if (!d || Number.isNaN(d.getTime())) return '';
+            return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+        }
+
+        function startOfDay(date) {
+            const d = date instanceof Date ? new Date(date) : parseLooseDate(date);
+            if (!d) return null;
+            d.setHours(0, 0, 0, 0);
+            return d;
+        }
+
+        function endOfDay(date) {
+            const d = date instanceof Date ? new Date(date) : parseLooseDate(date);
+            if (!d) return null;
+            d.setHours(23, 59, 59, 999);
+            return d;
+        }
+
+        function parseLooseDate(value) {
+            if (!value) return null;
+            if (value instanceof Date) return Number.isNaN(value.getTime()) ? null : value;
+            if (typeof value === 'number') return Number.isNaN(new Date(value).getTime()) ? null : new Date(value);
+            const s = String(value).trim();
+            const dmy = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})/);
+            if (dmy) return new Date(Number(dmy[3]), Number(dmy[2]) - 1, Number(dmy[1]), 12, 0, 0, 0);
+            const parsed = new Date(s);
+            return Number.isNaN(parsed.getTime()) ? null : parsed;
+        }
+
+        function orderTime(order) {
+            if (order.createdAt) return new Date(Number(order.createdAt)).getTime();
+            const parsed = parseLooseDate(order.dateStr);
+            return parsed ? parsed.getTime() : 0;
+        }
+
+        function expenseTime(expense) {
+            if (expense.createdAt) return new Date(Number(expense.createdAt)).getTime();
+            const parsed = parseLooseDate(expense.dateStr || expense.date);
+            return parsed ? parsed.getTime() : 0;
+        }
+
+        function inReportRange(time, range) {
+            if (!range) return true;
+            if (!time) return false;
+            return time >= range.start.getTime() && time <= range.end.getTime();
+        }
+
+        function getReportRange(view) {
+            const get = (id) => { const el = document.getElementById(id); return el ? el.value : ''; };
+            const fromValue = view === 'monthly' ? get('monthly-report-from') : get('daily-report-from');
+            const toValue = view === 'monthly' ? get('monthly-report-to') : get('daily-report-to');
+
+            if (fromValue || toValue) {
+                const start = fromValue ? startOfDay(fromValue) : new Date(0);
+                const end = toValue ? endOfDay(toValue) : new Date(8640000000000000);
+                return { start, end };
+            }
+
+            if (view === 'monthly') {
+                const month = get('monthly-report-month') || monthKey(new Date());
+                const match = month.match(/^(\d{4})-(\d{2})$/);
+                if (match) {
+                    const year = Number(match[1]);
+                    const monthIndex = Number(match[2]) - 1;
+                    return { start: new Date(year, monthIndex, 1, 0, 0, 0, 0), end: new Date(year, monthIndex + 1, 0, 23, 59, 59, 999) };
+                }
+                return null;
+            }
+
+            const date = get('daily-report-date') || todayKey();
+            return { start: startOfDay(date), end: endOfDay(date) };
+        }
 
         window.changeOrderStatus = async function(orderId, newStatus) {
             try {
@@ -3908,7 +5252,9 @@ INDEX_HTML = r"""<!DOCTYPE html>
             const name = document.getElementById('col-name').value.trim();
             if (!name) { showToast('Enter the collection name', 'error'); return; }
             const image = uploadedCollectionImage || document.getElementById('col-image-url').value.trim();
-            const payload = { name };
+            const selectedProductIds = Array.from(document.querySelectorAll('#col-product-selector input[type="checkbox"]:checked')).map(el => el.value);
+            const previousName = editId ? (collections.find(x => x.id === editId) || {}).name : '';
+            const payload = { name, productIds: selectedProductIds };
             if (image) payload.image = image;
             try {
                 if (editId) {
@@ -3918,11 +5264,37 @@ INDEX_HTML = r"""<!DOCTYPE html>
                     await addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'collections'), payload);
                     showToast('Collection added!');
                 }
+
+                const affectedIds = new Set(selectedProductIds);
+                products.forEach(p => {
+                    if (p.category === name || (previousName && p.category === previousName)) affectedIds.add(p.id);
+                });
+                for (const productId of affectedIds) {
+                    const p = products.find(x => x.id === productId);
+                    if (!p) continue;
+                    const nextCategory = selectedProductIds.includes(productId) ? name : '';
+                    if (p.category !== nextCategory) {
+                        await updateDoc(doc(db, 'artifacts', appId, 'public', 'data', 'products', productId), { category: nextCategory });
+                    }
+                }
+
                 resetCollectionForm();
+                closeCollectionModal();
                 await window.__refreshAll();
             } catch (err) {
                 showToast(err.message || 'Could not save the collection', 'error');
             }
+        };
+
+        window.openCollectionModal = function() {
+            resetCollectionForm();
+            document.getElementById('collection-modal').classList.remove('hidden');
+            renderCollectionProductSelector();
+            if (window.lucide) lucide.createIcons();
+        };
+
+        window.closeCollectionModal = function() {
+            document.getElementById('collection-modal').classList.add('hidden');
         };
 
         window.editCollection = function(id) {
@@ -3936,7 +5308,30 @@ INDEX_HTML = r"""<!DOCTYPE html>
             document.getElementById('col-image-preview-box').classList.toggle('hidden', !c.image);
             document.getElementById('col-form-title').innerText = 'Edit Collection';
             document.getElementById('col-cancel-btn').classList.remove('hidden');
-            document.getElementById('collection-form').scrollIntoView({ behavior: 'smooth' });
+            document.getElementById('collection-modal').classList.remove('hidden');
+            renderCollectionProductSelector();
+            if (window.lucide) lucide.createIcons();
+        };
+
+        window.renderCollectionProductSelector = function() {
+            const box = document.getElementById('col-product-selector');
+            if (!box) return;
+            const name = document.getElementById('col-name').value.trim();
+            const editId = document.getElementById('edit-col-id').value;
+            const oldName = editId ? (collections.find(x => x.id === editId) || {}).name : '';
+            const selected = new Set(Array.from(document.querySelectorAll('#col-product-selector input[type="checkbox"]:checked')).map(el => el.value));
+            const assigned = new Set(((collections.find(x => x.id === editId) || {}).productIds || []));
+            if (!products.length) {
+                box.innerHTML = `<p class="p-3 text-center text-xs text-slate-400">No products yet.</p>`;
+                return;
+            }
+            box.innerHTML = products.map(p => `
+                <label class="flex items-center gap-3 p-3 hover:bg-slate-50 cursor-pointer">
+                    <input type="checkbox" class="w-4 h-4 rounded border-slate-300 text-brand-600" value="${esc(p.id)}" ${selected.has(p.id) || assigned.has(p.id) || p.category === name || p.category === oldName ? 'checked' : ''}>
+                    <span class="text-sm text-slate-700">${esc(p.name)}</span>
+                    <span class="text-xs text-slate-400 ml-auto">${esc(p.category || '')}</span>
+                </label>
+            `).join('');
         };
 
         window.resetCollectionForm = function() {
@@ -3946,6 +5341,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
             document.getElementById('col-image-preview-box').classList.add('hidden');
             document.getElementById('col-form-title').innerText = 'Add New Collection';
             document.getElementById('col-cancel-btn').classList.add('hidden');
+            renderCollectionProductSelector();
         };
 
         window.deleteCollection = async function(id) {
@@ -3965,7 +5361,8 @@ INDEX_HTML = r"""<!DOCTYPE html>
                 return;
             }
             box.innerHTML = collections.map(c => {
-                const n = products.filter(p => p.category === c.name).length;
+                const assigned = Array.isArray(c.productIds) ? c.productIds : [];
+                const n = products.filter(p => assigned.includes(p.id) || p.category === c.name).length;
                 return `
                     <div class="py-3.5 flex items-center justify-between gap-3">
                         <div class="flex items-center gap-3 min-w-0">
@@ -3982,6 +5379,8 @@ INDEX_HTML = r"""<!DOCTYPE html>
                     </div>`;
             }).join('');
             lucide.createIcons();
+            initScrollReveal(grid);
+            initTiltInteractions();
         };
 
         window.adjustStockQuick = async function(productId, delta) {
@@ -4051,9 +5450,20 @@ INDEX_HTML = r"""<!DOCTYPE html>
                 `;
             }).join('');
             lucide.createIcons();
+            initScrollReveal(grid);
+            initTiltInteractions();
         };
 
         // Expenses Management
+        window.openExpenseModal = function() {
+            document.getElementById('expense-modal').classList.remove('hidden');
+            if (window.lucide) lucide.createIcons();
+        };
+
+        window.closeExpenseModal = function() {
+            document.getElementById('expense-modal').classList.add('hidden');
+        };
+
         window.handleAddExpense = async function(e) {
             e.preventDefault();
             if (!currentUser || !db) return;
@@ -4061,13 +5471,14 @@ INDEX_HTML = r"""<!DOCTYPE html>
             const category = document.getElementById('exp-category').value;
             const amount = parseInt(document.getElementById('exp-amount').value, 10);
 
-            if (!title || !Number.isInteger(amount) || amount < 0) {
+            if (!title || !Number.isInteger(amount) || amount < 1) {
                 showToast('Enter the expense description and a valid amount.', 'error');
                 return;
             }
             try {
                 await addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'expenses'), { title, category, amount });
                 e.target.reset();
+                closeExpenseModal();
                 showToast('Expense recorded!');
             } catch (err) {
                 showToast(err.message || 'Could not add the expense.', 'error');
@@ -4112,21 +5523,64 @@ INDEX_HTML = r"""<!DOCTYPE html>
             e.preventDefault();
             if (!currentUser || !db) return;
 
+            const val = (id) => {
+                const el = document.getElementById(id);
+                return el ? el.value.trim() : '';
+            };
+            const shopName = val('set-shop-name') || storeSettings.shopName || 'Taham';
+            const pageName = val('page-name') || storeSettings.pageName || shopName;
+            const themeSelector = document.getElementById('theme-selector');
             const updatedSettings = {
-                shopName: document.getElementById('set-shop-name').value.trim(),
-                shopPhone: document.getElementById('set-shop-phone').value.trim(),
-                paymentNumber: document.getElementById('set-payment-number').value.trim(),
-                shopAddress: document.getElementById('set-shop-address').value.trim(),
-                adminUser: document.getElementById('set-admin-user').value.trim(),
-                adminPass: document.getElementById('set-admin-pass').value.trim()
+                ...storeSettings,
+                shopName,
+                pageName,
+                theme: (themeSelector && themeSelector.dataset.selected) || storeSettings.theme || 'classic-pink',
+                shopPhone: val('set-shop-phone') || storeSettings.shopPhone,
+                paymentNumber: val('set-payment-number') || storeSettings.paymentNumber,
+                shopAddress: val('set-shop-address') || storeSettings.shopAddress,
+                adminUser: val('set-admin-user') || storeSettings.adminUser || '',
+                adminPass: val('set-admin-pass')
             };
 
             const settingsDoc = doc(db, 'artifacts', appId, 'public', 'data', 'settings', 'store_config');
             try {
                 await setDoc(settingsDoc, updatedSettings);
-                showToast('Shop settings and password updated successfully!');
+                storeSettings = { ...storeSettings, ...updatedSettings };
+                delete storeSettings.adminPass;
+                applyStoreSettingsToUI();
+                showToast('Settings updated successfully!');
             } catch (err) {
                 showToast(err.message || 'Could not save the settings.', 'error');
+            }
+        };
+
+        window.uploadSiteLogo = async function() {
+            const input = document.getElementById('logo-upload');
+            if (!input || !input.files || !input.files.length) {
+                showToast('Please choose an image file.', 'error');
+                return;
+            }
+            const file = input.files[0];
+            if (!file.type.startsWith('image/')) {
+                showToast('Please choose an image file.', 'error');
+                return;
+            }
+            try {
+                const dataUrl = await new Promise((resolve, reject) => {
+                    const reader = new FileReader();
+                    reader.onload = () => resolve(reader.result);
+                    reader.onerror = () => reject(new Error('Could not read the image.'));
+                    reader.readAsDataURL(file);
+                });
+                await api('POST', '/api/logo', { dataUrl });
+                const cacheBust = Date.now();
+                ['site-logo', 'settings-logo-preview'].forEach(id => {
+                    const img = document.getElementById(id);
+                    if (img) img.src = `/logo.png?v=${cacheBust}`;
+                });
+                showToast('Logo uploaded successfully!');
+            } catch (err) {
+                showToast(err.message || 'Could not upload logo.', 'error');
             }
         };
 
@@ -4210,9 +5664,11 @@ DEFAULT_ADMIN_USER = "taham@1234"      # used only the FIRST time (when taham.db
 DEFAULT_ADMIN_PASS = "taham@1234"      # change it later from Admin > Settings
 DEFAULT_SETTINGS = {
     "shopName": "Taham",
-    "shopPhone": "01700-000000",
-    "paymentNumber": "01700-000000",
-    "shopAddress": "New Market, Dhaka, Bangladesh",
+    "pageName": "Taham",
+    "theme": "classic-pink",
+    "shopPhone": "01400-570014",
+    "paymentNumber": "01400-570014",
+    "shopAddress": "Rayerbag, Dhaka, Bangladesh.",
 }
 DELIVERY_OPTIONS = (60, 120)           # Dhaka / outside Dhaka (must match the radio buttons)
 PAYMENT_METHODS = ("Cash on Delivery", "bKash", "Nagad")
@@ -4380,11 +5836,24 @@ def is_admin():
     return session.get("admin") is True
 
 
+def is_super_admin():
+    return session.get("admin") is True
+
+
 def admin_required(fn):
     @wraps(fn)
     def wrapper(*args, **kwargs):
         if not is_admin():
             return err("Admin login required", 401)
+        return fn(*args, **kwargs)
+    return wrapper
+
+
+def super_admin_required(fn):
+    @wraps(fn)
+    def wrapper(*args, **kwargs):
+        if not is_super_admin():
+            return err("Only the Super Admin can perform this action.", 403)
         return fn(*args, **kwargs)
     return wrapper
 
@@ -4439,6 +5908,17 @@ def _logo_bytes():
 @app.get("/logo.png")
 @app.get("/favicon.ico")
 def logo():
+    db = get_db()
+    logo_doc = get_doc(db, "settings", "logo")
+    if logo_doc and logo_doc.get("data"):
+        try:
+            image_bytes = base64.b64decode(logo_doc["data"])
+        except Exception:
+            image_bytes = _logo_bytes()
+        resp = Response(image_bytes, mimetype=logo_doc.get("mimetype") or "image/png")
+        resp.headers["Cache-Control"] = "no-store"
+        return resp
+
     resp = Response(_logo_bytes(), mimetype="image/png")
     resp.headers["Cache-Control"] = "public, max-age=86400"
     return resp
@@ -4465,12 +5945,66 @@ def no_cache_api(resp):
 
 
 # ------------------------------- auth -----------------------------------
+SUPER_ADMIN_ROLE = "Super Admin"
+USER_ROLES = ("Admin", "Manager", "Salesman", "Marketing")
+PERMISSION_DEFS = (
+    {"key": "viewOrders", "label": "View Orders"},
+    {"key": "editOrders", "label": "Edit Orders"},
+    {"key": "manageProducts", "label": "Manage Products & Stock"},
+    {"key": "addCollections", "label": "Add Collections"},
+    {"key": "deleteCollections", "label": "Delete Collections"},
+    {"key": "manageExpenses", "label": "Manage Daily Expenses"},
+    {"key": "viewProfit", "label": "View Profit/Revenue Stats"},
+    {"key": "accessSettings", "label": "Access Settings"},
+    {"key": "userManagement", "label": "User Management"},
+)
+PERMISSION_KEYS = tuple(p["key"] for p in PERMISSION_DEFS)
+DEFAULT_PERMISSIONS = {key: False for key in PERMISSION_KEYS}
+EMAIL_RE = re.compile(r"^[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}$")
+STRONG_PASSWORD_RE = re.compile(r"^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[^A-Za-z0-9]).{10,}$")
+
+
+def sanitize_permissions(d):
+    src = d if isinstance(d, dict) else {}
+    return {key: bool(src.get(key, False)) for key in PERMISSION_KEYS}
+
+
+def public_user(u):
+    return {
+        "id": u.get("id", ""),
+        "fullName": u.get("fullName", ""),
+        "role": u.get("role", "Marketing"),
+        "email": u.get("email", ""),
+        "permissions": sanitize_permissions(u.get("permissions")),
+        "isSuperAdmin": False,
+    }
+
+
+def super_admin_user():
+    db = get_db()
+    row = db.execute("SELECT username FROM admin WHERE id=1").fetchone()
+    username = row["username"] if row else "Super Admin"
+    return {
+        "id": "super-admin",
+        "fullName": username,
+        "role": SUPER_ADMIN_ROLE,
+        "email": "",
+        "permissions": {key: True for key in PERMISSION_KEYS},
+        "isSuperAdmin": True,
+    }
+
 _FAILS = {}
 
 
 @app.get("/api/me")
 def me():
-    return jsonify(admin=is_admin())
+    admin = is_admin()
+    return jsonify(
+        admin=admin,
+        role=SUPER_ADMIN_ROLE if admin else None,
+        isSuperAdmin=admin,
+        permissions={key: admin for key in PERMISSION_KEYS},
+    )
 
 
 @app.post("/api/login")
@@ -4490,6 +6024,7 @@ def login():
         return err("Wrong username or password!", 401)
     session.clear()
     session["admin"] = True
+    session["role"] = SUPER_ADMIN_ROLE
     session.permanent = True
     return jsonify(ok=True)
 
@@ -4497,6 +6032,80 @@ def login():
 @app.post("/api/logout")
 def logout():
     session.clear()
+    return jsonify(ok=True)
+
+
+@app.get("/api/users")
+@admin_required
+def users_list():
+    db = get_db()
+    users = [public_user(u) for u in list_docs(db, "users")]
+    users.sort(key=lambda u: (u.get("fullName") or u.get("email") or "").lower())
+    return jsonify(
+        users=users,
+        superAdmin=super_admin_user(),
+        roles=list(USER_ROLES),
+        permissionDefs=list(PERMISSION_DEFS),
+        isSuperAdmin=is_super_admin(),
+    )
+
+
+@app.post("/api/users")
+@admin_required
+def users_add():
+    d = body()
+    full_name = str(d.get("fullName", "")).strip()[:120]
+    role = str(d.get("role", "")).strip()
+    email = str(d.get("email", "")).strip().lower()[:200]
+    password = str(d.get("password", ""))
+
+    if not full_name:
+        return err("Full name is required.")
+    if role not in USER_ROLES or role == SUPER_ADMIN_ROLE:
+        return err("Invalid role. Super Admin is reserved for the primary owner account.")
+    if not EMAIL_RE.fullmatch(email):
+        return err("Please enter a strict valid email address.")
+    if not STRONG_PASSWORD_RE.fullmatch(password):
+        return err("Password must be at least 10 characters and include uppercase, lowercase, number, and special character.")
+
+    db = get_db()
+    if any(str(u.get("email", "")).lower() == email for u in list_docs(db, "users")):
+        return err("A user with this email already exists.", 409)
+
+    user = {
+        "id": secrets.token_hex(8),
+        "fullName": full_name,
+        "role": role,
+        "email": email,
+        "pw_hash": generate_password_hash(password),
+        "permissions": sanitize_permissions(d.get("permissions")),
+        "createdAt": now_ms(),
+    }
+    saved = save_doc(db, "users", user["id"], user)
+    return jsonify(public_user(saved)), 201
+
+
+@app.put("/api/users/<user_id>/permissions")
+@super_admin_required
+def user_permissions_update(user_id):
+    db = get_db()
+    user = get_doc(db, "users", user_id)
+    if not user:
+        return err("User not found.", 404)
+    user["permissions"] = sanitize_permissions(body().get("permissions"))
+    saved = save_doc(db, "users", user_id, user)
+    return jsonify(public_user(saved))
+
+
+@app.delete("/api/users/<user_id>")
+@super_admin_required
+def users_delete(user_id):
+    if user_id == "super-admin":
+        return err("Super Admin cannot be deleted.", 403)
+    db = get_db()
+    if not get_doc(db, "users", user_id):
+        return err("User not found.", 404)
+    db.execute("DELETE FROM docs WHERE col='users' AND id=?", (user_id,))
     return jsonify(ok=True)
 
 
@@ -4673,6 +6282,11 @@ def clean_collection(d):
         if len(img) > 3_000_000:
             raise ValueError("Image is too large, please use a smaller one.")
         out["image"] = img
+    if "productIds" in d:
+        ids = d.get("productIds") or []
+        if not isinstance(ids, list):
+            raise ValueError("Assigned products must be a list.")
+        out["productIds"] = [str(x) for x in ids if str(x).strip()]
     return out
 
 
@@ -4817,6 +6431,8 @@ def order_create():
             "orderNumber": "ORD-" + str(random.randint(100000, 999999)),
             "customerName": name, "customerPhone": phone, "customerAddress": address,
             "paymentMethod": method, "trxId": str(d.get("trxId", "")).strip()[:40],
+            "customDesignNotes": str(d.get("customDesignNotes", "")).strip()[:2000],
+            "referenceImage": str(d.get("referenceImage") or d.get("customDesignReferenceImage") or "").strip()[:8000000],
             "items": items, "subtotal": subtotal, "deliveryCharge": delivery,
             "total": subtotal + delivery, "totalCost": cost,
             "status": "Pending", "stockDeducted": True,
@@ -4912,22 +6528,65 @@ def settings_get():
 @admin_required
 def settings_put():
     d = body()
-    s = {}
+    db = get_db()
+    s = dict(get_doc(db, "settings", "store_config") or DEFAULT_SETTINGS)
+
+    required_keys = ("shopName", "shopPhone", "paymentNumber", "shopAddress", "pageName", "theme")
     for key in DEFAULT_SETTINGS:
-        val = str(d.get(key, "")).strip()[:200]
-        if not val:
-            return err("Please fill in all the shop details.")
-        s[key] = val
+        if key in d:
+            val = str(d.get(key, "")).strip()[:200]
+            if key in required_keys and not val:
+                return err("Please fill in all the shop details.")
+            s[key] = val
+        elif key not in s:
+            s[key] = str(DEFAULT_SETTINGS.get(key, "")).strip()
+
+    if not str(s.get("pageName", "")).strip():
+        s["pageName"] = str(s.get("shopName", "Taham")).strip() or "Taham"
+    if not str(s.get("theme", "")).strip():
+        s["theme"] = "classic-pink"
+
+    s.pop("id", None)
+    s.pop("adminUser", None)
+    s.pop("adminPass", None)
+
     user, pw = str(d.get("adminUser", "")).strip()[:60], str(d.get("adminPass", ""))
     if pw and len(pw) < 4:
         return err("Password must be at least 4 characters.")
-    db = get_db()
+
     save_doc(db, "settings", "store_config", s)
     if user:
         db.execute("UPDATE admin SET username=? WHERE id=1", (user,))
     if pw:
         db.execute("UPDATE admin SET pw_hash=? WHERE id=1", (generate_password_hash(pw),))
     return jsonify(ok=True)
+
+
+@app.post("/api/logo")
+@admin_required
+def logo_upload():
+    data_url = str(body().get("dataUrl", "")).strip()
+    if not data_url.startswith("data:image/") or "," not in data_url:
+        return err("Please choose an image file.")
+
+    header, encoded = data_url.split(",", 1)
+    mimetype = header[5:].split(";")[0].lower() or "image/png"
+    if not mimetype.startswith("image/"):
+        return err("Please choose an image file.")
+
+    try:
+        image_bytes = base64.b64decode(encoded)
+    except Exception:
+        return err("Could not read the image file.")
+
+    if not image_bytes:
+        return err("Could not read the image file.")
+    if len(image_bytes) > 8 * 1024 * 1024:
+        return err("Image must be smaller than 8 MB.")
+
+    db = get_db()
+    save_doc(db, "settings", "logo", {"mimetype": mimetype, "data": base64.b64encode(image_bytes).decode("ascii"), "updatedAt": now_ms()})
+    return jsonify(ok=True, logoUrl=f"/logo.png?v={now_ms()}")
 
 
 # ------------------------------- delete ---------------------------------
@@ -5675,7 +7334,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
     <!-- Google Fonts: Hind Siliguri & Inter -->
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Hind+Siliguri:wght@400;500;600;700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Hind+Siliguri:wght@400;500;600;700&family=Inter:wght@400;500;600;700&family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet">
     <!-- Lucide Icons -->
     <script src="https://unpkg.com/lucide@0.469.0/dist/umd/lucide.min.js"></script>
     <script>if (!window.lucide) window.lucide = { createIcons: function () {} };</script>
@@ -5684,16 +7343,17 @@ INDEX_HTML = r"""<!DOCTYPE html>
             theme: {
                 extend: {
                     fontFamily: {
-                        sans: ['"Hind Siliguri"', '"Inter"', 'sans-serif'],
+                        sans: ['"Plus Jakarta Sans"', '"Inter"', '"Hind Siliguri"', 'sans-serif'],
                     },
                     colors: {
                         brand: {
-                            50: '#fdf2f8',
-                            100: '#fce7f3',
-                            500: '#ec4899',
-                            600: '#db2777',
-                            700: '#be185d',
-                            900: '#831843',
+                            50: 'var(--brand-50)',
+                            100: 'var(--brand-100)',
+                            300: 'var(--brand-300)',
+                            500: 'var(--brand-500)',
+                            600: 'var(--brand-600)',
+                            700: 'var(--brand-700)',
+                            900: 'var(--brand-900)',
                         }
                     }
                 }
@@ -5701,6 +7361,304 @@ INDEX_HTML = r"""<!DOCTYPE html>
         }
     </script>
     <style>
+        :root {
+            --brand-50: #fdf2f8;
+            --brand-100: #fce7f3;
+            --brand-300: #fbcfe8;
+            --brand-500: #ec4899;
+            --brand-600: #db2777;
+            --brand-700: #be185d;
+            --brand-900: #831843;
+            --app-bg: #f8fafc;
+            --app-surface: #ffffff;
+            --app-text: #0f172a;
+        }
+
+        html {
+            font-family: "Plus Jakarta Sans", Inter, "Hind Siliguri", ui-sans-serif, system-ui, sans-serif;
+            font-size: 16px;
+        }
+
+        body {
+            background-color: var(--app-bg) !important;
+            color: var(--app-text);
+            font-family: "Plus Jakarta Sans", Inter, "Hind Siliguri", ui-sans-serif, system-ui, sans-serif;
+            font-weight: 400;
+            line-height: 1.5;
+            -webkit-font-smoothing: antialiased;
+            -moz-osx-font-smoothing: grayscale;
+        }
+
+        h1, h2, h3, h4, h5, h6 {
+            font-weight: 700;
+            letter-spacing: -0.012em;
+        }
+
+        h1 { font-weight: 800; letter-spacing: -0.02em; }
+        .text-\[11px\], .text-xs { font-weight: 500; }
+        .font-bold { font-weight: 700 !important; }
+        .font-semibold { font-weight: 600 !important; }
+
+        html { scroll-behavior: smooth; }
+        body { overflow-x: hidden; }
+        ::selection { background: var(--brand-500); color: #ffffff; }
+
+        /* Modern digital 3D + glassmorphism */
+        .glass,
+        .glass-card {
+            background: rgba(255, 255, 255, 0.72);
+            border: 1px solid rgba(255, 255, 255, 0.55);
+            box-shadow: 0 12px 34px rgba(15, 23, 42, 0.10), inset 0 1px 0 rgba(255, 255, 255, 0.70);
+            backdrop-filter: blur(16px) saturate(140%);
+            -webkit-backdrop-filter: blur(16px) saturate(140%);
+        }
+
+        .product-card {
+            position: relative;
+            border-radius: 1.25rem;
+            border: 1px solid rgba(148, 163, 184, 0.22);
+            background: rgba(255, 255, 255, 0.90);
+            box-shadow: 0 10px 28px rgba(15, 23, 42, 0.08), 0 2px 8px rgba(15, 23, 42, 0.05), inset 0 1px 0 rgba(255, 255, 255, 0.85);
+            transition: transform 240ms cubic-bezier(0.22, 1.18, 0.36, 1), box-shadow 240ms ease, border-color 240ms ease;
+            transform-style: preserve-3d;
+            will-change: transform;
+            backdrop-filter: blur(10px);
+        }
+
+        .product-card:hover {
+            border-color: rgba(var(--brand-rgb, 99, 102, 241), 0.30);
+            box-shadow: 0 22px 48px rgba(15, 23, 42, 0.16), 0 8px 18px rgba(15, 23, 42, 0.08), inset 0 1px 0 rgba(255, 255, 255, 0.90);
+        }
+
+        .tilt-3d {
+            transform-style: preserve-3d;
+            transition: transform 160ms cubic-bezier(0.22, 1.18, 0.36, 1), box-shadow 160ms ease, background-color 160ms ease, border-color 160ms ease;
+            will-change: transform;
+        }
+
+        .size-selector {
+            min-width: 2rem;
+            min-height: 2rem;
+            box-shadow: 0 4px 10px rgba(15, 23, 42, 0.08), inset 0 1px 0 rgba(255, 255, 255, 0.75);
+        }
+
+        .size-selector[aria-pressed="true"],
+        .size-selector.active,
+        .is-active {
+            box-shadow: 0 8px 18px rgba(var(--brand-rgb, 99, 102, 241), 0.32), 0 0 0 3px rgba(var(--brand-rgb, 99, 102, 241), 0.14), inset 0 1px 0 rgba(255, 255, 255, 0.35);
+        }
+
+        .action-button {
+            position: relative;
+            overflow: hidden;
+            box-shadow: 0 8px 18px rgba(var(--brand-rgb, 99, 102, 241), 0.24), inset 0 1px 0 rgba(255, 255, 255, 0.25);
+            transition: transform 160ms cubic-bezier(0.22, 1.18, 0.36, 1), box-shadow 160ms ease, background-color 160ms ease;
+        }
+
+        .action-button:hover:not(:disabled) {
+            box-shadow: 0 12px 26px rgba(var(--brand-rgb, 99, 102, 241), 0.32), 0 0 0 3px rgba(var(--brand-rgb, 99, 102, 241), 0.12), inset 0 1px 0 rgba(255, 255, 255, 0.30);
+        }
+
+        .action-button:active:not(:disabled) {
+            transform: translateY(1px) scale(0.97);
+            box-shadow: 0 4px 10px rgba(var(--brand-rgb, 99, 102, 241), 0.22);
+        }
+
+        .cat-btn.active,
+        .admin-sub-btn.bg-brand-600,
+        .admin-sub-btn.is-active {
+            box-shadow: 0 8px 18px rgba(var(--brand-rgb, 99, 102, 241), 0.28), 0 0 0 3px rgba(var(--brand-rgb, 99, 102, 241), 0.12);
+        }
+
+        button,
+        .tilt-3d {
+            -webkit-tap-highlight-color: transparent;
+        }
+
+        button:not(:disabled) { transition-property: transform, box-shadow, background-color, color, border-color, opacity; transition-duration: 160ms; }
+        button:not(:disabled):active { transform: translateY(1px) scale(0.97); }
+        button:disabled { cursor: not-allowed; }
+
+        .reveal {
+            opacity: 0;
+            transform: translateY(18px) scale(0.995);
+            will-change: opacity, transform;
+        }
+
+        .reveal-visible {
+            animation: reveal-up 520ms cubic-bezier(0.22, 1, 0.36, 1) both;
+        }
+
+        @keyframes reveal-up {
+            from { opacity: 0; transform: translateY(18px) scale(0.995); }
+            to { opacity: 1; transform: translateY(0) scale(1); }
+        }
+
+        @keyframes spring-press {
+            0% { transform: scale(1); }
+            45% { transform: scale(0.955); }
+            100% { transform: scale(1); }
+        }
+
+        button:not(:disabled):active { animation: spring-press 180ms ease-out; }
+
+        /* Floating 3D storefront footer */
+        .footer-3d {
+            position: relative;
+            z-index: 10;
+            max-width: 72rem;
+            margin: 2rem auto 1.5rem;
+            border-radius: 1.5rem;
+            border: 1px solid rgba(148, 163, 184, 0.22);
+            background: linear-gradient(145deg, #111827 0%, #0b1220 48%, #030712 100%);
+            color: #cbd5e1;
+            box-shadow:
+                0 28px 70px rgba(2, 6, 23, 0.45),
+                0 10px 24px rgba(15, 23, 42, 0.35),
+                inset 0 1px 0 rgba(255, 255, 255, 0.16),
+                inset 0 -1px 0 rgba(255, 255, 255, 0.04);
+            transform-style: preserve-3d;
+            overflow: hidden;
+        }
+
+        .footer-3d::before {
+            content: "";
+            position: absolute;
+            top: 0;
+            left: 1.5rem;
+            right: 1.5rem;
+            height: 1px;
+            background: linear-gradient(90deg, transparent, rgba(255,255,255,0.55), transparent);
+            pointer-events: none;
+        }
+
+        .footer-3d::after {
+            content: "";
+            position: absolute;
+            inset: auto -10% -45% -10%;
+            height: 8rem;
+            background: radial-gradient(ellipse at center, rgba(255,255,255,0.10), transparent 68%);
+            pointer-events: none;
+        }
+
+        .footer-title {
+            text-shadow: 0 1px 0 rgba(255,255,255,0.12), 0 8px 22px rgba(0,0,0,0.35);
+            letter-spacing: -0.02em;
+        }
+
+        .footer-address {
+            color: #94a3b8;
+            line-height: 1.45;
+            text-shadow: 0 1px 1px rgba(0,0,0,0.35);
+        }
+
+        .footer-phone-pill {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.55rem;
+            padding: 0.75rem 1.05rem;
+            border-radius: 999px;
+            border: 1px solid rgba(255,255,255,0.16);
+            background: linear-gradient(145deg, rgba(255,255,255,0.12), rgba(255,255,255,0.04));
+            color: #ffffff;
+            font-weight: 800;
+            font-size: 0.8rem;
+            letter-spacing: 0.01em;
+            box-shadow: 0 10px 24px rgba(0,0,0,0.28), inset 0 1px 0 rgba(255,255,255,0.22), inset 0 -1px 0 rgba(0,0,0,0.25);
+            backdrop-filter: blur(10px);
+            transition: transform 180ms cubic-bezier(0.22, 1.18, 0.36, 1), box-shadow 180ms ease, border-color 180ms ease, background 180ms ease;
+            text-decoration: none;
+        }
+
+        .footer-phone-pill:hover {
+            transform: translateY(-3px) scale(1.02);
+            border-color: rgba(255,255,255,0.34);
+            background: linear-gradient(145deg, rgba(255,255,255,0.18), rgba(255,255,255,0.07));
+            box-shadow: 0 16px 34px rgba(0,0,0,0.34), 0 0 0 3px rgba(255,255,255,0.06), inset 0 1px 0 rgba(255,255,255,0.28);
+        }
+
+        .footer-phone-pill:active { transform: translateY(1px) scale(0.98); }
+
+        @media (prefers-reduced-motion: reduce) {
+            html { scroll-behavior: auto; }
+            *, *::before, *::after {
+                animation-duration: 0.001ms !important;
+                animation-iteration-count: 1 !important;
+                transition-duration: 0.001ms !important;
+                scroll-behavior: auto !important;
+            }
+            .reveal { opacity: 1; transform: none; }
+            .tilt-3d, .product-card, .size-selector, .action-button, .footer-phone-pill { transform: none !important; }
+        }
+
+        .bg-slate-50 { background-color: var(--app-bg) !important; }
+        .bg-white { background-color: var(--app-surface) !important; }
+
+        .admin-sidebar,
+        .admin-subtab-panel.bg-white,
+        .settings-section {
+            box-shadow: var(--app-shadow);
+        }
+
+        .admin-sidebar {
+            position: sticky;
+            top: 1rem;
+            max-height: calc(100vh - 2rem);
+            overflow-y: auto;
+        }
+
+        .admin-sub-btn { text-align: left; }
+        .settings-submenu-btn { text-align: left; }
+        .theme-option { cursor: pointer; }
+
+        .product-image-zoom { cursor: zoom-in; }
+        .zoomable-image {
+            transform-origin: center center;
+            transition: transform 180ms ease-out;
+            will-change: transform, transform-origin;
+        }
+        .discount-badge {
+            z-index: 15;
+            padding: 0.45rem 0.8rem;
+            border-radius: 0.65rem;
+            background: linear-gradient(135deg, #e11d48 0%, #be123c 100%);
+            border: 1px solid rgba(255,255,255,0.35);
+            color: #ffffff;
+            font-size: 0.9rem;
+            line-height: 1;
+            font-weight: 800;
+            letter-spacing: 0.01em;
+            text-transform: uppercase;
+            box-shadow: 0 10px 24px rgba(190,18,60,0.35), 0 2px 0 rgba(15,23,42,0.25), inset 0 1px 0 rgba(255,255,255,0.35);
+            transform: rotate(3deg);
+        }
+
+        .bg-brand-50 { background-color: var(--brand-50) !important; }
+        .bg-brand-100 { background-color: var(--brand-100) !important; }
+        .bg-brand-300 { background-color: var(--brand-300) !important; }
+        .bg-brand-500 { background-color: var(--brand-500) !important; }
+        .bg-brand-600 { background-color: var(--brand-600) !important; }
+        .bg-brand-700 { background-color: var(--brand-700) !important; }
+        .bg-brand-900 { background-color: var(--brand-900) !important; }
+
+        .text-brand-500 { color: var(--brand-500) !important; }
+        .text-brand-600 { color: var(--brand-600) !important; }
+        .text-brand-700 { color: var(--brand-700) !important; }
+        .text-brand-900 { color: var(--brand-900) !important; }
+
+        .border-brand-300 { border-color: var(--brand-300) !important; }
+        .border-brand-500 { border-color: var(--brand-500) !important; }
+        .border-brand-600 { border-color: var(--brand-600) !important; }
+        .border-brand-700 { border-color: var(--brand-700) !important; }
+
+        .hover\:bg-brand-50:hover { background-color: var(--brand-50) !important; }
+        .hover\:bg-brand-600:hover { background-color: var(--brand-600) !important; }
+        .hover\:bg-brand-700:hover { background-color: var(--brand-700) !important; }
+        .hover\:border-brand-300:hover { border-color: var(--brand-300) !important; }
+        .hover\:border-brand-600:hover { border-color: var(--brand-600) !important; }
+        .ring-brand-500 { --tw-ring-color: var(--brand-500) !important; }
+        .selection\:bg-brand-500::selection { background-color: var(--brand-500) !important; }
+
         @media print {
             body * { visibility: hidden !important; }
             #invoice-print-area, #invoice-print-area * { visibility: visible !important; }
@@ -5729,7 +7687,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
                 <!-- Brand Logo -->
                 <div class="flex items-center gap-3 cursor-pointer" onclick="switchView('store')">
                     <div class="w-11 h-11 sm:w-12 sm:h-12 rounded-xl overflow-hidden bg-black shadow-md shrink-0">
-                        <img src="/logo.png?v=2" alt="Taham" class="w-full h-full object-cover">
+                        <img id="site-logo" src="/logo.png?v=2" alt="Taham" class="w-full h-full object-cover">
                     </div>
                     <div>
                         <h1 id="header-shop-name" class="text-lg sm:text-2xl font-bold bg-gradient-to-r from-brand-700 to-slate-900 bg-clip-text text-transparent leading-tight">
@@ -5851,41 +7809,20 @@ INDEX_HTML = r"""<!DOCTYPE html>
     <!-- 2. SUPER ADMIN ERP DASHBOARD VIEW          -->
     <!-- ========================================== -->
     <main id="admin-view" class="hidden max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8 pb-20 no-print">
-        <!-- Admin Top Banner -->
-        <div class="bg-slate-900 text-white p-6 rounded-2xl shadow-lg mb-8 flex flex-col md:flex-row justify-between items-start md:items-center gap-4">
-            <div>
-                <div class="flex items-center gap-2">
-                    <span class="px-2.5 py-0.5 rounded-md bg-pink-600 text-xs font-bold uppercase tracking-wider">Super Admin ERP</span>
-                    <span class="text-xs text-slate-400">Real-Time Cloud Sync Active</span>
-                </div>
-                <h2 class="text-2xl sm:text-3xl font-bold mt-1">Business & Accounts Management Panel</h2>
-            </div>
-            <div class="flex flex-wrap gap-2">
-                <button onclick="switchView('store')" class="px-4 py-2 rounded-xl bg-white/10 hover:bg-white/20 text-white text-xs sm:text-sm font-semibold transition-all flex items-center gap-1.5">
-                    <i data-lucide="store" class="w-4 h-4"></i>
-                    <span>View Store</span>
-                </button>
-                <button onclick="logoutAdmin()" class="px-4 py-2 rounded-xl bg-rose-600 hover:bg-rose-700 text-white text-xs sm:text-sm font-semibold transition-all flex items-center gap-1.5">
-                    <i data-lucide="lock" class="w-4 h-4"></i>
-                    <span>Lock / Logout</span>
-                </button>
-            </div>
-        </div>
-
         <!-- Business Analytics Overview Cards -->
         <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-4 mb-8">
-            <div class="bg-white p-5 rounded-2xl border border-slate-200 shadow-sm">
+            <button type="button" onclick="openAdminSummary('orders')" class="bg-white p-5 rounded-2xl border border-slate-200 shadow-sm text-left w-full hover:border-brand-300 hover:shadow-md transition-all">
                 <div class="flex items-center justify-between">
-                    <p class="text-xs font-semibold text-slate-500">Total Sales (Revenue)</p>
+                    <p class="text-xs font-semibold text-slate-500">Total Sales</p>
                     <div class="w-9 h-9 rounded-xl bg-blue-50 text-blue-600 flex items-center justify-center">
                         <i data-lucide="banknote" class="w-5 h-5"></i>
                     </div>
                 </div>
                 <p id="stat-revenue" class="text-2xl font-bold text-slate-900 mt-2">৳ 0</p>
                 <p class="text-[11px] text-slate-400 mt-1">Total sales including delivery charge</p>
-            </div>
+            </button>
 
-            <div class="bg-white p-5 rounded-2xl border border-emerald-200 shadow-sm bg-gradient-to-br from-white to-emerald-50/40">
+            <button type="button" onclick="openAdminSummary('orders')" class="bg-white p-5 rounded-2xl border border-emerald-200 shadow-sm bg-gradient-to-br from-white to-emerald-50/40 text-left w-full hover:border-emerald-400 hover:shadow-md transition-all">
                 <div class="flex items-center justify-between">
                     <p class="text-xs font-semibold text-emerald-700">Net Profit</p>
                     <div class="w-9 h-9 rounded-xl bg-emerald-100 text-emerald-700 flex items-center justify-center">
@@ -5894,9 +7831,9 @@ INDEX_HTML = r"""<!DOCTYPE html>
                 </div>
                 <p id="stat-profit" class="text-2xl font-bold text-emerald-700 mt-2">৳ 0</p>
                 <p class="text-[11px] text-emerald-600/80 mt-1">Net profit after purchase cost and expenses</p>
-            </div>
+            </button>
 
-            <div class="bg-white p-5 rounded-2xl border border-slate-200 shadow-sm">
+            <button type="button" onclick="openAdminSummary('expenses')" class="bg-white p-5 rounded-2xl border border-slate-200 shadow-sm text-left w-full hover:border-rose-300 hover:shadow-md transition-all">
                 <div class="flex items-center justify-between">
                     <p class="text-xs font-semibold text-slate-500">Total Expenses</p>
                     <div class="w-9 h-9 rounded-xl bg-rose-50 text-rose-600 flex items-center justify-center">
@@ -5905,9 +7842,9 @@ INDEX_HTML = r"""<!DOCTYPE html>
                 </div>
                 <p id="stat-expenses" class="text-2xl font-bold text-rose-600 mt-2">৳ 0</p>
                 <p class="text-[11px] text-slate-400 mt-1">Shop & other expenses</p>
-            </div>
+            </button>
 
-            <div class="bg-white p-5 rounded-2xl border border-slate-200 shadow-sm">
+            <button type="button" onclick="openAdminSummary('orders', 'Pending')" class="bg-white p-5 rounded-2xl border border-slate-200 shadow-sm text-left w-full hover:border-amber-300 hover:shadow-md transition-all">
                 <div class="flex items-center justify-between">
                     <p class="text-xs font-semibold text-slate-500">Pending Orders</p>
                     <div class="w-9 h-9 rounded-xl bg-amber-50 text-amber-600 flex items-center justify-center">
@@ -5916,44 +7853,50 @@ INDEX_HTML = r"""<!DOCTYPE html>
                 </div>
                 <p id="stat-pending" class="text-2xl font-bold text-amber-600 mt-2">0</p>
                 <p id="stat-total-orders" class="text-[11px] text-slate-400 mt-1">Total Orders: 0</p>
-            </div>
+            </button>
 
-            <div class="bg-white p-5 rounded-2xl border border-slate-200 shadow-sm">
+            <button type="button" onclick="openAdminSummary('inventory')" class="bg-white p-5 rounded-2xl border border-slate-200 shadow-sm text-left w-full hover:border-purple-300 hover:shadow-md transition-all">
                 <div class="flex items-center justify-between">
-                    <p class="text-xs font-semibold text-slate-500">Low Stock Alert (&lt;5)</p>
+                    <p class="text-xs font-semibold text-slate-500">Low Stock Alert</p>
                     <div class="w-9 h-9 rounded-xl bg-purple-50 text-purple-600 flex items-center justify-center">
                         <i data-lucide="alert-triangle" class="w-5 h-5"></i>
                     </div>
                 </div>
                 <p id="stat-low-stock" class="text-2xl font-bold text-purple-700 mt-2">0</p>
                 <p id="stat-total-products" class="text-[11px] text-slate-400 mt-1">Total Items: 0</p>
-            </div>
+            </button>
         </div>
 
         <!-- Admin Sub-Navigation Tabs -->
-        <div class="flex items-center gap-2 overflow-x-auto pb-2 mb-6 border-b border-slate-200">
-            <button onclick="switchAdminSubTab('orders')" data-subtab="orders" class="admin-sub-btn px-4 py-2.5 rounded-xl text-sm font-bold bg-brand-600 text-white shadow-sm whitespace-nowrap flex items-center gap-2">
-                <i data-lucide="package-check" class="w-4 h-4"></i>
-                <span>Orders & Invoices</span>
-            </button>
-            <button onclick="switchAdminSubTab('inventory')" data-subtab="inventory" class="admin-sub-btn px-4 py-2.5 rounded-xl text-sm font-bold bg-white text-slate-700 hover:bg-slate-100 border border-slate-200 whitespace-nowrap flex items-center gap-2">
-                <i data-lucide="shirt" class="w-4 h-4"></i>
-                <span>Products & Stock (Inventory)</span>
-            </button>
-            <button onclick="switchAdminSubTab('collections')" data-subtab="collections" class="admin-sub-btn px-4 py-2.5 rounded-xl text-sm font-bold bg-white text-slate-700 hover:bg-slate-100 border border-slate-200 whitespace-nowrap flex items-center gap-2">
-                <i data-lucide="layout-grid" class="w-4 h-4"></i>
-                <span>Collections</span>
-            </button>
-            <button onclick="switchAdminSubTab('expenses')" data-subtab="expenses" class="admin-sub-btn px-4 py-2.5 rounded-xl text-sm font-bold bg-white text-slate-700 hover:bg-slate-100 border border-slate-200 whitespace-nowrap flex items-center gap-2">
-                <i data-lucide="wallet" class="w-4 h-4"></i>
-                <span>Daily Expenses</span>
-            </button>
-            <button onclick="switchAdminSubTab('settings')" data-subtab="settings" class="admin-sub-btn px-4 py-2.5 rounded-xl text-sm font-bold bg-white text-slate-700 hover:bg-slate-100 border border-slate-200 whitespace-nowrap flex items-center gap-2">
-                <i data-lucide="settings" class="w-4 h-4"></i>
-                <span>Shop Settings & Password</span>
-            </button>
-        </div>
+        <div class="admin-layout flex flex-col lg:flex-row gap-6 items-start">
+            <nav id="admin-sidebar" class="admin-sidebar w-full lg:w-64 lg:flex-shrink-0 bg-white rounded-2xl border border-slate-200 shadow-sm p-3 space-y-1" aria-label="Admin navigation">
+                <button type="button" onclick="switchAdminSubTab('orders')" data-subtab="orders" class="admin-sub-btn w-full px-4 py-2.5 rounded-xl text-sm font-bold bg-brand-600 text-white shadow-sm flex items-center justify-start gap-2">
+                    <i data-lucide="package-check" class="w-4 h-4"></i>
+                    <span>Orders & Invoices</span>
+                </button>
+                <button type="button" onclick="switchAdminSubTab('inventory')" data-subtab="inventory" class="admin-sub-btn w-full px-4 py-2.5 rounded-xl text-sm font-bold bg-white text-slate-700 hover:bg-slate-100 border border-slate-200 flex items-center justify-start gap-2">
+                    <i data-lucide="shirt" class="w-4 h-4"></i>
+                    <span>Products & Stock (Inventory)</span>
+                </button>
+                <button type="button" onclick="switchAdminSubTab('collections')" data-subtab="collections" class="admin-sub-btn w-full px-4 py-2.5 rounded-xl text-sm font-bold bg-white text-slate-700 hover:bg-slate-100 border border-slate-200 flex items-center justify-start gap-2">
+                    <i data-lucide="layout-grid" class="w-4 h-4"></i>
+                    <span>Collections</span>
+                </button>
+                <button type="button" onclick="switchAdminSubTab('expenses')" data-subtab="expenses" class="admin-sub-btn w-full px-4 py-2.5 rounded-xl text-sm font-bold bg-white text-slate-700 hover:bg-slate-100 border border-slate-200 flex items-center justify-start gap-2">
+                    <i data-lucide="wallet" class="w-4 h-4"></i>
+                    <span>Daily Expenses</span>
+                </button>
+                <button type="button" onclick="switchAdminSubTab('settings')" data-subtab="settings" class="admin-sub-btn w-full px-4 py-2.5 rounded-xl text-sm font-bold bg-white text-slate-700 hover:bg-slate-100 border border-slate-200 flex items-center justify-start gap-2">
+                    <i data-lucide="settings" class="w-4 h-4"></i>
+                    <span>Settings</span>
+                </button>
+                <button type="button" onclick="switchAdminSubTab('reports')" data-subtab="reports" class="admin-sub-btn w-full px-4 py-2.5 rounded-xl text-sm font-bold bg-white text-slate-700 hover:bg-slate-100 border border-slate-200 flex items-center justify-start gap-2">
+                    <i data-lucide="bar-chart-3" class="w-4 h-4"></i>
+                    <span>Reports</span>
+                </button>
+            </nav>
 
+            <div class="admin-content flex-1 min-w-0 w-full space-y-6">
         <!-- SUB-TAB 1: ORDERS & INVOICE PRINTING -->
         <div id="subtab-orders" class="admin-subtab-panel space-y-6">
             <div class="bg-white p-6 rounded-2xl border border-slate-200 shadow-sm">
@@ -6092,133 +8035,352 @@ INDEX_HTML = r"""<!DOCTYPE html>
         </div>
 
         <!-- SUB-TAB: COLLECTIONS (photo + name) -->
-        <div id="subtab-collections" class="admin-subtab-panel hidden grid grid-cols-1 lg:grid-cols-3 gap-8">
-            <div class="lg:col-span-1">
-                <div class="bg-white p-6 rounded-2xl border border-slate-200 shadow-sm sticky top-24">
-                    <div class="flex items-center justify-between mb-5 pb-3 border-b border-slate-100">
-                        <div class="flex items-center gap-2">
-                            <i data-lucide="layout-grid" class="w-5 h-5 text-brand-600"></i>
-                            <h3 id="col-form-title" class="text-lg font-bold text-slate-900">Add New Collection</h3>
-                        </div>
-                        <button id="col-cancel-btn" onclick="resetCollectionForm()" class="hidden text-xs text-rose-600 font-bold hover:underline">Cancel</button>
-                    </div>
-                    <form id="collection-form" onsubmit="handleSaveCollection(event)" class="space-y-4">
-                        <input type="hidden" id="edit-col-id">
-                        <div>
-                            <label class="block text-xs font-bold text-slate-700 mb-1">Collection Name *</label>
-                            <input type="text" id="col-name" required maxlength="40" placeholder="e.g. Winter Wear" class="w-full px-3.5 py-2.5 rounded-xl border border-slate-200 focus:outline-none focus:ring-2 focus:ring-brand-500 text-sm">
-                        </div>
-                        <div class="p-3.5 rounded-xl border border-dashed border-brand-300 bg-brand-50/30 space-y-2">
-                            <label class="block text-xs font-bold text-brand-900">Upload a cover photo from your gallery/computer:</label>
-                            <input type="file" id="col-image-file" accept="image/*" onchange="handleCollectionImageUpload(event)" class="w-full text-xs text-slate-600 file:mr-3 file:py-1.5 file:px-3 file:rounded-lg file:border-0 file:text-xs file:font-semibold file:bg-brand-600 file:text-white hover:file:bg-brand-700 cursor-pointer">
-                            <div id="col-image-preview-box" class="hidden pt-2">
-                                <img id="col-image-preview-img" src="" class="h-28 w-24 object-cover rounded-lg border border-slate-200 shadow-sm">
-                            </div>
-                            <input type="text" id="col-image-url" placeholder="Or paste an image link (URL)..." class="w-full px-3 py-2 rounded-lg border border-slate-200 bg-white text-xs mt-1">
-                        </div>
-                        <button type="submit" class="w-full py-3 rounded-xl bg-brand-600 hover:bg-brand-700 text-white font-semibold shadow-md transition-all flex items-center justify-center gap-2">
-                            <i data-lucide="save" class="w-4 h-4"></i>
-                            <span>Save Collection</span>
-                        </button>
-                    </form>
-                </div>
-            </div>
-            <div class="lg:col-span-2">
-                <div class="bg-white p-6 rounded-2xl border border-slate-200 shadow-sm">
-                    <div class="mb-5 pb-3 border-b border-slate-100">
+        <div id="subtab-collections" class="admin-subtab-panel hidden">
+            <div class="bg-white p-6 rounded-2xl border border-slate-200 shadow-sm">
+                <div class="flex items-center justify-between gap-4 mb-5 pb-3 border-b border-slate-100">
+                    <div>
                         <h3 class="text-lg font-bold text-slate-900">Your Collections</h3>
                         <p class="text-xs text-slate-500 mt-1">These photos appear on the storefront. Customers tap a collection to see its clothes.</p>
                     </div>
-                    <div id="admin-collections-list" class="divide-y divide-slate-100"></div>
+                    <button type="button" onclick="openCollectionModal()" class="px-4 py-2.5 rounded-xl bg-brand-600 hover:bg-brand-700 text-white text-sm font-bold shadow-sm flex items-center gap-2 whitespace-nowrap">
+                        <i data-lucide="plus" class="w-4 h-4"></i>
+                        <span>Add New Collection</span>
+                    </button>
                 </div>
+                <div id="admin-collections-list" class="divide-y divide-slate-100"></div>
+            </div>
+        </div>
+
+        <!-- Collection Modal -->
+        <div id="collection-modal" class="fixed inset-0 z-50 hidden flex items-center justify-center p-4 no-print">
+            <div onclick="closeCollectionModal()" class="fixed inset-0 bg-slate-900/75 backdrop-blur-sm"></div>
+            <div class="bg-white rounded-2xl max-w-2xl w-full p-6 sm:p-8 relative z-10 shadow-2xl max-h-[90vh] overflow-y-auto">
+                <div class="flex justify-between items-start gap-4 pb-4 border-b border-slate-100 mb-5">
+                    <div class="flex items-center gap-2">
+                        <i data-lucide="layout-grid" class="w-5 h-5 text-brand-600"></i>
+                        <h3 id="col-form-title" class="text-lg font-bold text-slate-900">Add New Collection</h3>
+                    </div>
+                    <div class="flex items-center gap-2">
+                        <button id="col-cancel-btn" onclick="closeCollectionModal()" class="hidden text-xs text-rose-600 font-bold hover:underline">Cancel</button>
+                        <button type="button" onclick="closeCollectionModal()" class="p-2 rounded-xl text-slate-400 hover:bg-slate-100"><i data-lucide="x" class="w-4 h-4"></i></button>
+                    </div>
+                </div>
+                <form id="collection-form" onsubmit="handleSaveCollection(event)" class="space-y-4">
+                    <input type="hidden" id="edit-col-id">
+                    <div>
+                        <label class="block text-xs font-bold text-slate-700 mb-1">Collection Name *</label>
+                        <input type="text" id="col-name" required maxlength="40" placeholder="e.g. Winter Wear" class="w-full px-3.5 py-2.5 rounded-xl border border-slate-200 focus:outline-none focus:ring-2 focus:ring-brand-500 text-sm" oninput="renderCollectionProductSelector()">
+                    </div>
+                    <div class="p-3.5 rounded-xl border border-dashed border-brand-300 bg-brand-50/30 space-y-2">
+                        <label class="block text-xs font-bold text-brand-900">Cover Photo (upload or URL)</label>
+                        <input type="file" id="col-image-file" accept="image/*" onchange="handleCollectionImageUpload(event)" class="w-full text-xs text-slate-600 file:mr-3 file:py-1.5 file:px-3 file:rounded-lg file:border-0 file:text-xs file:font-semibold file:bg-brand-600 file:text-white hover:file:bg-brand-700 cursor-pointer">
+                        <div id="col-image-preview-box" class="hidden pt-2">
+                            <img id="col-image-preview-img" src="" class="h-28 w-24 object-cover rounded-lg border border-slate-200 shadow-sm">
+                        </div>
+                        <input type="text" id="col-image-url" placeholder="Or paste an image link (URL)..." class="w-full px-3 py-2 rounded-lg border border-slate-200 bg-white text-xs mt-1">
+                    </div>
+                    <div>
+                        <label class="block text-xs font-bold text-slate-700 mb-1">Assign Products to Collection</label>
+                        <div id="col-product-selector" class="max-h-48 overflow-y-auto rounded-xl border border-slate-200 divide-y divide-slate-100 bg-white"></div>
+                        <p class="text-[11px] text-slate-400 mt-1">Select products to assign. Products removed here will be unassigned from this collection.</p>
+                    </div>
+                    <button type="submit" class="w-full py-3 rounded-xl bg-brand-600 hover:bg-brand-700 text-white font-semibold shadow-md transition-all flex items-center justify-center gap-2">
+                        <i data-lucide="save" class="w-4 h-4"></i>
+                        <span>Save Collection</span>
+                    </button>
+                </form>
             </div>
         </div>
 
         <!-- SUB-TAB 3: DAILY EXPENSE TRACKER -->
-        <div id="subtab-expenses" class="admin-subtab-panel hidden grid grid-cols-1 lg:grid-cols-3 gap-8">
-            <div class="lg:col-span-1">
-                <div class="bg-white p-6 rounded-2xl border border-slate-200 shadow-sm">
-                    <h3 class="text-lg font-bold text-slate-900 mb-4 pb-3 border-b border-slate-100">Add New Expense</h3>
-                    <form onsubmit="handleAddExpense(event)" class="space-y-4">
-                        <div>
-                            <label class="block text-xs font-bold text-slate-700 mb-1">Expense Description *</label>
-                            <input type="text" id="exp-title" required placeholder="e.g. Shop rent / Packaging bags" class="w-full px-3.5 py-2.5 rounded-xl border border-slate-200 text-sm">
-                        </div>
-                        <div>
-                            <label class="block text-xs font-bold text-slate-700 mb-1">Expense Category *</label>
-                            <select id="exp-category" class="w-full px-3.5 py-2.5 rounded-xl border border-slate-200 text-sm bg-white">
-                                <option value="Shop rent & bills">Shop rent & electricity bill</option>
-                                <option value="Packaging & delivery">Packaging & courier cost</option>
-                                <option value="Marketing & boosting">Facebook boosting / marketing</option>
-                                <option value="Staff & hospitality">Staff salary & hospitality</option>
-                                <option value="Other">Other expenses</option>
-                            </select>
-                        </div>
-                        <div>
-                            <label class="block text-xs font-bold text-slate-700 mb-1">Amount (৳) *</label>
-                            <input type="number" id="exp-amount" required min="1" placeholder="500" class="w-full px-3.5 py-2.5 rounded-xl border border-slate-200 text-sm">
-                        </div>
-                        <button type="submit" class="w-full py-3 rounded-xl bg-rose-600 hover:bg-rose-700 text-white font-semibold shadow-sm transition-all">
-                            Add Expense
-                        </button>
-                    </form>
-                </div>
-            </div>
-
-            <div class="lg:col-span-2">
-                <div class="bg-white p-6 rounded-2xl border border-slate-200 shadow-sm">
-                    <h3 class="text-lg font-bold text-slate-900 mb-4 pb-3 border-b border-slate-100">Daily Expense List</h3>
-                    <div id="admin-expenses-list" class="divide-y divide-slate-100">
-                        <!-- Expenses injected here -->
+        <div id="subtab-expenses" class="admin-subtab-panel hidden">
+            <div class="bg-white p-6 rounded-2xl border border-slate-200 shadow-sm">
+                <div class="flex items-center justify-between gap-4 mb-5 pb-3 border-b border-slate-100">
+                    <div>
+                        <h3 class="text-lg font-bold text-slate-900">Daily Expense List</h3>
                     </div>
+                    <button type="button" onclick="openExpenseModal()" class="px-4 py-2.5 rounded-xl bg-brand-600 hover:bg-brand-700 text-white text-sm font-bold shadow-sm flex items-center gap-2 whitespace-nowrap">
+                        <i data-lucide="plus" class="w-4 h-4"></i>
+                        <span>Add New Expense</span>
+                    </button>
+                </div>
+                <div id="admin-expenses-list" class="divide-y divide-slate-100">
+                    <!-- Expenses injected here -->
                 </div>
             </div>
         </div>
 
-        <!-- SUB-TAB 4: STORE SETTINGS & ADMIN PASSWORD -->
-        <div id="subtab-settings" class="admin-subtab-panel hidden max-w-2xl mx-auto">
-            <div class="bg-white p-6 sm:p-8 rounded-2xl border border-slate-200 shadow-sm">
-                <h3 class="text-xl font-bold text-slate-900 mb-2">Shop Information & Super Admin Security</h3>
-                <p class="text-xs text-slate-500 mb-6 pb-4 border-b border-slate-100">Change the shop name, bKash/Nagad number and admin password from here.</p>
-
-                <form onsubmit="handleSaveSettings(event)" class="space-y-4">
+        <!-- Expense Modal -->
+        <div id="expense-modal" class="fixed inset-0 z-50 hidden flex items-center justify-center p-4 no-print">
+            <div onclick="closeExpenseModal()" class="fixed inset-0 bg-slate-900/75 backdrop-blur-sm"></div>
+            <div class="bg-white rounded-2xl max-w-lg w-full p-6 sm:p-8 relative z-10 shadow-2xl max-h-[90vh] overflow-y-auto">
+                <div class="flex justify-between items-center pb-4 border-b border-slate-100 mb-5">
+                    <h3 class="text-lg font-bold text-slate-900">Add New Expense</h3>
+                    <button type="button" onclick="closeExpenseModal()" class="p-2 rounded-xl text-slate-400 hover:bg-slate-100"><i data-lucide="x" class="w-4 h-4"></i></button>
+                </div>
+                <form onsubmit="handleAddExpense(event)" class="space-y-4">
                     <div>
-                        <label class="block text-xs font-bold text-slate-700 mb-1">Shop Name</label>
-                        <input type="text" id="set-shop-name" required class="w-full px-4 py-2.5 rounded-xl border border-slate-200 text-sm">
-                    </div>
-                    <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
-                        <div>
-                            <label class="block text-xs font-bold text-slate-700 mb-1">Shop Mobile Number</label>
-                            <input type="text" id="set-shop-phone" required class="w-full px-4 py-2.5 rounded-xl border border-slate-200 text-sm">
-                        </div>
-                        <div>
-                            <label class="block text-xs font-bold text-slate-700 mb-1">bKash / Nagad Payment Number</label>
-                            <input type="text" id="set-payment-number" required class="w-full px-4 py-2.5 rounded-xl border border-slate-200 text-sm">
-                        </div>
+                        <label class="block text-xs font-bold text-slate-700 mb-1">Expense Description *</label>
+                        <input type="text" id="exp-title" required placeholder="e.g. Shop rent / Packaging bags" class="w-full px-3.5 py-2.5 rounded-xl border border-slate-200 text-sm">
                     </div>
                     <div>
-                        <label class="block text-xs font-bold text-slate-700 mb-1">Shop Address (shown on invoice)</label>
-                        <input type="text" id="set-shop-address" required class="w-full px-4 py-2.5 rounded-xl border border-slate-200 text-sm">
+                        <label class="block text-xs font-bold text-slate-700 mb-1">Expense Category *</label>
+                        <select id="exp-category" class="w-full px-3.5 py-2.5 rounded-xl border border-slate-200 text-sm bg-white">
+                            <option value="Shop rent & bills">Shop rent & electricity bill</option>
+                            <option value="Packaging & delivery">Packaging & courier cost</option>
+                            <option value="Marketing & boosting">Facebook boosting / marketing</option>
+                            <option value="Staff & hospitality">Staff salary & hospitality</option>
+                            <option value="Other">Other expenses</option>
+                        </select>
                     </div>
-
-                    <div class="pt-4 border-t border-slate-100">
-                        <h4 class="text-sm font-bold text-rose-700 mb-3">Change Super Admin Login Details</h4>
-                        <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
-                            <div>
-                                <label class="block text-xs font-bold text-slate-700 mb-1">Admin Username</label>
-                                <input type="text" id="set-admin-user" required class="w-full px-4 py-2.5 rounded-xl border border-slate-200 text-sm">
-                            </div>
-                            <div>
-                                <label class="block text-xs font-bold text-slate-700 mb-1">New Password</label>
-                                <input type="password" id="set-admin-pass" autocomplete="new-password" placeholder="Leave empty to keep the current password" class="w-full px-4 py-2.5 rounded-xl border border-slate-200 text-sm">
-                            </div>
-                        </div>
+                    <div>
+                        <label class="block text-xs font-bold text-slate-700 mb-1">Amount (৳) *</label>
+                        <input type="number" id="exp-amount" required min="1" placeholder="500" class="w-full px-3.5 py-2.5 rounded-xl border border-slate-200 text-sm">
                     </div>
-
-                    <button type="submit" class="w-full py-3 rounded-xl bg-slate-900 hover:bg-slate-800 text-white font-bold shadow-md transition-all mt-4">
-                        Save Settings
+                    <button type="submit" class="w-full py-3 rounded-xl bg-rose-600 hover:bg-rose-700 text-white font-semibold shadow-sm transition-all">
+                        Add Expense
                     </button>
                 </form>
+            </div>
+        </div>
+
+        <!-- SUB-TAB 4: SETTINGS -->
+        <div id="subtab-settings" class="admin-subtab-panel hidden w-full">
+            <div class="settings-layout grid grid-cols-1 lg:grid-cols-[220px_1fr] gap-6 items-start">
+                <nav class="settings-submenu bg-white rounded-2xl border border-slate-200 shadow-sm p-3 space-y-1" aria-label="Settings sections">
+                    <button type="button" onclick="switchSettingsSection('user-management')" data-settings-section="user-management" class="settings-submenu-btn w-full px-4 py-2.5 rounded-xl text-sm font-bold bg-brand-600 text-white flex items-center justify-start gap-2">
+                        <i data-lucide="users" class="w-4 h-4"></i>
+                        <span>User Management</span>
+                    </button>
+                    <button type="button" onclick="switchSettingsSection('access-control')" data-settings-section="access-control" class="settings-submenu-btn w-full px-4 py-2.5 rounded-xl text-sm font-bold bg-white text-slate-700 hover:bg-slate-100 border border-slate-200 flex items-center justify-start gap-2">
+                        <i data-lucide="shield-check" class="w-4 h-4"></i>
+                        <span>Access Control</span>
+                    </button>
+                    <button type="button" onclick="switchSettingsSection('page-setup')" data-settings-section="page-setup" class="settings-submenu-btn w-full px-4 py-2.5 rounded-xl text-sm font-bold bg-white text-slate-700 hover:bg-slate-100 border border-slate-200 flex items-center justify-start gap-2">
+                        <i data-lucide="file-cog" class="w-4 h-4"></i>
+                        <span>Page Setup</span>
+                    </button>
+                </nav>
+
+                <div class="settings-content min-w-0 space-y-6">
+                    <section id="settings-user-management" class="settings-section bg-white p-6 sm:p-8 rounded-2xl border border-slate-200 shadow-sm">
+                        <div class="flex items-start justify-between gap-4 mb-6 pb-4 border-b border-slate-100">
+                            <div>
+                                <h3 class="text-xl font-bold text-slate-900 mb-2">User Management</h3>
+                                <p class="text-xs text-slate-500">Manage users, roles, and the primary Super Admin account.</p>
+                            </div>
+                            <button type="button" onclick="openUserModal()" class="px-4 py-2.5 rounded-xl bg-brand-600 hover:bg-brand-700 text-white text-sm font-bold shadow-sm flex items-center gap-2 whitespace-nowrap">
+                                <i data-lucide="user-plus" class="w-4 h-4"></i>
+                                <span>Add New User</span>
+                            </button>
+                        </div>
+
+                        <form onsubmit="handleSaveSettings(event)" class="space-y-4 mb-8">
+                            <h4 class="text-sm font-bold text-slate-900">Super Admin Account</h4>
+                            <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                                <div>
+                                    <label class="block text-xs font-bold text-slate-700 mb-1">Admin Username</label>
+                                    <input type="text" id="set-admin-user" required class="w-full px-4 py-2.5 rounded-xl border border-slate-200 text-sm">
+                                </div>
+                                <div>
+                                    <label class="block text-xs font-bold text-slate-700 mb-1">New Password</label>
+                                    <input type="password" id="set-admin-pass" autocomplete="new-password" placeholder="Leave empty to keep the current password" class="w-full px-4 py-2.5 rounded-xl border border-slate-200 text-sm">
+                                </div>
+                            </div>
+
+                            <button type="submit" class="w-full py-3 rounded-xl bg-slate-900 hover:bg-slate-800 text-white font-bold shadow-md transition-all mt-4">
+                                Save Super Admin
+                            </button>
+                        </form>
+
+                        <div id="users-list" class="divide-y divide-slate-100 rounded-xl border border-slate-200 overflow-hidden"></div>
+                    </section>
+
+                    <!-- Add New User Modal -->
+                    <div id="user-modal" class="fixed inset-0 z-50 hidden flex items-center justify-center p-4 no-print">
+                        <div onclick="closeUserModal()" class="fixed inset-0 bg-slate-900/75 backdrop-blur-sm"></div>
+                        <div class="bg-white rounded-2xl max-w-lg w-full p-6 sm:p-8 relative z-10 shadow-2xl max-h-[90vh] overflow-y-auto">
+                            <div class="flex justify-between items-center pb-4 border-b border-slate-100 mb-5">
+                                <h3 class="text-lg font-bold text-slate-900">Add New User</h3>
+                                <button type="button" onclick="closeUserModal()" class="p-2 rounded-xl text-slate-400 hover:bg-slate-100"><i data-lucide="x" class="w-4 h-4"></i></button>
+                            </div>
+                            <form id="add-user-form" onsubmit="handleAddUser(event)" class="space-y-4">
+                                <div>
+                                    <label class="block text-xs font-bold text-slate-700 mb-1">Full Name *</label>
+                                    <input type="text" id="user-full-name" required maxlength="120" autocomplete="name" class="w-full px-4 py-2.5 rounded-xl border border-slate-200 text-sm" placeholder="Full name">
+                                </div>
+                                <div>
+                                    <label class="block text-xs font-bold text-slate-700 mb-1">Role *</label>
+                                    <select id="user-role" required class="w-full px-4 py-2.5 rounded-xl border border-slate-200 text-sm bg-white">
+                                        <option value="Admin">Admin</option>
+                                        <option value="Manager">Manager</option>
+                                        <option value="Salesman">Salesman</option>
+                                        <option value="Marketing">Marketing</option>
+                                    </select>
+                                </div>
+                                <div>
+                                    <label class="block text-xs font-bold text-slate-700 mb-1">Email ID *</label>
+                                    <input type="email" id="user-email" required autocomplete="email" class="w-full px-4 py-2.5 rounded-xl border border-slate-200 text-sm" placeholder="name@example.com" pattern="^[A-Za-z0-9._%+\\-]+@[A-Za-z0-9.\\-]+\\.[A-Za-z]{2,}$">
+                                </div>
+                                <div>
+                                    <label class="block text-xs font-bold text-slate-700 mb-1">Password *</label>
+                                    <input type="password" id="user-password" required minlength="10" autocomplete="new-password" class="w-full px-4 py-2.5 rounded-xl border border-slate-200 text-sm" placeholder="At least 10 characters">
+                                    <p class="text-[11px] text-slate-400 mt-1">Must include uppercase, lowercase, number, and special character.</p>
+                                </div>
+                                <button type="submit" class="w-full py-3 rounded-xl bg-brand-600 hover:bg-brand-700 text-white font-bold shadow-md transition-all">
+                                    Add New User
+                                </button>
+                            </form>
+                        </div>
+                    </div>
+
+                    <section id="settings-access-control" class="settings-section hidden bg-white p-6 sm:p-8 rounded-2xl border border-slate-200 shadow-sm">
+                        <h3 class="text-xl font-bold text-slate-900 mb-2">Access Control</h3>
+                        <p class="text-xs text-slate-500 mb-6 pb-4 border-b border-slate-100">Customize exact permissions individually for each user. Super Admin always has full access and cannot be removed.</p>
+
+                        <div class="rounded-xl border border-slate-200 bg-slate-50 p-4 mb-5">
+                            <p class="text-xs font-bold uppercase tracking-wider text-slate-500">Super Admin</p>
+                            <p id="access-admin-user" class="text-sm font-bold text-slate-900 mt-1">—</p>
+                            <p class="text-xs text-slate-500 mt-1">Full access. Only Super Admin can delete user accounts.</p>
+                        </div>
+
+                        <div class="grid grid-cols-1 lg:grid-cols-[240px_1fr] gap-5">
+                            <div>
+                                <label class="block text-xs font-bold text-slate-700 mb-1">Select User</label>
+                                <select id="access-user-id" onchange="renderAccessMatrix()" class="w-full px-3.5 py-2.5 rounded-xl border border-slate-200 text-sm bg-white"></select>
+                                <p class="text-[11px] text-slate-400 mt-2">Choose a specific user to view and edit their permission matrix.</p>
+                            </div>
+                            <div id="access-permissions-matrix" class="space-y-2"></div>
+                        </div>
+                    </section>
+
+                    <section id="settings-page-setup" class="settings-section hidden bg-white p-6 sm:p-8 rounded-2xl border border-slate-200 shadow-sm">
+                        <h3 class="text-xl font-bold text-slate-900 mb-2">Page Setup</h3>
+                        <p class="text-xs text-slate-500 mb-6 pb-4 border-b border-slate-100">Customize the panel title, shop details, logo, and dashboard theme.</p>
+
+                        <form onsubmit="handleSaveSettings(event)" class="space-y-4">
+                            <div>
+                                <label class="block text-xs font-bold text-slate-700 mb-1">Page Name</label>
+                                <input type="text" id="page-name" required class="w-full px-4 py-2.5 rounded-xl border border-slate-200 text-sm" placeholder="Website / panel title">
+                            </div>
+
+                            <div>
+                                <label class="block text-xs font-bold text-slate-700 mb-1">Shop Name</label>
+                                <input type="text" id="set-shop-name" required class="w-full px-4 py-2.5 rounded-xl border border-slate-200 text-sm">
+                            </div>
+                            <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                                <div>
+                                    <label class="block text-xs font-bold text-slate-700 mb-1">Shop Mobile Number</label>
+                                    <input type="text" id="set-shop-phone" required class="w-full px-4 py-2.5 rounded-xl border border-slate-200 text-sm">
+                                </div>
+                                <div>
+                                    <label class="block text-xs font-bold text-slate-700 mb-1">bKash / Nagad Payment Number</label>
+                                    <input type="text" id="set-payment-number" required class="w-full px-4 py-2.5 rounded-xl border border-slate-200 text-sm">
+                                </div>
+                            </div>
+                            <div>
+                                <label class="block text-xs font-bold text-slate-700 mb-1">Shop Address (shown on invoice)</label>
+                                <input type="text" id="set-shop-address" required class="w-full px-4 py-2.5 rounded-xl border border-slate-200 text-sm">
+                            </div>
+
+                            <div class="pt-4 border-t border-slate-100">
+                                <h4 class="text-sm font-bold text-slate-900 mb-3">Logo Upload</h4>
+                                <div class="flex flex-col sm:flex-row items-start sm:items-center gap-4">
+                                    <img id="settings-logo-preview" src="/logo.png?v=2" alt="Current site logo" class="w-16 h-16 rounded-xl object-cover border border-slate-200 bg-white">
+                                    <div class="space-y-2 w-full">
+                                        <input type="file" id="logo-upload" accept="image/*" class="block w-full text-sm text-slate-500 file:mr-3 file:py-2 file:px-4 file:rounded-xl file:border-0 file:text-sm file:font-bold file:bg-slate-900 file:text-white hover:file:bg-slate-800">
+                                        <button type="button" onclick="uploadSiteLogo()" class="px-4 py-2.5 rounded-xl bg-brand-600 hover:bg-brand-700 text-white text-sm font-bold">
+                                            Upload Logo
+                                        </button>
+                                    </div>
+                                </div>
+                            </div>
+
+                            <div class="pt-4 border-t border-slate-100">
+                                <h4 class="text-sm font-bold text-slate-900 mb-3">Theme Selector</h4>
+                                <p class="text-xs text-slate-500 mb-3">Choose from 24 distinct color and UI themes. Selecting a theme applies it to the dashboard immediately.</p>
+                                <div id="theme-selector" class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3" data-selected="classic-pink"></div>
+                            </div>
+
+                            <button type="submit" class="w-full py-3 rounded-xl bg-slate-900 hover:bg-slate-800 text-white font-bold shadow-md transition-all mt-4">
+                                Save Page Setup
+                            </button>
+                        </form>
+                    </section>
+                </div>
+            </div>
+        </div>
+
+        <!-- SUB-TAB: REPORTS -->
+        <div id="subtab-reports" class="admin-subtab-panel hidden w-full">
+            <div class="bg-white p-6 rounded-2xl border border-slate-200 shadow-sm space-y-6">
+                <div class="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4 pb-4 border-b border-slate-100">
+                    <div>
+                        <h3 class="text-xl font-bold text-slate-900">Reports</h3>
+                        <p class="text-xs text-slate-500 mt-1">Financial summaries, order summaries, and calendar filtering.</p>
+                    </div>
+                    <div class="flex gap-2" role="tablist">
+                        <button type="button" onclick="switchReportView('daily')" data-report-tab="daily" class="report-tab px-4 py-2 rounded-xl text-sm font-bold bg-brand-600 text-white">Daily Report</button>
+                        <button type="button" onclick="switchReportView('monthly')" data-report-tab="monthly" class="report-tab px-4 py-2 rounded-xl text-sm font-bold bg-white text-slate-700 border border-slate-200">Monthly Report</button>
+                    </div>
+                </div>
+
+                <div id="report-daily" class="report-view space-y-4">
+                    <div class="rounded-xl border border-slate-200 bg-slate-50 p-4">
+                        <h4 class="text-sm font-bold text-slate-900 mb-3">Calendar Date Filter</h4>
+                        <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
+                            <div>
+                                <label class="block text-xs font-bold text-slate-700 mb-1">Specific Date</label>
+                                <input type="date" id="daily-report-date" onchange="renderReports()" class="w-full px-3 py-2 rounded-xl border border-slate-200 bg-white text-sm">
+                            </div>
+                            <div>
+                                <label class="block text-xs font-bold text-slate-700 mb-1">From Date</label>
+                                <input type="date" id="daily-report-from" onchange="renderReports()" class="w-full px-3 py-2 rounded-xl border border-slate-200 bg-white text-sm">
+                            </div>
+                            <div>
+                                <label class="block text-xs font-bold text-slate-700 mb-1">To Date</label>
+                                <input type="date" id="daily-report-to" onchange="renderReports()" class="w-full px-3 py-2 rounded-xl border border-slate-200 bg-white text-sm">
+                            </div>
+                            <div class="flex items-end">
+                                <button type="button" onclick="clearReportFilters('daily')" class="w-full px-3 py-2 rounded-xl bg-white text-slate-700 border border-slate-200 text-sm font-bold hover:bg-slate-100">Clear Filters</button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <div id="report-monthly" class="report-view hidden space-y-4">
+                    <div class="rounded-xl border border-slate-200 bg-slate-50 p-4">
+                        <h4 class="text-sm font-bold text-slate-900 mb-3">Calendar Month Filter</h4>
+                        <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
+                            <div>
+                                <label class="block text-xs font-bold text-slate-700 mb-1">Month</label>
+                                <input type="month" id="monthly-report-month" onchange="renderReports()" class="w-full px-3 py-2 rounded-xl border border-slate-200 bg-white text-sm">
+                            </div>
+                            <div>
+                                <label class="block text-xs font-bold text-slate-700 mb-1">From Date</label>
+                                <input type="date" id="monthly-report-from" onchange="renderReports()" class="w-full px-3 py-2 rounded-xl border border-slate-200 bg-white text-sm">
+                            </div>
+                            <div>
+                                <label class="block text-xs font-bold text-slate-700 mb-1">To Date</label>
+                                <input type="date" id="monthly-report-to" onchange="renderReports()" class="w-full px-3 py-2 rounded-xl border border-slate-200 bg-white text-sm">
+                            </div>
+                            <div class="flex items-end">
+                                <button type="button" onclick="clearReportFilters('monthly')" class="w-full px-3 py-2 rounded-xl bg-white text-slate-700 border border-slate-200 text-sm font-bold hover:bg-slate-100">Clear Filters</button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <div id="report-metrics" class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4"></div>
+
+                <div class="bg-white rounded-2xl border border-slate-200 shadow-sm">
+                    <div class="p-4 border-b border-slate-100">
+                        <h4 class="text-lg font-bold text-slate-900">Order Summaries</h4>
+                    </div>
+                    <div id="report-orders" class="divide-y divide-slate-100"></div>
+                </div>
+            </div>
+        </div>
             </div>
         </div>
     </main>
@@ -6356,6 +8518,29 @@ INDEX_HTML = r"""<!DOCTYPE html>
                     <textarea id="cust-address" rows="2" required placeholder="House no, road, area, thana and district..." class="w-full px-4 py-2.5 rounded-xl border border-slate-200 text-sm"></textarea>
                 </div>
 
+                <!-- Optional Custom Design Instructions -->
+                <div id="custom-design-section" class="rounded-2xl border border-slate-200 bg-slate-50 p-4 space-y-3">
+                    <div class="flex items-center justify-between gap-3">
+                        <div>
+                            <h4 class="text-sm font-bold text-slate-900">Custom Design Instructions</h4>
+                            <p class="text-[11px] text-slate-500">Optional. Add print placement, text, color changes, sizing notes, or attach a mockup.</p>
+                        </div>
+                        <span class="text-[10px] font-bold uppercase tracking-wider text-slate-400 bg-white px-2 py-1 rounded-lg border border-slate-200">Optional</span>
+                    </div>
+                    <div>
+                        <label class="block text-xs font-bold text-slate-700 mb-1">Custom Design Notes</label>
+                        <textarea id="custom-design-notes" rows="3" maxlength="2000" placeholder="e.g. Place logo on left chest, use black thread, change sleeve color, custom text..." class="w-full px-3.5 py-2.5 rounded-xl border border-slate-200 bg-white text-sm"></textarea>
+                    </div>
+                    <div>
+                        <label class="block text-xs font-bold text-slate-700 mb-1">Reference Image / Mockup</label>
+                        <input type="file" id="custom-design-reference" accept="image/*" onchange="handleCustomDesignReferenceUpload(event)" class="block w-full text-sm text-slate-500 file:mr-3 file:py-2 file:px-4 file:rounded-xl file:border-0 file:text-sm file:font-bold file:bg-slate-900 file:text-white hover:file:bg-slate-800">
+                        <div id="custom-design-reference-preview" class="hidden pt-2">
+                            <img id="custom-design-reference-img" src="" alt="Custom design reference" class="h-28 w-28 object-cover rounded-xl border border-slate-200 bg-white">
+                            <button type="button" onclick="clearCustomDesignReference()" class="mt-2 text-xs text-rose-600 font-bold hover:underline">Remove reference image</button>
+                        </div>
+                    </div>
+                </div>
+
                 <div>
                     <label class="block text-xs font-bold text-slate-700 mb-2">Choose payment method *</label>
                     <div class="grid grid-cols-3 gap-2.5">
@@ -6489,14 +8674,17 @@ INDEX_HTML = r"""<!DOCTYPE html>
     </div>
 
     <!-- Footer -->
-    <footer class="bg-slate-900 text-slate-400 py-10 border-t border-slate-800 no-print">
-        <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 flex flex-col sm:flex-row justify-between items-center gap-4">
-            <div class="text-center sm:text-left">
-                <h4 id="footer-shop-name" class="text-white font-bold text-lg">Taham</h4>
-                <p id="footer-shop-address" class="text-xs mt-1">We deliver the best quality clothing all over Bangladesh with trust.</p>
+    <footer class="footer-3d no-print">
+        <div class="max-w-7xl mx-auto px-5 sm:px-7 lg:px-9 py-7 flex flex-col sm:flex-row justify-between items-center gap-5">
+            <div class="footer-brand text-center sm:text-left">
+                <h4 id="footer-shop-name" class="footer-title text-white font-extrabold text-xl">Taham</h4>
+                <p id="footer-shop-address" class="footer-address text-sm mt-2 text-slate-300">Rayerbag, Dhaka, Bangladesh.</p>
             </div>
             <div class="flex items-center gap-4 text-xs">
-                <span id="footer-shop-phone">Helpline: 01700-000000</span>
+                <a id="footer-shop-phone" class="footer-phone-pill" href="tel:01400570014" title="Call / WhatsApp Helpline" aria-label="Call or WhatsApp helpline">
+                    <i data-lucide="phone" class="w-4 h-4"></i>
+                    <span id="footer-shop-phone-text">Helpline: 01400-570014</span>
+                </a>
             </div>
         </div>
     </footer>
@@ -6535,7 +8723,6 @@ INDEX_HTML = r"""<!DOCTYPE html>
          "Search clothes by name...": "পোশাকের নাম খুঁজুন...",
          "All Collections": "সকল কালেকশন",
          "Loading...": "লোড হচ্ছে...",
-         "Business & Accounts Management Panel": "ব্যবসা পরিচালনা ও হিসাব-নিকাশ প্যানেল",
          "View Store": "দোকান দেখুন",
          "Lock / Logout": "লক / লগআউট",
          "Total Sales (Revenue)": "মোট বিক্রি (Revenue)",
@@ -6551,7 +8738,6 @@ INDEX_HTML = r"""<!DOCTYPE html>
          "Orders & Invoices": "অর্ডার ও ইনভয়েস (Orders)",
          "Products & Stock (Inventory)": "পণ্য ও স্টক ম্যানেজমেন্ট (Inventory)",
          "Daily Expenses": "দৈনিক খরচের হিসাব (Expenses)",
-         "Shop Settings & Password": "দোকানের সেটিংস ও পাসওয়ার্ড",
          "All Customer Orders": "সকল কাস্টমার অর্ডার তালিকা",
          "Changing the order status updates stock automatically, and you can print the receipt": "অর্ডার স্ট্যাটাস পরিবর্তন করলে স্টক অটোমেটিক আপডেট হবে এবং রসিদ প্রিন্ট করা যাবে",
          "All Orders": "সব অর্ডার (All Orders)",
@@ -6785,7 +8971,6 @@ INDEX_HTML = r"""<!DOCTYPE html>
          "Discount value": "ছাড়ের পরিমাণ",
          "CASH MEMO": "ক্যাশ মেমো",
          "Send Money": "সেন্ড মানি",
-         "Super Admin ERP": "সুপার অ্যাডমিন প্যানেল",
          "Real-Time Cloud Sync Active": "রিয়েল-টাইম সিঙ্ক চালু আছে",
          "Colours (optional)": "রঙ (ঐচ্ছিক)",
          "Pick from the list or add your own colour:": "তালিকা থেকে বেছে নিন বা নিজের রঙ যোগ করুন:",
@@ -7021,6 +9206,8 @@ INDEX_HTML = r"""<!DOCTYPE html>
         let expenses = [];
         let storeSettings = {
             shopName: 'Taham',
+            pageName: 'Taham',
+            theme: 'classic-pink',
             shopPhone: '01700-000000',
             paymentNumber: '01700-000000',
             shopAddress: 'New Market, Dhaka, Bangladesh',
@@ -7030,6 +9217,12 @@ INDEX_HTML = r"""<!DOCTYPE html>
         let selectedCategory = 'All';
         let selectedSizes = {};
         let isAdminAuthenticated = false;
+        let isSuperAdmin = false;
+        let users = [];
+        let permissionDefs = [];
+        let currentAccessUserId = '';
+        let currentReportView = 'daily';
+        let customDesignReferenceImage = '';
         let uploadedImageBase64 = '';
         let uploadedCollectionImage = '';
         let collections = [];
@@ -7051,10 +9244,12 @@ INDEX_HTML = r"""<!DOCTYPE html>
                 const me = await api('GET', '/api/me');
                 if (me.admin) {
                     isAdminAuthenticated = true;
+                    isSuperAdmin = !!me.isSuperAdmin || !!me.admin;
                     document.getElementById('admin-logout-btn').classList.remove('hidden');
                 }
                 setCloudStatus('online', 'Connected to server');
                 setupRealtimeListeners();
+                await loadUsers();
                 backend.startPolling();
             } catch (error) {
                 console.error('Server error:', error);
@@ -7128,20 +9323,293 @@ INDEX_HTML = r"""<!DOCTYPE html>
             }, (err) => console.error("Settings snapshot error:", err));
         }
 
+        const THEMES = [
+            { id: 'classic-pink', name: 'Classic Pink', description: 'Warm pink accent with clean enterprise contrast', brand50: '#fdf2f8', brand100: '#fce7f3', brand300: '#f9a8d4', brand500: '#e879a9', brand600: '#db2777', brand700: '#be185d', brand900: '#831843', appBg: '#f8fafc', appSurface: '#ffffff', appText: '#0f172a' },
+            { id: 'enterprise-indigo', name: 'Enterprise Indigo', description: 'Balanced indigo for a polished SaaS dashboard', brand50: '#eef2ff', brand100: '#e0e7ff', brand300: '#a5b4fc', brand500: '#6366f1', brand600: '#4f46e5', brand700: '#4338ca', brand900: '#312e81', appBg: '#f8fafc', appSurface: '#ffffff', appText: '#0f172a' },
+            { id: 'corporate-navy', name: 'Corporate Navy', description: 'Deep navy accents with crisp light surfaces', brand50: '#f1f5f9', brand100: '#e2e8f0', brand300: '#94a3b8', brand500: '#334155', brand600: '#1e3a5f', brand700: '#172a46', brand900: '#0b1726', appBg: '#f8fafc', appSurface: '#ffffff', appText: '#0f172a' },
+            { id: 'slate-emerald', name: 'Slate Emerald', description: 'Calm emerald accents with neutral contrast', brand50: '#ecfdf5', brand100: '#d1fae5', brand300: '#86efac', brand500: '#10b981', brand600: '#059669', brand700: '#047857', brand900: '#064e3b', appBg: '#f8fafc', appSurface: '#ffffff', appText: '#0f172a' },
+            { id: 'warm-sand', name: 'Warm Sand', description: 'Soft sand neutrals with restrained warmth', brand50: '#fefce8', brand100: '#fef9c3', brand300: '#fde68a', brand500: '#d97706', brand600: '#b45309', brand700: '#92400e', brand900: '#78350f', appBg: '#fafaf9', appSurface: '#ffffff', appText: '#1c1917' },
+            { id: 'graphite-slate', name: 'Graphite Slate', description: 'Neutral graphite for a minimal professional UI', brand50: '#f8fafc', brand100: '#f1f5f9', brand300: '#cbd5e1', brand500: '#64748b', brand600: '#475569', brand700: '#334155', brand900: '#1e293b', appBg: '#f8fafc', appSurface: '#ffffff', appText: '#0f172a' },
+            { id: 'deep-teal', name: 'Deep Teal', description: 'Sophisticated teal with cool clean backgrounds', brand50: '#f0fdfa', brand100: '#ccfbf1', brand300: '#5eead4', brand500: '#14b8a6', brand600: '#0f766e', brand700: '#115e59', brand900: '#134e4a', appBg: '#f8fafc', appSurface: '#ffffff', appText: '#0f172a' },
+            { id: 'royal-blue', name: 'Royal Blue', description: 'Refined blue accents with high readability', brand50: '#eff6ff', brand100: '#dbeafe', brand300: '#93c5fd', brand500: '#3b82f6', brand600: '#2563eb', brand700: '#1d4ed8', brand900: '#1e3a8a', appBg: '#f8fafc', appSurface: '#ffffff', appText: '#0f172a' },
+            { id: 'violet-indigo', name: 'Violet Indigo', description: 'Elegant violet harmonized with cool surfaces', brand50: '#f5f3ff', brand100: '#ede9fe', brand300: '#c4b5fd', brand500: '#8b5cf6', brand600: '#7c3aed', brand700: '#6d28d9', brand900: '#4c1d95', appBg: '#f8fafc', appSurface: '#ffffff', appText: '#0f172a' },
+            { id: 'crimson', name: 'Crimson', description: 'Confident crimson with clean neutral contrast', brand50: '#fef2f2', brand100: '#fee2e2', brand300: '#fca5a5', brand500: '#ef4444', brand600: '#dc2626', brand700: '#b91c1c', brand900: '#7f1d1d', appBg: '#f8fafc', appSurface: '#ffffff', appText: '#0f172a' },
+            { id: 'amber-gold', name: 'Amber Gold', description: 'Premium amber with restrained gold accents', brand50: '#fffbeb', brand100: '#fef3c7', brand300: '#fcd34d', brand500: '#f59e0b', brand600: '#d97706', brand700: '#b45309', brand900: '#78350f', appBg: '#fffbeb', appSurface: '#ffffff', appText: '#0f172a' },
+            { id: 'forest-green', name: 'Forest Green', description: 'Muted forest accent for a grounded feel', brand50: '#f0fdf4', brand100: '#dcfce7', brand300: '#86efac', brand500: '#22c55e', brand600: '#16a34a', brand700: '#15803d', brand900: '#14532d', appBg: '#f0fdf4', appSurface: '#ffffff', appText: '#0f172a' },
+            { id: 'ocean-blue', name: 'Ocean Blue', description: 'Clear blue accents with airy backgrounds', brand50: '#f0f9ff', brand100: '#e0f2fe', brand300: '#7dd3fc', brand500: '#0ea5e9', brand600: '#0284c7', brand700: '#0369a1', brand900: '#0c4a6e', appBg: '#f0f9ff', appSurface: '#ffffff', appText: '#0f172a' },
+            { id: 'rose-quartz', name: 'Rose Quartz', description: 'Soft rose accent with elegant contrast', brand50: '#fff1f2', brand100: '#ffe4e6', brand300: '#fda4af', brand500: '#f43f5e', brand600: '#e11d48', brand700: '#be123c', brand900: '#881337', appBg: '#fff1f2', appSurface: '#ffffff', appText: '#0f172a' },
+            { id: 'copper-warm', name: 'Copper Warm', description: 'Warm copper accent with soft neutral base', brand50: '#fff7ed', brand100: '#ffedd5', brand300: '#fdba74', brand500: '#f97316', brand600: '#c2410c', brand700: '#9a3412', brand900: '#7c2d12', appBg: '#fff7ed', appSurface: '#ffffff', appText: '#0f172a' },
+            { id: 'midnight', name: 'Midnight', description: 'Dark midnight accent with strong clean contrast', brand50: '#f1f5f9', brand100: '#e2e8f0', brand300: '#64748b', brand500: '#0f172a', brand600: '#020617', brand700: '#000000', brand900: '#000000', appBg: '#f8fafc', appSurface: '#ffffff', appText: '#0f172a' },
+            { id: 'lavender', name: 'Lavender', description: 'Soft lavender with calm cool backgrounds', brand50: '#f5f3ff', brand100: '#ede9fe', brand300: '#c4b5fd', brand500: '#a78bfa', brand600: '#8b5cf6', brand700: '#7c3aed', brand900: '#4c1d95', appBg: '#f5f3ff', appSurface: '#ffffff', appText: '#0f172a' },
+            { id: 'sky', name: 'Sky', description: 'Light sky accent with open spacing', brand50: '#f0f9ff', brand100: '#e0f2fe', brand300: '#bae6fd', brand500: '#38bdf8', brand600: '#0ea5e9', brand700: '#0284c7', brand900: '#0369a1', appBg: '#f0f9ff', appSurface: '#ffffff', appText: '#0f172a' },
+            { id: 'plum', name: 'Plum', description: 'Deep plum accent with refined contrast', brand50: '#fdf4ff', brand100: '#fae8ff', brand300: '#e9d5ff', brand500: '#a855f7', brand600: '#9333ea', brand700: '#7e22ce', brand900: '#581c87', appBg: '#fdf4ff', appSurface: '#ffffff', appText: '#0f172a' },
+            { id: 'carbon-gold', name: 'Carbon Gold', description: 'Carbon accent with restrained gold highlights', brand50: '#f8fafc', brand100: '#f1f5f9', brand300: '#cbd5e1', brand500: '#d4af37', brand600: '#b8962f', brand700: '#8a6d1f', brand900: '#1f2937', appBg: '#f8fafc', appSurface: '#ffffff', appText: '#0f172a' },
+            { id: 'aqua-mint', name: 'Aqua Mint', description: 'Cool aqua accent with fresh clean backgrounds', brand50: '#ecfeff', brand100: '#cffafe', brand300: '#a5f3fc', brand500: '#06b6d4', brand600: '#0891b2', brand700: '#0e7490', brand900: '#164e63', appBg: '#ecfeff', appSurface: '#ffffff', appText: '#0f172a' },
+            { id: 'coral', name: 'Coral', description: 'Warm coral accent with bright clean surfaces', brand50: '#fff1f2', brand100: '#ffe4e6', brand300: '#fecdd3', brand500: '#fb7185', brand600: '#f43f5e', brand700: '#e11d48', brand900: '#881337', appBg: '#fff1f2', appSurface: '#ffffff', appText: '#0f172a' },
+            { id: 'muted-sage', name: 'Muted Sage', description: 'Muted sage green for a calm enterprise palette', brand50: '#f0fdf4', brand100: '#dcfce7', brand300: '#bbf7d0', brand500: '#4d7c0f', brand600: '#3f6212', brand700: '#365314', brand900: '#1a2e05', appBg: '#f0fdf4', appSurface: '#ffffff', appText: '#0f172a' },
+            { id: 'ruby', name: 'Ruby', description: 'Rich ruby accent with polished neutral contrast', brand50: '#fef2f2', brand100: '#fee2e2', brand300: '#fecaca', brand500: '#ef4444', brand600: '#b91c1c', brand700: '#991b1b', brand900: '#7f1d1d', appBg: '#f8fafc', appSurface: '#ffffff', appText: '#0f172a' },
+        ];
+
+        window.applyTheme = function(themeId) {
+            const theme = THEMES.find(t => t.id === themeId) || THEMES[0];
+            const root = document.documentElement;
+            root.setAttribute('data-theme', theme.id);
+            root.style.setProperty('--brand-50', theme.brand50);
+            root.style.setProperty('--brand-100', theme.brand100);
+            root.style.setProperty('--brand-300', theme.brand300);
+            root.style.setProperty('--brand-500', theme.brand500);
+            root.style.setProperty('--brand-600', theme.brand600);
+            root.style.setProperty('--brand-700', theme.brand700);
+            root.style.setProperty('--brand-900', theme.brand900);
+            root.style.setProperty('--app-bg', theme.appBg);
+            root.style.setProperty('--app-surface', theme.appSurface);
+            root.style.setProperty('--app-text', theme.appText);
+            root.style.setProperty('--app-shadow', '0 1px 3px rgba(15, 23, 42, 0.06), 0 1px 2px rgba(15, 23, 42, 0.04)');
+            storeSettings.theme = theme.id;
+
+            const selector = document.getElementById('theme-selector');
+            if (selector) selector.dataset.selected = theme.id;
+            document.querySelectorAll('.theme-option').forEach(btn => {
+                const active = btn.dataset.theme === theme.id;
+                btn.setAttribute('aria-pressed', active ? 'true' : 'false');
+                btn.className = active
+                    ? 'theme-option rounded-xl border border-brand-600 bg-brand-50 p-3 text-left ring-2 ring-brand-500'
+                    : 'theme-option rounded-xl border border-slate-200 bg-white p-3 text-left hover:border-brand-300 hover:bg-slate-50';
+            });
+            if (window.lucide) lucide.createIcons();
+        };
+
+        window.renderThemeSelector = function() {
+            const container = document.getElementById('theme-selector');
+            if (!container) return;
+            const selected = storeSettings.theme || 'classic-pink';
+            container.dataset.selected = selected;
+            container.innerHTML = THEMES.map(theme => `
+                <button type="button" class="theme-option rounded-xl border border-slate-200 bg-white p-3 text-left hover:border-brand-300 hover:bg-slate-50"
+                    data-theme="${esc(theme.id)}" onclick="applyTheme('${esc(theme.id)}')" aria-pressed="${theme.id === selected ? 'true' : 'false'}">
+                    <span class="theme-swatch block h-8 rounded-lg mb-2" style="background: linear-gradient(135deg, ${esc(theme.brand500)} 0%, ${esc(theme.brand600)} 55%, ${esc(theme.brand700)} 100%);"></span>
+                    <span class="block text-sm font-bold text-slate-900">${esc(theme.name)}</span>
+                    <span class="block text-xs text-slate-500 mt-1">${esc(theme.description)}</span>
+                </button>
+            `).join('');
+            window.applyTheme(selected);
+        };
+
+        window.switchSettingsSection = function(sectionName) {
+            document.querySelectorAll('.settings-section').forEach(section => {
+                section.classList.toggle('hidden', section.id !== `settings-${sectionName}`);
+            });
+            document.querySelectorAll('.settings-submenu-btn').forEach(btn => {
+                const active = btn.dataset.settingsSection === sectionName;
+                btn.className = active
+                    ? 'settings-submenu-btn w-full px-4 py-2.5 rounded-xl text-sm font-bold bg-brand-600 text-white flex items-center justify-start gap-2'
+                    : 'settings-submenu-btn w-full px-4 py-2.5 rounded-xl text-sm font-bold bg-white text-slate-700 hover:bg-slate-100 border border-slate-200 flex items-center justify-start gap-2';
+            });
+            if (sectionName === 'access-control') renderAccessControl();
+            if (sectionName === 'user-management') loadUsers();
+            if (window.lucide) lucide.createIcons();
+        };
+
+        const FALLBACK_PERMISSION_DEFS = [
+            { key: 'viewOrders', label: 'View Orders' },
+            { key: 'editOrders', label: 'Edit Orders' },
+            { key: 'manageProducts', label: 'Manage Products & Stock' },
+            { key: 'addCollections', label: 'Add Collections' },
+            { key: 'deleteCollections', label: 'Delete Collections' },
+            { key: 'manageExpenses', label: 'Manage Daily Expenses' },
+            { key: 'viewProfit', label: 'View Profit/Revenue Stats' },
+            { key: 'accessSettings', label: 'Access Settings' },
+            { key: 'userManagement', label: 'User Management' },
+        ];
+
+        function isValidEmail(email) {
+            return /^[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}$/.test(email);
+        }
+
+        function isStrongPassword(password) {
+            return password.length >= 10 && /[a-z]/.test(password) && /[A-Z]/.test(password) && /\d/.test(password) && /[^A-Za-z0-9]/.test(password);
+        }
+
+        window.openUserModal = function() {
+            document.getElementById('user-modal').classList.remove('hidden');
+            if (window.lucide) lucide.createIcons();
+        };
+
+        window.closeUserModal = function() {
+            document.getElementById('user-modal').classList.add('hidden');
+        };
+
+        window.handleAddUser = async function(e) {
+            e.preventDefault();
+            const fullName = document.getElementById('user-full-name').value.trim();
+            const role = document.getElementById('user-role').value;
+            const email = document.getElementById('user-email').value.trim();
+            const password = document.getElementById('user-password').value;
+
+            if (!fullName) { showToast('Full name is required.', 'error'); return; }
+            if (['Admin', 'Manager', 'Salesman', 'Marketing'].indexOf(role) < 0) { showToast('Invalid role. Super Admin is reserved for the primary owner.', 'error'); return; }
+            if (!isValidEmail(email)) { showToast('Please enter a strict valid email address.', 'error'); return; }
+            if (!isStrongPassword(password)) { showToast('Password must be at least 10 characters and include uppercase, lowercase, number, and special character.', 'error'); return; }
+
+            try {
+                await api('POST', '/api/users', { fullName, role, email, password });
+                e.target.reset();
+                closeUserModal();
+                await loadUsers();
+                showToast('User added successfully!');
+            } catch (err) {
+                showToast(err.message || 'Could not add user.', 'error');
+            }
+        };
+
+        window.deleteUser = async function(userId) {
+            if (!isSuperAdmin) { showToast('Only Super Admin can delete user accounts.', 'error'); return; }
+            if (!confirm('Delete this user account?')) return;
+            try {
+                await api('DELETE', `/api/users/${encodeURIComponent(userId)}`);
+                await loadUsers();
+                showToast('User deleted.');
+            } catch (err) {
+                showToast(err.message || 'Could not delete user.', 'error');
+            }
+        };
+
+        async function loadUsers() {
+            if (!isAdminAuthenticated) return;
+            try {
+                const data = await api('GET', '/api/users');
+                users = data.users || [];
+                permissionDefs = data.permissionDefs || FALLBACK_PERMISSION_DEFS;
+                renderUserManagement();
+                renderAccessControl();
+            } catch (err) {
+                console.error('Users error:', err);
+            }
+        }
+
+        window.renderUserManagement = function() {
+            const box = document.getElementById('users-list');
+            if (!box) return;
+            const superAdminHtml = `
+                <div class="p-4 flex items-center justify-between gap-3 bg-slate-50">
+                    <div class="min-w-0">
+                        <p class="text-sm font-bold text-slate-900 truncate">${esc(storeSettings.adminUser || 'Super Admin')}</p>
+                        <p class="text-xs text-slate-500">Super Admin</p>
+                    </div>
+                    <span class="text-xs font-bold text-emerald-700 bg-emerald-50 px-2 py-1 rounded-lg">Protected</span>
+                </div>`;
+            if (!users.length) {
+                box.innerHTML = superAdminHtml + `<p class="p-4 text-center text-xs text-slate-400">No additional users yet.</p>`;
+                if (window.lucide) lucide.createIcons();
+                return;
+            }
+            box.innerHTML = superAdminHtml + users.map(u => `
+                <div class="p-4 flex items-center justify-between gap-3">
+                    <div class="min-w-0">
+                        <p class="text-sm font-bold text-slate-900 truncate">${esc(u.fullName || u.email)}</p>
+                        <p class="text-xs text-slate-500 truncate">${esc(u.email)}</p>
+                    </div>
+                    <div class="flex items-center gap-2 shrink-0">
+                        <span class="text-xs font-bold text-slate-600 bg-slate-100 px-2 py-1 rounded-lg">${esc(u.role)}</span>
+                        ${isSuperAdmin ? `<button type="button" onclick="deleteUser('${esc(u.id)}')" class="p-2 rounded-xl text-rose-600 hover:bg-rose-50" title="Delete user"><i data-lucide="trash-2" class="w-4 h-4"></i></button>` : ''}
+                    </div>
+                </div>
+            `).join('');
+            if (window.lucide) lucide.createIcons();
+        };
+
+        window.renderAccessControl = function() {
+            const select = document.getElementById('access-user-id');
+            if (!select) return;
+            const defs = permissionDefs.length ? permissionDefs : FALLBACK_PERMISSION_DEFS;
+            permissionDefs = defs;
+            const superAdmin = { id: 'super-admin', fullName: storeSettings.adminUser || 'Super Admin', role: 'Super Admin', permissions: Object.fromEntries(defs.map(d => [d.key, true])), isSuperAdmin: true };
+            const allUsers = [superAdmin, ...users];
+            if (!currentAccessUserId || !allUsers.some(u => u.id === currentAccessUserId)) currentAccessUserId = superAdmin.id;
+            select.innerHTML = allUsers.map(u => `<option value="${esc(u.id)}">${esc(u.fullName || u.email || u.id)} (${esc(u.role)})</option>`).join('');
+            select.value = currentAccessUserId;
+            renderAccessMatrix();
+        };
+
+        window.renderAccessMatrix = function() {
+            const matrix = document.getElementById('access-permissions-matrix');
+            if (!matrix) return;
+            const select = document.getElementById('access-user-id');
+            if (select) currentAccessUserId = select.value;
+            const defs = permissionDefs.length ? permissionDefs : FALLBACK_PERMISSION_DEFS;
+            const superAdmin = { id: 'super-admin', fullName: storeSettings.adminUser || 'Super Admin', role: 'Super Admin', permissions: Object.fromEntries(defs.map(d => [d.key, true])), isSuperAdmin: true };
+            const allUsers = [superAdmin, ...users];
+            const user = allUsers.find(u => u.id === currentAccessUserId) || superAdmin;
+            const superAdminUser = user.id === 'super-admin';
+            matrix.innerHTML = defs.map(def => `
+                <label class="flex items-center justify-between gap-3 rounded-xl border border-slate-200 bg-white p-3 hover:bg-slate-50">
+                    <span class="text-sm text-slate-700">${esc(def.label)}</span>
+                    <input type="checkbox" class="w-4 h-4 rounded border-slate-300 text-brand-600" data-permission-key="${esc(def.key)}"
+                        ${superAdminUser || user.permissions[def.key] ? 'checked' : ''}
+                        ${superAdminUser || !isSuperAdmin ? 'disabled' : ''}
+                        onchange="togglePermission('${esc(user.id)}', '${esc(def.key)}', this.checked)">
+                </label>
+            `).join('');
+        };
+
+        window.togglePermission = async function(userId, key, checked) {
+            if (!isSuperAdmin) return;
+            const user = users.find(u => u.id === userId);
+            if (!user) return;
+            user.permissions = { ...(user.permissions || {}), [key]: checked };
+            try {
+                await api('PUT', `/api/users/${encodeURIComponent(userId)}/permissions`, { permissions: user.permissions });
+            } catch (err) {
+                showToast(err.message || 'Could not update permission.', 'error');
+            }
+            renderAccessMatrix();
+        };
+
         function applyStoreSettingsToUI() {
-            document.getElementById('header-shop-name').innerText = storeSettings.shopName;
-            document.getElementById('footer-shop-name').innerText = storeSettings.shopName;
-            document.getElementById('footer-shop-address').innerText = storeSettings.shopAddress;
-            document.getElementById('footer-shop-phone').innerText = t('Helpline: {p}', { p: storeSettings.shopPhone });
-            document.getElementById('checkout-merchant-num').innerText = storeSettings.paymentNumber;
+            const shopName = storeSettings.shopName || 'Taham';
+            const pageName = storeSettings.pageName || shopName || 'Taham';
+            const setValue = (id, value) => {
+                const el = document.getElementById(id);
+                if (el) el.value = value || '';
+            };
+
+            document.title = pageName;
+            document.getElementById('header-shop-name').innerText = pageName;
+            document.getElementById('footer-shop-name').innerText = shopName;
+            document.getElementById('footer-shop-address').innerText = storeSettings.shopAddress || 'Rayerbag, Dhaka, Bangladesh.';
+
+            const footerPhoneNumber = storeSettings.shopPhone || '01400-570014';
+            const footerPhoneLink = document.getElementById('footer-shop-phone');
+            const footerPhoneText = document.getElementById('footer-shop-phone-text');
+            if (footerPhoneLink) {
+                const phoneDigits = footerPhoneNumber.replace(/[^\d+]/g, '');
+                footerPhoneLink.href = `tel:${phoneDigits}`;
+                footerPhoneLink.setAttribute('aria-label', `Call or WhatsApp helpline ${footerPhoneNumber}`);
+                footerPhoneLink.title = 'Call / WhatsApp Helpline';
+            }
+            if (footerPhoneText) footerPhoneText.innerText = t('Helpline: {p}', { p: footerPhoneNumber });
+
+            document.getElementById('checkout-merchant-num').innerText = storeSettings.paymentNumber || '';
 
             // Populate settings form inputs
-            document.getElementById('set-shop-name').value = storeSettings.shopName;
-            document.getElementById('set-shop-phone').value = storeSettings.shopPhone;
-            document.getElementById('set-payment-number').value = storeSettings.paymentNumber;
-            document.getElementById('set-shop-address').value = storeSettings.shopAddress;
-            document.getElementById('set-admin-user').value = storeSettings.adminUser || '';
-            document.getElementById('set-admin-pass').value = '';
+            setValue('page-name', pageName);
+            setValue('set-shop-name', shopName);
+            setValue('set-shop-phone', storeSettings.shopPhone);
+            setValue('set-payment-number', storeSettings.paymentNumber);
+            setValue('set-shop-address', storeSettings.shopAddress);
+            setValue('set-admin-user', storeSettings.adminUser || '');
+            setValue('set-admin-pass', '');
+
+            const accessAdmin = document.getElementById('access-admin-user');
+            if (accessAdmin) accessAdmin.innerText = storeSettings.adminUser || shopName;
+            renderUserManagement();
+            renderAccessControl();
+
+            const preview = document.getElementById('settings-logo-preview');
+            if (preview) preview.src = `/logo.png?v=${Date.now()}`;
+
+            applyTheme(storeSettings.theme || 'classic-pink');
+            renderThemeSelector();
         }
 
         function updatePendingBadge() {
@@ -7218,10 +9686,12 @@ INDEX_HTML = r"""<!DOCTYPE html>
             try {
                 await api('POST', '/api/login', { username, password });
                 isAdminAuthenticated = true;
+                isSuperAdmin = true;
                 document.getElementById('login-password').value = '';
                 document.getElementById('admin-logout-btn').classList.remove('hidden');
                 closeAdminLoginModal();
                 await window.__refreshAll();
+                await loadUsers();
                 showToast('Welcome to the Super Admin panel!');
                 switchView('admin');
             } catch (err) {
@@ -7232,6 +9702,9 @@ INDEX_HTML = r"""<!DOCTYPE html>
         window.logoutAdmin = async function() {
             try { await api('POST', '/api/logout'); } catch (e) { /* ignore */ }
             isAdminAuthenticated = false;
+            isSuperAdmin = false;
+            users = [];
+            currentAccessUserId = '';
             document.getElementById('admin-logout-btn').classList.add('hidden');
             await window.__refreshAll();
             showToast('Logged out successfully.');
@@ -7243,13 +9716,33 @@ INDEX_HTML = r"""<!DOCTYPE html>
             document.getElementById(`subtab-${tabName}`).classList.remove('hidden');
 
             document.querySelectorAll('.admin-sub-btn').forEach(btn => {
-                if (btn.dataset.subtab === tabName) {
-                    btn.className = "admin-sub-btn px-4 py-2.5 rounded-xl text-sm font-bold bg-brand-600 text-white shadow-sm whitespace-nowrap flex items-center gap-2";
-                } else {
-                    btn.className = "admin-sub-btn px-4 py-2.5 rounded-xl text-sm font-bold bg-white text-slate-700 hover:bg-slate-100 border border-slate-200 whitespace-nowrap flex items-center gap-2";
-                }
+                const active = btn.dataset.subtab === tabName;
+                btn.className = active
+                    ? "admin-sub-btn w-full px-4 py-2.5 rounded-xl text-sm font-bold bg-brand-600 text-white shadow-sm flex items-center justify-start gap-2"
+                    : "admin-sub-btn w-full px-4 py-2.5 rounded-xl text-sm font-bold bg-white text-slate-700 hover:bg-slate-100 border border-slate-200 flex items-center justify-start gap-2";
             });
+            if (tabName === 'settings' && typeof window.switchSettingsSection === 'function') {
+                window.switchSettingsSection('user-management');
+            }
+            if (tabName === 'reports' && typeof window.renderReports === 'function') {
+                window.switchReportView(currentReportView || 'daily');
+            }
             lucide.createIcons();
+        };
+
+        window.openAdminSummary = function(tabName, orderFilter) {
+            window.switchAdminSubTab(tabName);
+            if (tabName === 'orders') {
+                const filter = document.getElementById('admin-order-filter');
+                if (filter) {
+                    filter.value = orderFilter || 'All';
+                    window.renderAdminOrders();
+                }
+            } else if (tabName === 'inventory' && typeof window.renderAdminInventory === 'function') {
+                window.renderAdminInventory();
+            } else if (tabName === 'expenses' && typeof window.renderAdminExpenses === 'function') {
+                window.renderAdminExpenses();
+            }
         };
 
         // ==========================================
@@ -7289,7 +9782,8 @@ INDEX_HTML = r"""<!DOCTYPE html>
             if (!collections.length) { section.classList.add('hidden'); return; }
             section.classList.remove('hidden');
             grid.innerHTML = collections.map(c => {
-                const n = products.filter(p => p.category === c.name).length;
+                const assigned = Array.isArray(c.productIds) ? c.productIds : [];
+                const n = products.filter(p => assigned.includes(p.id) || p.category === c.name).length;
                 return `
                     <button data-cat="${esc(c.name)}" onclick="selectCollection(this.dataset.cat)"
                         class="group relative overflow-hidden rounded-2xl aspect-[4/5] bg-slate-200 shadow-sm hover:shadow-xl transition-all text-left">
@@ -7303,6 +9797,57 @@ INDEX_HTML = r"""<!DOCTYPE html>
                         </div>
                     </button>`;
             }).join('');
+        };
+
+        window.initTiltInteractions = function() {
+            if (window.__tiltInitialized) return;
+            window.__tiltInitialized = true;
+
+            document.addEventListener('mousemove', function(event) {
+                const el = event.target.closest && event.target.closest('.tilt-3d');
+                if (!el) return;
+                const rect = el.getBoundingClientRect();
+                if (!rect.width || !rect.height) return;
+                const x = Math.max(0, Math.min(1, (event.clientX - rect.left) / rect.width));
+                const y = Math.max(0, Math.min(1, (event.clientY - rect.top) / rect.height));
+                const maxTilt = el.classList.contains('size-selector') ? 4 : 7;
+                const rotateX = (0.5 - y) * maxTilt;
+                const rotateY = (x - 0.5) * maxTilt;
+                const lift = el.classList.contains('size-selector') ? 'translateY(-3px) scale(1.08)' : 'translateY(-8px) scale(1.018)';
+                el.style.transform = `perspective(900px) rotateX(${rotateX.toFixed(2)}deg) rotateY(${rotateY.toFixed(2)}deg) ${lift}`;
+            });
+
+            document.addEventListener('mouseout', function(event) {
+                const el = event.target.closest && event.target.closest('.tilt-3d');
+                if (!el) return;
+                if (event.relatedTarget && el.contains(event.relatedTarget)) return;
+                el.style.transform = '';
+            });
+        };
+
+        window.initScrollReveal = function(root) {
+            const scope = root && root.querySelectorAll ? root : document;
+            const items = scope.querySelectorAll ? scope.querySelectorAll('.reveal') : [];
+            if (!items.length) return;
+
+            const reduceMotion = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+            if (reduceMotion || !('IntersectionObserver' in window)) {
+                items.forEach(item => item.classList.add('reveal-visible'));
+                return;
+            }
+
+            if (!window.__revealObserver) {
+                window.__revealObserver = new IntersectionObserver((entries) => {
+                    entries.forEach(entry => {
+                        if (entry.isIntersecting) {
+                            entry.target.classList.add('reveal-visible');
+                            window.__revealObserver.unobserve(entry.target);
+                        }
+                    });
+                }, { threshold: 0.08, rootMargin: '0px 0px -40px 0px' });
+            }
+
+            items.forEach(item => window.__revealObserver.observe(item));
         };
 
         window.selectProductSize = function(productId, size) {
@@ -7354,16 +9899,19 @@ INDEX_HTML = r"""<!DOCTYPE html>
                 const pct = hasDiscount ? Math.round((1 - sale / price) * 100) : 0;
 
                 return `
-                    <div class="bg-white rounded-2xl border border-slate-200 overflow-hidden shadow-sm hover:shadow-xl transition-all duration-300 flex flex-col group">
+                    <div class="product-card tilt-3d reveal bg-white/90 backdrop-blur-sm rounded-2xl border border-slate-200 overflow-hidden shadow-sm flex flex-col group">
                         <div class="relative aspect-[4/4] bg-slate-100 overflow-hidden">
                             <img src="${esc(shownPhoto.src)}"
                                  alt="${esc(product.name)}"
                                  onerror="this.onerror=null;this.src='/placeholder.svg?w=600&h=700&text=Taham'"
-                                 class="w-full h-full object-cover ${isOutOfStock ? 'grayscale opacity-60' : 'group-hover:scale-105'} transition-transform duration-500">
-                            <span class="absolute top-3 left-3 bg-white/95 backdrop-blur-sm text-slate-800 text-xs font-bold px-3 py-1 rounded-lg shadow-sm">${esc(product.category)}</span>
-                            <span class="absolute top-3 right-3 ${isOutOfStock ? 'bg-rose-600 text-white' : (stock < 5 ? 'bg-amber-500 text-white' : 'bg-emerald-600 text-white')} text-[11px] font-bold px-2.5 py-1 rounded-lg shadow-sm">${isOutOfStock ? 'Out of Stock' : esc(t('Stock: {n}', { n: stock }))}</span>
-                            ${shownPhoto.color ? `<span class="absolute bottom-3 right-3 bg-white/95 text-slate-800 text-[11px] font-bold px-2.5 py-1 rounded-lg shadow-sm flex items-center gap-1.5"><span class="w-3 h-3 rounded-full border border-slate-300" style="background:${esc((colors.find(c => c.name === shownPhoto.color) || {}).hex || '#ccc')}"></span><span>${esc(shownPhoto.color)}</span></span>` : ''}
-                            ${hasDiscount ? `<span class="absolute bottom-3 left-3 bg-rose-600 text-white text-xs font-bold px-2.5 py-1 rounded-lg shadow-md">${esc(t('{pct}% OFF', { pct }))}</span>` : ''}
+                                 onmouseenter="startInPlaceZoom(this)"
+                                 onmousemove="updateInPlaceZoom(event, this)"
+                                 onmouseleave="endInPlaceZoom(this)"
+                                 class="product-image-zoom zoomable-image w-full h-full object-cover ${isOutOfStock ? 'grayscale opacity-60' : ''}">
+                            <span class="absolute top-3 left-3 bg-white/85 backdrop-blur-md text-slate-800 text-xs font-bold px-3 py-1 rounded-lg shadow-sm border border-white/50">${esc(product.category)}</span>
+                            <span class="absolute right-3 ${hasDiscount ? 'top-14' : 'top-3'} ${isOutOfStock ? 'bg-rose-600 text-white' : (stock < 5 ? 'bg-amber-500 text-white' : 'bg-emerald-600 text-white')} text-[11px] font-bold px-2.5 py-1 rounded-lg shadow-sm">${isOutOfStock ? 'Out of Stock' : esc(t('Stock: {n}', { n: stock }))}</span>
+                            ${hasDiscount ? `<span class="discount-badge absolute top-3 right-3">${esc(t('{pct}% OFF', { pct }))}</span>` : ''}
+                            ${shownPhoto.color ? `<span class="absolute bottom-3 right-3 bg-white/85 backdrop-blur-md text-slate-800 text-[11px] font-bold px-2.5 py-1 rounded-lg shadow-sm border border-white/50 flex items-center gap-1.5"><span class="w-3 h-3 rounded-full border border-slate-300" style="background:${esc((colors.find(c => c.name === shownPhoto.color) || {}).hex || '#ccc')}"></span><span>${esc(shownPhoto.color)}</span></span>` : ''}
                         </div>
 
                         ${photos.length > 1 ? `<div class="flex gap-2 overflow-x-auto px-4 pt-3">
@@ -7385,7 +9933,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
                                     <div class="flex gap-1.5">
                                         ${sizes.map(sz => `
                                             <button onclick="selectProductSize('${product.id}', '${sz}')"
-                                                class="w-7 h-7 rounded-lg text-xs font-bold transition-all ${activeSize === sz ? 'bg-slate-900 text-white' : 'bg-slate-100 text-slate-600 hover:bg-slate-200'}">${sz}</button>
+                                                class="size-selector tilt-3d w-8 h-8 rounded-lg text-xs font-bold transition-all ${activeSize === sz ? 'bg-slate-900 text-white' : 'bg-slate-100 text-slate-600 hover:bg-slate-200'}">${sz}</button>
                                         `).join('')}
                                     </div>
                                 </div>
@@ -7409,7 +9957,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
                                         </div>
                                     </div>
                                     <button onclick="addToCart('${product.id}')" ${isOutOfStock ? 'disabled' : ''}
-                                        class="px-4 py-2.5 rounded-xl ${isOutOfStock ? 'bg-slate-200 text-slate-400 cursor-not-allowed' : 'bg-brand-600 hover:bg-brand-700 active:scale-95 text-white shadow-sm'} text-sm font-semibold transition-all flex items-center gap-1.5">
+                                        class="action-button tilt-3d px-4 py-2.5 rounded-xl ${isOutOfStock ? 'bg-slate-200 text-slate-400 cursor-not-allowed' : 'bg-brand-600 hover:bg-brand-700 text-white shadow-sm'} text-sm font-semibold transition-all flex items-center gap-1.5">
                                         <i data-lucide="shopping-bag" class="w-4 h-4"></i>
                                         <span>${isOutOfStock ? 'Out of stock' : 'Add to Bag'}</span>
                                     </button>
@@ -7420,6 +9968,8 @@ INDEX_HTML = r"""<!DOCTYPE html>
                 `;
             }).join('');
             lucide.createIcons();
+            initScrollReveal(grid);
+            initTiltInteractions();
         };
 
         window.addToCart = function(productId) {
@@ -7543,8 +10093,59 @@ INDEX_HTML = r"""<!DOCTYPE html>
             lucide.createIcons();
         };
 
+        window.startInPlaceZoom = function(img) {
+            if (!img) return;
+            img.style.transform = 'scale(1.55)';
+        };
+
+        window.updateInPlaceZoom = function(event, img) {
+            if (!img) return;
+            const rect = img.getBoundingClientRect();
+            if (!rect.width || !rect.height) return;
+            const x = Math.max(0, Math.min(100, ((event.clientX - rect.left) / rect.width) * 100));
+            const y = Math.max(0, Math.min(100, ((event.clientY - rect.top) / rect.height) * 100));
+            img.style.transformOrigin = `${x}% ${y}%`;
+            img.style.transform = 'scale(1.55)';
+        };
+
+        window.endInPlaceZoom = function(img) {
+            if (!img) return;
+            img.style.transform = 'scale(1)';
+            img.style.transformOrigin = 'center center';
+        };
+
+        window.handleCustomDesignReferenceUpload = async function(event) {
+            const file = event.target.files && event.target.files[0];
+            if (!file) return;
+            if (!file.type.startsWith('image/')) {
+                showToast('Please choose an image reference.', 'error');
+                event.target.value = '';
+                return;
+            }
+            try {
+                customDesignReferenceImage = await readImageFile(file, 1600, 0.85);
+                document.getElementById('custom-design-reference-img').src = customDesignReferenceImage;
+                document.getElementById('custom-design-reference-preview').classList.remove('hidden');
+                showToast('Reference image attached.');
+            } catch (err) {
+                showToast(err.message || 'Could not read the reference image.', 'error');
+                clearCustomDesignReference();
+            }
+        };
+
+        window.clearCustomDesignReference = function() {
+            customDesignReferenceImage = '';
+            const input = document.getElementById('custom-design-reference');
+            const preview = document.getElementById('custom-design-reference-preview');
+            const img = document.getElementById('custom-design-reference-img');
+            if (input) input.value = '';
+            if (preview) preview.classList.add('hidden');
+            if (img) img.src = '';
+        };
+
         window.openCheckoutModal = function() {
             toggleCart(false);
+            clearCustomDesignReference();
             document.getElementById('checkout-modal').classList.remove('hidden');
         };
 
@@ -7575,6 +10176,9 @@ INDEX_HTML = r"""<!DOCTYPE html>
                     customerAddress: document.getElementById('cust-address').value.trim(),
                     paymentMethod: document.querySelector('input[name="payment_method"]:checked').value,
                     trxId: document.getElementById('cust-trx-id').value.trim(),
+                    customDesignNotes: document.getElementById('custom-design-notes').value.trim(),
+                    referenceImage: customDesignReferenceImage,
+                    customDesignReferenceImage: customDesignReferenceImage,
                     deliveryCharge: getSelectedDeliveryCharge(),
                     items: cart.map((i) => ({ productId: i.productId, size: i.size, color: i.color || '', qty: i.qty }))
                 });
@@ -7582,6 +10186,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
                 cart = [];
                 updateCartUI();
                 document.getElementById('checkout-form').reset();
+                clearCustomDesignReference();
                 closeCheckoutModal();
                 showToast(t('Thank you {name}! Your order ({num}) is complete.', { name, num: order.orderNumber }));
                 window.__refreshAll();
@@ -7674,6 +10279,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
             renderAdminInventory();
             renderAdminExpenses();
             renderAdminCollections();
+            renderReports();
         };
 
         window.renderAdminOrders = function() {
@@ -7730,6 +10336,13 @@ INDEX_HTML = r"""<!DOCTYPE html>
                             <p><strong class="text-slate-700">Address:</strong> ${esc(order.customerAddress)}</p>
                         </div>
 
+                        ${(order.customDesignNotes || order.referenceImage) ? `
+                        <div class="bg-white p-3 rounded-xl border border-slate-200 text-xs space-y-2">
+                            <p class="font-bold text-slate-700">Custom Design Instructions</p>
+                            ${order.customDesignNotes ? `<p class="whitespace-pre-line text-slate-700">${esc(order.customDesignNotes)}</p>` : ''}
+                            ${order.referenceImage ? `<div><p class="text-slate-500 mb-1">Reference Image / Mockup:</p><img src="${esc(order.referenceImage)}" alt="Custom design reference" class="h-32 w-32 object-cover rounded-xl border border-slate-200 bg-slate-50"></div>` : ''}
+                        </div>` : ''}
+
                         <div class="flex flex-wrap justify-between items-center gap-2 pt-1 text-xs">
                             <div>
                                 ${(order.items || []).map(i => `<span class="inline-block bg-white border border-slate-200 px-2.5 py-1 rounded-lg mr-1.5 mb-1 font-medium">${esc(i.name)} (${esc(i.size)}${i.color ? ', ' + esc(i.color) : ''}) × ${Number(i.qty)}</span>`).join('')}
@@ -7743,7 +10356,192 @@ INDEX_HTML = r"""<!DOCTYPE html>
                 `;
             }).join('');
             lucide.createIcons();
+            initScrollReveal(grid);
+            initTiltInteractions();
         };
+
+        window.switchReportView = function(view) {
+            currentReportView = view === 'monthly' ? 'monthly' : 'daily';
+            document.querySelectorAll('.report-view').forEach(el => el.classList.toggle('hidden', el.id !== `report-${currentReportView}`));
+            document.querySelectorAll('.report-tab').forEach(btn => {
+                const active = btn.dataset.reportTab === currentReportView;
+                btn.className = active
+                    ? 'report-tab px-4 py-2 rounded-xl text-sm font-bold bg-brand-600 text-white'
+                    : 'report-tab px-4 py-2 rounded-xl text-sm font-bold bg-white text-slate-700 border border-slate-200';
+            });
+            if (currentReportView === 'daily') {
+                const dateEl = document.getElementById('daily-report-date');
+                if (dateEl && !dateEl.value) dateEl.value = todayKey();
+            } else {
+                const monthEl = document.getElementById('monthly-report-month');
+                if (monthEl && !monthEl.value) monthEl.value = monthKey(new Date());
+            }
+            renderReports();
+        };
+
+        window.clearReportFilters = function(view) {
+            const prefix = view === 'monthly' ? 'monthly' : 'daily';
+            if (prefix === 'daily') {
+                document.getElementById('daily-report-date').value = todayKey();
+                document.getElementById('daily-report-from').value = '';
+                document.getElementById('daily-report-to').value = '';
+            } else {
+                document.getElementById('monthly-report-month').value = monthKey(new Date());
+                document.getElementById('monthly-report-from').value = '';
+                document.getElementById('monthly-report-to').value = '';
+            }
+            renderReports();
+        };
+
+        window.renderReports = function() {
+            const metricsBox = document.getElementById('report-metrics');
+            const ordersBox = document.getElementById('report-orders');
+            if (!metricsBox || !ordersBox) return;
+
+            const range = getReportRange(currentReportView);
+            const filteredOrders = orders.filter(o => inReportRange(orderTime(o), range));
+            const filteredExpenses = expenses.filter(e => inReportRange(expenseTime(e), range));
+            const activeOrders = filteredOrders.filter(o => o.status !== 'Cancelled');
+
+            const totalSales = activeOrders.reduce((sum, o) => sum + Number(o.total || 0), 0);
+            const totalProductCost = activeOrders.reduce((sum, o) => sum + Number(o.totalCost || 0), 0);
+            const totalDeliveryCost = activeOrders.reduce((sum, o) => sum + Number(o.deliveryCharge || 0), 0);
+            const totalExpenses = filteredExpenses.reduce((sum, e) => sum + Number(e.amount || 0), 0);
+            const netProfit = totalSales - totalProductCost - totalDeliveryCost - totalExpenses;
+            const orderCount = filteredOrders.length;
+            const totalItems = activeOrders.reduce((sum, o) => sum + (o.items || []).reduce((n, i) => n + Number(i.qty || 0), 0), 0);
+            const cancelledCount = filteredOrders.filter(o => o.status === 'Cancelled').length;
+            const pendingCount = filteredOrders.filter(o => o.status === 'Pending').length;
+
+            metricsBox.innerHTML = `
+                ${reportMetricCard('Total Sales', money(totalSales), 'banknote', 'text-brand-700')}
+                ${reportMetricCard('Total Expenses', money(totalExpenses), 'receipt', 'text-rose-600')}
+                ${reportMetricCard('Net Profit', money(netProfit), 'trending-up', netProfit < 0 ? 'text-rose-600' : 'text-emerald-700')}
+                ${reportMetricCard('Orders', String(orderCount), 'package-check', 'text-slate-900')}
+                ${reportMetricCard('Items Sold', String(totalItems), 'shirt', 'text-slate-900')}
+                ${reportMetricCard('Pending', String(pendingCount), 'clock', 'text-amber-600')}
+                ${reportMetricCard('Cancelled', String(cancelledCount), 'x-circle', 'text-rose-600')}
+                ${reportMetricCard('Expenses Count', String(filteredExpenses.length), 'wallet', 'text-slate-900')}
+            `;
+
+            if (!filteredOrders.length) {
+                ordersBox.innerHTML = `<div class="p-8 text-center text-sm text-slate-400">No order summaries in this date range.</div>`;
+            } else {
+                ordersBox.innerHTML = filteredOrders.map(o => `
+                    <div class="p-4 grid grid-cols-1 sm:grid-cols-5 gap-3 items-center text-sm">
+                        <div>
+                            <p class="font-bold text-slate-900">${esc(o.orderNumber || o.id.slice(0, 8))}</p>
+                            <p class="text-xs text-slate-500">${esc(fmtDate(orderTime(o)))}</p>
+                        </div>
+                        <p class="text-slate-700">${esc(o.customerName || '')}</p>
+                        <span class="text-xs font-bold text-slate-600">${esc(o.status)}</span>
+                        <span class="text-xs text-slate-500">${(o.items || []).length} item(s)</span>
+                        <p class="font-bold text-brand-700 sm:text-right">${money(o.total)}</p>
+                    </div>
+                `).join('');
+            }
+            if (window.lucide) lucide.createIcons();
+        };
+
+        function reportMetricCard(label, value, icon, colorClass) {
+            return `
+                <div class="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
+                    <div class="flex items-center justify-between">
+                        <p class="text-xs font-semibold text-slate-500">${esc(label)}</p>
+                        <i data-lucide="${esc(icon)}" class="w-5 h-5 text-slate-400"></i>
+                    </div>
+                    <p class="text-2xl font-bold mt-2 ${colorClass || 'text-slate-900'}">${esc(value)}</p>
+                </div>`;
+        }
+
+        function money(value) {
+            return `৳ ${Number(value || 0).toLocaleString('en-US')}`;
+        }
+
+        function todayKey() {
+            return dateKey(new Date());
+        }
+
+        function monthKey(date) {
+            const d = date instanceof Date ? date : parseLooseDate(date);
+            if (!d) return '';
+            return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
+        }
+
+        function dateKey(date) {
+            const d = date instanceof Date ? date : parseLooseDate(date);
+            if (!d || Number.isNaN(d.getTime())) return '';
+            return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+        }
+
+        function startOfDay(date) {
+            const d = date instanceof Date ? new Date(date) : parseLooseDate(date);
+            if (!d) return null;
+            d.setHours(0, 0, 0, 0);
+            return d;
+        }
+
+        function endOfDay(date) {
+            const d = date instanceof Date ? new Date(date) : parseLooseDate(date);
+            if (!d) return null;
+            d.setHours(23, 59, 59, 999);
+            return d;
+        }
+
+        function parseLooseDate(value) {
+            if (!value) return null;
+            if (value instanceof Date) return Number.isNaN(value.getTime()) ? null : value;
+            if (typeof value === 'number') return Number.isNaN(new Date(value).getTime()) ? null : new Date(value);
+            const s = String(value).trim();
+            const dmy = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})/);
+            if (dmy) return new Date(Number(dmy[3]), Number(dmy[2]) - 1, Number(dmy[1]), 12, 0, 0, 0);
+            const parsed = new Date(s);
+            return Number.isNaN(parsed.getTime()) ? null : parsed;
+        }
+
+        function orderTime(order) {
+            if (order.createdAt) return new Date(Number(order.createdAt)).getTime();
+            const parsed = parseLooseDate(order.dateStr);
+            return parsed ? parsed.getTime() : 0;
+        }
+
+        function expenseTime(expense) {
+            if (expense.createdAt) return new Date(Number(expense.createdAt)).getTime();
+            const parsed = parseLooseDate(expense.dateStr || expense.date);
+            return parsed ? parsed.getTime() : 0;
+        }
+
+        function inReportRange(time, range) {
+            if (!range) return true;
+            if (!time) return false;
+            return time >= range.start.getTime() && time <= range.end.getTime();
+        }
+
+        function getReportRange(view) {
+            const get = (id) => { const el = document.getElementById(id); return el ? el.value : ''; };
+            const fromValue = view === 'monthly' ? get('monthly-report-from') : get('daily-report-from');
+            const toValue = view === 'monthly' ? get('monthly-report-to') : get('daily-report-to');
+
+            if (fromValue || toValue) {
+                const start = fromValue ? startOfDay(fromValue) : new Date(0);
+                const end = toValue ? endOfDay(toValue) : new Date(8640000000000000);
+                return { start, end };
+            }
+
+            if (view === 'monthly') {
+                const month = get('monthly-report-month') || monthKey(new Date());
+                const match = month.match(/^(\d{4})-(\d{2})$/);
+                if (match) {
+                    const year = Number(match[1]);
+                    const monthIndex = Number(match[2]) - 1;
+                    return { start: new Date(year, monthIndex, 1, 0, 0, 0, 0), end: new Date(year, monthIndex + 1, 0, 23, 59, 59, 999) };
+                }
+                return null;
+            }
+
+            const date = get('daily-report-date') || todayKey();
+            return { start: startOfDay(date), end: endOfDay(date) };
+        }
 
         window.changeOrderStatus = async function(orderId, newStatus) {
             try {
@@ -8068,7 +10866,9 @@ INDEX_HTML = r"""<!DOCTYPE html>
             const name = document.getElementById('col-name').value.trim();
             if (!name) { showToast('Enter the collection name', 'error'); return; }
             const image = uploadedCollectionImage || document.getElementById('col-image-url').value.trim();
-            const payload = { name };
+            const selectedProductIds = Array.from(document.querySelectorAll('#col-product-selector input[type="checkbox"]:checked')).map(el => el.value);
+            const previousName = editId ? (collections.find(x => x.id === editId) || {}).name : '';
+            const payload = { name, productIds: selectedProductIds };
             if (image) payload.image = image;
             try {
                 if (editId) {
@@ -8078,11 +10878,37 @@ INDEX_HTML = r"""<!DOCTYPE html>
                     await addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'collections'), payload);
                     showToast('Collection added!');
                 }
+
+                const affectedIds = new Set(selectedProductIds);
+                products.forEach(p => {
+                    if (p.category === name || (previousName && p.category === previousName)) affectedIds.add(p.id);
+                });
+                for (const productId of affectedIds) {
+                    const p = products.find(x => x.id === productId);
+                    if (!p) continue;
+                    const nextCategory = selectedProductIds.includes(productId) ? name : '';
+                    if (p.category !== nextCategory) {
+                        await updateDoc(doc(db, 'artifacts', appId, 'public', 'data', 'products', productId), { category: nextCategory });
+                    }
+                }
+
                 resetCollectionForm();
+                closeCollectionModal();
                 await window.__refreshAll();
             } catch (err) {
                 showToast(err.message || 'Could not save the collection', 'error');
             }
+        };
+
+        window.openCollectionModal = function() {
+            resetCollectionForm();
+            document.getElementById('collection-modal').classList.remove('hidden');
+            renderCollectionProductSelector();
+            if (window.lucide) lucide.createIcons();
+        };
+
+        window.closeCollectionModal = function() {
+            document.getElementById('collection-modal').classList.add('hidden');
         };
 
         window.editCollection = function(id) {
@@ -8096,7 +10922,30 @@ INDEX_HTML = r"""<!DOCTYPE html>
             document.getElementById('col-image-preview-box').classList.toggle('hidden', !c.image);
             document.getElementById('col-form-title').innerText = 'Edit Collection';
             document.getElementById('col-cancel-btn').classList.remove('hidden');
-            document.getElementById('collection-form').scrollIntoView({ behavior: 'smooth' });
+            document.getElementById('collection-modal').classList.remove('hidden');
+            renderCollectionProductSelector();
+            if (window.lucide) lucide.createIcons();
+        };
+
+        window.renderCollectionProductSelector = function() {
+            const box = document.getElementById('col-product-selector');
+            if (!box) return;
+            const name = document.getElementById('col-name').value.trim();
+            const editId = document.getElementById('edit-col-id').value;
+            const oldName = editId ? (collections.find(x => x.id === editId) || {}).name : '';
+            const selected = new Set(Array.from(document.querySelectorAll('#col-product-selector input[type="checkbox"]:checked')).map(el => el.value));
+            const assigned = new Set(((collections.find(x => x.id === editId) || {}).productIds || []));
+            if (!products.length) {
+                box.innerHTML = `<p class="p-3 text-center text-xs text-slate-400">No products yet.</p>`;
+                return;
+            }
+            box.innerHTML = products.map(p => `
+                <label class="flex items-center gap-3 p-3 hover:bg-slate-50 cursor-pointer">
+                    <input type="checkbox" class="w-4 h-4 rounded border-slate-300 text-brand-600" value="${esc(p.id)}" ${selected.has(p.id) || assigned.has(p.id) || p.category === name || p.category === oldName ? 'checked' : ''}>
+                    <span class="text-sm text-slate-700">${esc(p.name)}</span>
+                    <span class="text-xs text-slate-400 ml-auto">${esc(p.category || '')}</span>
+                </label>
+            `).join('');
         };
 
         window.resetCollectionForm = function() {
@@ -8106,6 +10955,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
             document.getElementById('col-image-preview-box').classList.add('hidden');
             document.getElementById('col-form-title').innerText = 'Add New Collection';
             document.getElementById('col-cancel-btn').classList.add('hidden');
+            renderCollectionProductSelector();
         };
 
         window.deleteCollection = async function(id) {
@@ -8125,7 +10975,8 @@ INDEX_HTML = r"""<!DOCTYPE html>
                 return;
             }
             box.innerHTML = collections.map(c => {
-                const n = products.filter(p => p.category === c.name).length;
+                const assigned = Array.isArray(c.productIds) ? c.productIds : [];
+                const n = products.filter(p => assigned.includes(p.id) || p.category === c.name).length;
                 return `
                     <div class="py-3.5 flex items-center justify-between gap-3">
                         <div class="flex items-center gap-3 min-w-0">
@@ -8142,6 +10993,8 @@ INDEX_HTML = r"""<!DOCTYPE html>
                     </div>`;
             }).join('');
             lucide.createIcons();
+            initScrollReveal(grid);
+            initTiltInteractions();
         };
 
         window.adjustStockQuick = async function(productId, delta) {
@@ -8211,9 +11064,20 @@ INDEX_HTML = r"""<!DOCTYPE html>
                 `;
             }).join('');
             lucide.createIcons();
+            initScrollReveal(grid);
+            initTiltInteractions();
         };
 
         // Expenses Management
+        window.openExpenseModal = function() {
+            document.getElementById('expense-modal').classList.remove('hidden');
+            if (window.lucide) lucide.createIcons();
+        };
+
+        window.closeExpenseModal = function() {
+            document.getElementById('expense-modal').classList.add('hidden');
+        };
+
         window.handleAddExpense = async function(e) {
             e.preventDefault();
             if (!currentUser || !db) return;
@@ -8221,13 +11085,14 @@ INDEX_HTML = r"""<!DOCTYPE html>
             const category = document.getElementById('exp-category').value;
             const amount = parseInt(document.getElementById('exp-amount').value, 10);
 
-            if (!title || !Number.isInteger(amount) || amount < 0) {
+            if (!title || !Number.isInteger(amount) || amount < 1) {
                 showToast('Enter the expense description and a valid amount.', 'error');
                 return;
             }
             try {
                 await addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'expenses'), { title, category, amount });
                 e.target.reset();
+                closeExpenseModal();
                 showToast('Expense recorded!');
             } catch (err) {
                 showToast(err.message || 'Could not add the expense.', 'error');
@@ -8272,21 +11137,64 @@ INDEX_HTML = r"""<!DOCTYPE html>
             e.preventDefault();
             if (!currentUser || !db) return;
 
+            const val = (id) => {
+                const el = document.getElementById(id);
+                return el ? el.value.trim() : '';
+            };
+            const shopName = val('set-shop-name') || storeSettings.shopName || 'Taham';
+            const pageName = val('page-name') || storeSettings.pageName || shopName;
+            const themeSelector = document.getElementById('theme-selector');
             const updatedSettings = {
-                shopName: document.getElementById('set-shop-name').value.trim(),
-                shopPhone: document.getElementById('set-shop-phone').value.trim(),
-                paymentNumber: document.getElementById('set-payment-number').value.trim(),
-                shopAddress: document.getElementById('set-shop-address').value.trim(),
-                adminUser: document.getElementById('set-admin-user').value.trim(),
-                adminPass: document.getElementById('set-admin-pass').value.trim()
+                ...storeSettings,
+                shopName,
+                pageName,
+                theme: (themeSelector && themeSelector.dataset.selected) || storeSettings.theme || 'classic-pink',
+                shopPhone: val('set-shop-phone') || storeSettings.shopPhone,
+                paymentNumber: val('set-payment-number') || storeSettings.paymentNumber,
+                shopAddress: val('set-shop-address') || storeSettings.shopAddress,
+                adminUser: val('set-admin-user') || storeSettings.adminUser || '',
+                adminPass: val('set-admin-pass')
             };
 
             const settingsDoc = doc(db, 'artifacts', appId, 'public', 'data', 'settings', 'store_config');
             try {
                 await setDoc(settingsDoc, updatedSettings);
-                showToast('Shop settings and password updated successfully!');
+                storeSettings = { ...storeSettings, ...updatedSettings };
+                delete storeSettings.adminPass;
+                applyStoreSettingsToUI();
+                showToast('Settings updated successfully!');
             } catch (err) {
                 showToast(err.message || 'Could not save the settings.', 'error');
+            }
+        };
+
+        window.uploadSiteLogo = async function() {
+            const input = document.getElementById('logo-upload');
+            if (!input || !input.files || !input.files.length) {
+                showToast('Please choose an image file.', 'error');
+                return;
+            }
+            const file = input.files[0];
+            if (!file.type.startsWith('image/')) {
+                showToast('Please choose an image file.', 'error');
+                return;
+            }
+            try {
+                const dataUrl = await new Promise((resolve, reject) => {
+                    const reader = new FileReader();
+                    reader.onload = () => resolve(reader.result);
+                    reader.onerror = () => reject(new Error('Could not read the image.'));
+                    reader.readAsDataURL(file);
+                });
+                await api('POST', '/api/logo', { dataUrl });
+                const cacheBust = Date.now();
+                ['site-logo', 'settings-logo-preview'].forEach(id => {
+                    const img = document.getElementById(id);
+                    if (img) img.src = `/logo.png?v=${cacheBust}`;
+                });
+                showToast('Logo uploaded successfully!');
+            } catch (err) {
+                showToast(err.message || 'Could not upload logo.', 'error');
             }
         };
 
