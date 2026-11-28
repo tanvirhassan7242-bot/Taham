@@ -59,6 +59,13 @@ DEFAULT_SETTINGS = {
     "paymentNumber": "01400-570014",
     "shopAddress": "Rayerbag, Dhaka, Bangladesh.",
     "showStockToCustomers": True,
+    "invoicePadUrl": "/official-pad-background.jpg",
+    "invoicePadFilename": "official_pad_background.jpg",
+    "invoiceMarginTop": "58",
+    "invoiceMarginBottom": "48",
+    "invoiceMarginLeft": "18",
+    "invoiceMarginRight": "18",
+    "invoiceMarginUnit": "mm",
 }
 DELIVERY_OPTIONS = (60, 120)           # Dhaka / outside Dhaka (must match the radio buttons)
 PAYMENT_METHODS = ("Cash on Delivery", "bKash", "Nagad")
@@ -993,6 +1000,51 @@ def logo_upload():
     save_doc(db, "settings", "logo", {"mimetype": mimetype, "data": base64.b64encode(image_bytes).decode("ascii"), "updatedAt": now_ms()})
     return jsonify(ok=True, logoUrl=f"/logo.png?v={now_ms()}")
 
+
+@app.post("/api/invoice-pad")
+@admin_required
+def invoice_pad_upload():
+    data_url = str(body().get("dataUrl", "")).strip()
+    if not data_url.startswith("data:image/") or "," not in data_url:
+        return err("Please choose an image file.")
+
+    header, encoded = data_url.split(",", 1)
+    mimetype = header[5:].split(";")[0].lower() or "image/png"
+    if not mimetype.startswith("image/"):
+        return err("Please choose an image file.")
+
+    try:
+        image_bytes = base64.b64decode(encoded)
+    except Exception:
+        return err("Could not read the image file.")
+
+    if not image_bytes:
+        return err("Could not read the image file.")
+    if len(image_bytes) > 8 * 1024 * 1024:
+        return err("Image must be smaller than 8 MB.")
+
+    db = get_db()
+    save_doc(db, "settings", "invoice_pad", {"mimetype": mimetype, "data": base64.b64encode(image_bytes).decode("ascii"), "updatedAt": now_ms()})
+
+    s = dict(get_doc(db, "settings", "store_config") or DEFAULT_SETTINGS)
+    pad_url = f"/invoice-pad-background.jpg?v={now_ms()}"
+    s["invoicePadUrl"] = pad_url
+    s["invoicePadFilename"] = str(body().get("filename", "invoice-pad.jpg"))[:200]
+    s.pop("id", None)
+    s.pop("adminUser", None)
+    s.pop("adminPass", None)
+    save_doc(db, "settings", "store_config", s)
+    return jsonify(ok=True, padUrl=pad_url, invoicePadUrl=pad_url)
+
+
+@app.get("/invoice-pad-background.jpg")
+def invoice_pad_background():
+    db = get_db()
+    doc = get_doc(db, "settings", "invoice_pad")
+    if doc and doc.get("data"):
+        return Response(base64.b64decode(doc["data"]), mimetype=doc.get("mimetype") or "image/jpeg")
+    with open(os.path.join(BASE_DIR, "official_pad_background.jpg"), "rb") as f:
+        return Response(f.read(), mimetype="image/jpeg")
 
 # ------------------------------- delete ---------------------------------
 
@@ -2087,6 +2139,116 @@ INDEX_HTML = r"""<!DOCTYPE html>
             .no-print { display: none !important; }
         }
 
+        /* Dynamic TAHAM pad sizing, safe margins, and multi-page printing */
+        @media print {
+            @page {
+                size: A4;
+                margin: 0;
+                width: 210mm;
+                height: 297mm;
+                background-image: url("/official-pad-background.jpg");
+                background-size: cover;
+                background-position: center;
+                background-repeat: no-repeat;
+                print-color-adjust: exact;
+                -webkit-print-color-adjust: exact;
+            }
+
+            html, body { width: 210mm; margin: 0 !important; padding: 0 !important; }
+
+            .print-pad {
+                position: relative !important;
+                width: 210mm !important;
+                height: 297mm !important;
+                max-width: 210mm !important;
+                max-height: none !important;
+                min-height: 297mm !important;
+                margin: 0 !important;
+                padding: var(--invoice-margin-top, 58mm) var(--invoice-margin-right, 18mm) var(--invoice-margin-bottom, 48mm) var(--invoice-margin-left, 18mm) !important;
+                box-sizing: border-box !important;
+                overflow: visible !important;
+                border: 0 !important;
+                border-radius: 0 !important;
+                box-shadow: none !important;
+                background-color: transparent !important;
+                background-image: var(--invoice-pad-image, url("/official-pad-background.jpg")) !important;
+                background-size: cover !important;
+                background-position: center !important;
+                background-repeat: no-repeat !important;
+                page-break-inside: auto !important;
+                break-inside: auto !important;
+                -webkit-print-color-adjust: exact !important;
+                print-color-adjust: exact !important;
+            }
+
+            #invoice-print-area, #report-print-area {
+                padding: var(--invoice-margin-top, 58mm) var(--invoice-margin-right, 18mm) var(--invoice-margin-bottom, 48mm) var(--invoice-margin-left, 18mm) !important;
+            }
+
+            .print-pad-background {
+                position: absolute !important;
+                top: 0 !important;
+                right: 0 !important;
+                bottom: 0 !important;
+                left: 0 !important;
+                width: 100% !important;
+                height: 100% !important;
+                max-width: none !important;
+                min-width: 0 !important;
+                object-fit: cover !important;
+                object-position: center center !important;
+                z-index: 0 !important;
+                visibility: visible !important;
+                pointer-events: none !important;
+                -webkit-print-color-adjust: exact !important;
+                print-color-adjust: exact !important;
+            }
+
+            .print-pad > :not(.print-pad-background) { position: relative; z-index: 1; }
+
+            .invoice-table, .report-print-table, table { page-break-inside: auto !important; break-inside: auto !important; }
+            .invoice-table thead, .report-print-table thead { display: table-header-group !important; }
+            .invoice-table tfoot, .report-print-table tfoot { display: table-footer-group !important; }
+            .invoice-table tbody tr, .report-print-table tbody tr, table tbody tr {
+                page-break-inside: avoid !important;
+                break-inside: avoid !important;
+                page-break-after: auto !important;
+                break-after: auto !important;
+            }
+            .invoice-totals, .invoice-payment-box, .invoice-signatures-footer, .report-print-header { page-break-inside: avoid !important; break-inside: avoid !important; }
+            .no-print { display: none !important; }
+        }
+
+        /* Invoice Setup live preview */
+        .invoice-pad-live-preview {
+            position: relative;
+            width: 100%;
+            max-width: 420px;
+            aspect-ratio: 210 / 297;
+            overflow: hidden;
+            border: 1px solid #d8dee9;
+            border-radius: 12px;
+            background: #fff;
+            margin-top: 12px;
+        }
+        .invoice-pad-live-bg { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
+        .invoice-pad-live-safe {
+            position: absolute;
+            top: 58mm;
+            bottom: 48mm;
+            left: 18mm;
+            right: 18mm;
+            border: 1px dashed #c1121f;
+            background: rgba(255,255,255,0.35);
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            gap: 4px;
+            color: #0b1f3a;
+            font-size: 11px;
+            text-align: center;
+        }
         /* Floating 3D storefront footer */
         .footer-3d {
             position: relative;
@@ -2841,6 +3003,14 @@ INDEX_HTML = r"""<!DOCTYPE html>
                         <i data-lucide="file-cog" class="w-4 h-4"></i>
                         <span>Page Setup</span>
                     </button>
+                    <button type="button" onclick="switchSettingsSection('theme')" data-settings-section="theme" class="settings-submenu-btn w-full px-4 py-2.5 rounded-xl text-sm font-bold bg-white text-slate-700 hover:bg-slate-100 border border-slate-200 flex items-center justify-start gap-2">
+                        <i data-lucide="palette" class="w-4 h-4"></i>
+                        <span>Theme</span>
+                    </button>
+                    <button type="button" onclick="switchSettingsSection('invoice-setup')" data-settings-section="invoice-setup" class="settings-submenu-btn w-full px-4 py-2.5 rounded-xl text-sm font-bold bg-white text-slate-700 hover:bg-slate-100 border border-slate-200 flex items-center justify-start gap-2">
+                        <i data-lucide="file-text" class="w-4 h-4"></i>
+                        <span>Invoice Setup</span>
+                    </button>
                 </nav>
 
                 <div class="settings-content min-w-0 space-y-6">
@@ -2977,12 +3147,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
                                 </div>
                             </div>
 
-                            <div class="pt-4 border-t border-slate-100">
-                                <h4 class="text-sm font-bold text-slate-900 mb-3">Theme Selector</h4>
-                                <p class="text-xs text-slate-500 mb-3">Choose from 24 distinct color and UI themes. Selecting a theme applies it to the dashboard immediately.</p>
-                                <div id="theme-selector" class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3" data-selected="classic-pink"></div>
-                            </div>
-
+                            
                             <div class="pt-4 border-t border-slate-100">
                                 <label class="flex items-center justify-between gap-4 rounded-xl border border-slate-200 bg-slate-50 p-4 cursor-pointer">
                                     <span>
@@ -3001,6 +3166,53 @@ INDEX_HTML = r"""<!DOCTYPE html>
                             </button>
                         </form>
                     </section>
+<section id="settings-theme" class="settings-section hidden bg-white p-6 sm:p-8 rounded-2xl border border-slate-200 shadow-sm">
+    <h3 class="text-lg font-bold text-slate-900 mb-1">Theme</h3>
+    <p class="text-xs text-slate-500 mb-6 pb-4 border-b border-slate-100">Choose from 24 professional UI themes. Selecting a theme applies it to the dashboard immediately.</p>
+    <div id="theme-selector" class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3" data-selected="classic-pink"></div>
+</section>
+
+<section id="settings-invoice-setup" class="settings-section hidden bg-white p-6 sm:p-8 rounded-2xl border border-slate-200 shadow-sm">
+    <h3 class="text-lg font-bold text-slate-900 mb-1">Invoice Setup</h3>
+    <p class="text-xs text-slate-500 mb-6 pb-4 border-b border-slate-100">Custom TAHAM Official Pad template and printable safe-zone margins.</p>
+
+    <div class="space-y-6">
+        <div>
+            <h4 class="text-sm font-bold text-slate-900 mb-3">Custom Pad Upload &amp; Live Sync</h4>
+            <p class="text-xs text-slate-500 mb-3">Upload or replace the official pad template. Applies to invoices, delivery slips, Daily Report, Monthly Report, and every generated print page.</p>
+            <div class="flex flex-col sm:flex-row gap-4 items-start">
+                <img id="invoice-pad-preview" src="/official-pad-background.jpg" alt="Invoice pad preview" class="w-40 h-auto rounded-xl border border-slate-200 bg-white">
+                <div class="flex-1 space-y-3">
+                    <input type="file" id="invoice-pad-upload" accept="image/*" class="block w-full text-sm text-slate-500 file:mr-3 file:py-2 file:px-4 file:rounded-xl file:border-0 file:text-sm file:font-bold file:bg-slate-900 file:text-white hover:file:bg-slate-800">
+                    <button type="button" onclick="uploadInvoicePad()" class="px-4 py-2.5 rounded-xl bg-brand-600 hover:bg-brand-700 text-white text-sm font-bold">Upload Pad Template</button>
+                    <p id="invoice-pad-url" class="text-[11px] text-slate-500"></p>
+                </div>
+            </div>
+        </div>
+
+        <div class="pt-4 border-t border-slate-100">
+            <h4 class="text-sm font-bold text-slate-900 mb-3">Configurable Print Margins</h4>
+            <p class="text-xs text-slate-500 mb-3">Safe zone in millimetres. Content stays clear of the pad header and bottom signature/footer.</p>
+            <div class="grid grid-cols-2 sm:grid-cols-4 gap-3">
+                <label class="block text-xs font-bold text-slate-700">Top Margin<input type="number" id="invoice-margin-top" min="0" step="1" value="58" oninput="updateInvoicePadPreview(); saveInvoiceSetup();" class="mt-1 w-full px-3 py-2 rounded-xl border border-slate-200 text-sm"></label>
+                <label class="block text-xs font-bold text-slate-700">Bottom Margin<input type="number" id="invoice-margin-bottom" min="0" step="1" value="48" oninput="updateInvoicePadPreview(); saveInvoiceSetup();" class="mt-1 w-full px-3 py-2 rounded-xl border border-slate-200 text-sm"></label>
+                <label class="block text-xs font-bold text-slate-700">Left Margin<input type="number" id="invoice-margin-left" min="0" step="1" value="18" oninput="updateInvoicePadPreview(); saveInvoiceSetup();" class="mt-1 w-full px-3 py-2 rounded-xl border border-slate-200 text-sm"></label>
+                <label class="block text-xs font-bold text-slate-700">Right Margin<input type="number" id="invoice-margin-right" min="0" step="1" value="18" oninput="updateInvoicePadPreview(); saveInvoiceSetup();" class="mt-1 w-full px-3 py-2 rounded-xl border border-slate-200 text-sm"></label>
+            </div>
+            <p class="text-[11px] text-slate-500 mt-2">Units: mm. <button type="button" onclick="saveInvoiceSetup()" class="ml-2 px-3 py-1 rounded-lg bg-slate-900 text-white font-bold">Save Invoice Setup</button></p>
+        </div>
+
+        <div id="invoice-pad-live-preview" class="invoice-pad-live-preview" aria-label="Invoice pad live preview">
+            <img class="invoice-pad-live-bg" src="/official-pad-background.jpg" alt="">
+            <div id="invoice-pad-live-safe" class="invoice-pad-live-safe">
+                <strong>TAHAM Official Pad</strong>
+                <span>Safe printable area</span>
+                <span id="invoice-pad-live-dims">58mm / 48mm / 18mm / 18mm</span>
+            </div>
+        </div>
+    </div>
+</section>
+
                 </div>
             </div>
         </div>
@@ -3364,7 +3576,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
 
             <!-- Modal Action Buttons -->
             <div class="flex gap-3 mt-6 pt-4 border-t border-slate-100 no-print">
-                <button onclick="window.print()" class="flex-1 py-3 rounded-xl bg-slate-900 hover:bg-slate-800 text-white font-bold flex items-center justify-center gap-2 shadow-md">
+                <button onclick="preparePrintPagination('#invoice-print-area'); window.print()" class="flex-1 py-3 rounded-xl bg-slate-900 hover:bg-slate-800 text-white font-bold flex items-center justify-center gap-2 shadow-md">
                     <i data-lucide="printer" class="w-4 h-4"></i>
                     <span>Print Invoice</span>
                 </button>
@@ -4109,6 +4321,8 @@ INDEX_HTML = r"""<!DOCTYPE html>
             });
             if (sectionName === 'access-control') renderAccessControl();
             if (sectionName === 'user-management') loadUsers();
+            if (sectionName === 'theme') renderThemeSelector();
+            if (sectionName === 'invoice-setup') renderInvoicePadSettings();
             if (window.lucide) lucide.createIcons();
         };
 
@@ -4317,9 +4531,200 @@ INDEX_HTML = r"""<!DOCTYPE html>
 
             applyTheme(storeSettings.theme || 'classic-pink');
             renderThemeSelector();
+            renderInvoicePadSettings();
             renderProducts();
         }
 
+        window.getInvoicePadUrl = function() {
+            const url = (typeof storeSettings !== 'undefined' && storeSettings.invoicePadUrl) || '/official-pad-background.jpg';
+            return String(url || '/official-pad-background.jpg');
+        };
+
+        window.insertPrintPadBackground = function(root) {
+            if (!root) return;
+            const padUrl = window.getInvoicePadUrl();
+            let bg = root.querySelector(':scope > .print-pad-background');
+            if (!bg) {
+                bg = document.createElement('img');
+                bg.className = 'print-pad-background';
+                bg.alt = '';
+                bg.setAttribute('aria-hidden', 'true');
+                root.insertBefore(bg, root.firstChild);
+            }
+            bg.src = padUrl;
+            return bg;
+        };
+
+        window.applyInvoicePadSettings = function() {
+            const padUrl = window.getInvoicePadUrl();
+            const rootStyle = document.documentElement.style;
+            const ss = (typeof storeSettings !== 'undefined' && storeSettings) ? storeSettings : {};
+            const top = `${Number(ss.invoiceMarginTop || 58)}mm`;
+            const bottom = `${Number(ss.invoiceMarginBottom || 48)}mm`;
+            const left = `${Number(ss.invoiceMarginLeft || 18)}mm`;
+            const right = `${Number(ss.invoiceMarginRight || 18)}mm`;
+            rootStyle.setProperty('--invoice-pad-image', `url("${padUrl}")`);
+            rootStyle.setProperty('--invoice-margin-top', top);
+            rootStyle.setProperty('--invoice-margin-bottom', bottom);
+            rootStyle.setProperty('--invoice-margin-left', left);
+            rootStyle.setProperty('--invoice-margin-right', right);
+            let dynamicPadStyle = document.getElementById('taham-dynamic-pad-style');
+            if (!dynamicPadStyle) {
+                dynamicPadStyle = document.createElement('style');
+                dynamicPadStyle.id = 'taham-dynamic-pad-style';
+                document.head.appendChild(dynamicPadStyle);
+            }
+            const safePadUrl = String(padUrl).replace(/[\x22\x27`\x5c]/g, '%22');
+            dynamicPadStyle.textContent = `@media print {
+                @page { background-image: url("${safePadUrl}") !important; background-size: cover !important; background-position: center !important; background-repeat: no-repeat !important; print-color-adjust: exact; -webkit-print-color-adjust: exact; }
+                .print-pad { background-image: url("${safePadUrl}") !important; }
+                .print-pad-background { visibility: visible !important; }
+            }`;
+            document.querySelectorAll('.print-pad').forEach(pad => {
+                pad.style.setProperty('--invoice-pad-image', `url("${padUrl}")`);
+                pad.style.backgroundImage = `url("${padUrl}")`;
+                window.insertPrintPadBackground(pad);
+            });
+            return padUrl;
+        };
+
+        window.preparePrintPagination = function(selector) {
+            const root = document.querySelector(selector);
+            if (!root) return;
+            window.applyInvoicePadSettings();
+            window.insertPrintPadBackground(root);
+            root.querySelectorAll('.print-pad').forEach(pad => window.insertPrintPadBackground(pad));
+            root.querySelectorAll('table').forEach(table => {
+                table.style.breakInside = 'auto';
+                table.style.pageBreakInside = 'auto';
+            });
+            root.querySelectorAll('table tbody tr').forEach(tr => {
+                tr.style.breakInside = 'avoid';
+                tr.style.pageBreakInside = 'avoid';
+                tr.style.pageBreakAfter = 'auto';
+            });
+            root.querySelectorAll('table thead').forEach(thead => { thead.style.display = 'table-header-group'; });
+            root.querySelectorAll('table tfoot').forEach(tfoot => { tfoot.style.display = 'table-footer-group'; });
+            root.classList.add('print-pad-paginated');
+        };
+
+        window.updateInvoicePadPreview = function() {
+            const ss = (typeof storeSettings !== 'undefined' && storeSettings) ? storeSettings : {};
+            const read = (id, fallback) => {
+                const el = document.getElementById(id);
+                const n = parseFloat(el ? el.value : ss[id]);
+                return Number.isFinite(n) && n >= 0 ? n : fallback;
+            };
+            const top = read('invoice-margin-top', Number(ss.invoiceMarginTop || 58));
+            const bottom = read('invoice-margin-bottom', Number(ss.invoiceMarginBottom || 48));
+            const left = read('invoice-margin-left', Number(ss.invoiceMarginLeft || 18));
+            const right = read('invoice-margin-right', Number(ss.invoiceMarginRight || 18));
+            const padUrl = window.getInvoicePadUrl();
+            const unit = (ss.invoiceMarginUnit || 'mm');
+
+            ['document', 'invoice-pad-live-preview'].forEach(() => {});
+            const setVar = (name, value) => document.documentElement.style.setProperty(name, value);
+            setVar('--invoice-margin-top', `${top}${unit}`);
+            setVar('--invoice-margin-bottom', `${bottom}${unit}`);
+            setVar('--invoice-margin-left', `${left}${unit}`);
+            setVar('--invoice-margin-right', `${right}${unit}`);
+
+            const preview = document.getElementById('invoice-pad-live-preview');
+            const safe = document.getElementById('invoice-pad-live-safe');
+            const bg = document.querySelector('.invoice-pad-live-bg');
+            const dims = document.getElementById('invoice-pad-live-dims');
+            const padImg = document.getElementById('invoice-pad-preview');
+            const urlText = document.getElementById('invoice-pad-url');
+            if (preview) preview.style.setProperty('--invoice-pad-image', `url("${padUrl}")`);
+            if (safe) {
+                safe.style.top = `${top}${unit}`;
+                safe.style.bottom = `${bottom}${unit}`;
+                safe.style.left = `${left}${unit}`;
+                safe.style.right = `${right}${unit}`;
+            }
+            if (bg) bg.src = padUrl;
+            if (padImg) padImg.src = padUrl;
+            if (urlText) urlText.innerText = padUrl;
+            if (dims) dims.innerText = `${top}${unit} / ${bottom}${unit} / ${left}${unit} / ${right}${unit}`;
+            window.applyInvoicePadSettings();
+        };
+
+        window.renderInvoicePadSettings = function() {
+            const ss = (typeof storeSettings !== 'undefined' && storeSettings) ? storeSettings : {};
+            const setValue = (id, value) => { const el = document.getElementById(id); if (el) el.value = value == null ? '' : value; };
+            setValue('invoice-margin-top', ss.invoiceMarginTop != null ? ss.invoiceMarginTop : 58);
+            setValue('invoice-margin-bottom', ss.invoiceMarginBottom != null ? ss.invoiceMarginBottom : 48);
+            setValue('invoice-margin-left', ss.invoiceMarginLeft != null ? ss.invoiceMarginLeft : 18);
+            setValue('invoice-margin-right', ss.invoiceMarginRight != null ? ss.invoiceMarginRight : 18);
+            const padImg = document.getElementById('invoice-pad-preview');
+            const bg = document.querySelector('.invoice-pad-live-bg');
+            const urlText = document.getElementById('invoice-pad-url');
+            if (padImg) padImg.src = window.getInvoicePadUrl();
+            if (bg) bg.src = window.getInvoicePadUrl();
+            if (urlText) urlText.innerText = window.getInvoicePadUrl();
+            window.updateInvoicePadPreview();
+        };
+
+        window.saveInvoiceSetup = async function() {
+            const ss = (typeof storeSettings !== 'undefined' && storeSettings) ? storeSettings : {};
+            const num = (id, fallback) => {
+                const el = document.getElementById(id);
+                const n = parseFloat(el ? el.value : fallback);
+                return Number.isFinite(n) && n >= 0 ? String(Math.round(n * 100) / 100) : String(fallback);
+            };
+            const payload = Object.assign({}, ss, {
+                invoiceMarginTop: num('invoice-margin-top', ss.invoiceMarginTop || 58),
+                invoiceMarginBottom: num('invoice-margin-bottom', ss.invoiceMarginBottom || 48),
+                invoiceMarginLeft: num('invoice-margin-left', ss.invoiceMarginLeft || 18),
+                invoiceMarginRight: num('invoice-margin-right', ss.invoiceMarginRight || 18),
+                invoiceMarginUnit: ss.invoiceMarginUnit || 'mm'
+            });
+            if (typeof storeSettings !== 'undefined') Object.assign(storeSettings, payload);
+            try {
+                if (typeof api === 'function') await api('PUT', '/api/settings/store_config', payload);
+                window.applyInvoicePadSettings();
+                window.updateInvoicePadPreview();
+            } catch (err) {
+                if (typeof showToast === 'function') showToast(err.message || 'Could not save invoice setup.', 'error');
+            }
+        };
+
+        window.uploadInvoicePad = async function() {
+            const input = document.getElementById('invoice-pad-upload');
+            if (!input || !input.files || !input.files[0]) {
+                if (typeof showToast === 'function') showToast('Please choose an image file.', 'error');
+                return;
+            }
+            const file = input.files[0];
+            if (!file.type.startsWith('image/')) {
+                if (typeof showToast === 'function') showToast('Please choose an image file.', 'error');
+                return;
+            }
+            if (file.size > 8 * 1024 * 1024) {
+                if (typeof showToast === 'function') showToast('Image must be smaller than 8 MB.', 'error');
+                return;
+            }
+            const dataUrl = await new Promise((resolve, reject) => {
+                const reader = new FileReader();
+                reader.onload = () => resolve(reader.result);
+                reader.onerror = () => reject(new Error('Could not read the image file.'));
+                reader.readAsDataURL(file);
+            });
+            try {
+                const result = await api('POST', '/api/invoice-pad', { dataUrl, filename: file.name });
+                const padUrl = result.padUrl || result.invoicePadUrl || '/invoice-pad-background.jpg';
+                if (typeof storeSettings !== 'undefined') {
+                    storeSettings.invoicePadUrl = padUrl;
+                    storeSettings.invoicePadFilename = file.name;
+                }
+                await api('PUT', '/api/settings/store_config', Object.assign({}, storeSettings, { invoicePadUrl: padUrl, invoicePadFilename: file.name }));
+                window.applyInvoicePadSettings();
+                window.renderInvoicePadSettings();
+                if (typeof showToast === 'function') showToast('Invoice pad uploaded and applied.');
+            } catch (err) {
+                if (typeof showToast === 'function') showToast(err.message || 'Could not upload invoice pad.', 'error');
+            }
+        };
         function updatePendingBadge() {
             const pendingCount = orders.filter(o => o.status === 'Pending').length;
             const badge = document.getElementById('pending-orders-badge');
@@ -4998,6 +5403,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
             setText('inv-due', money(due));
 
             document.getElementById('invoice-modal').classList.remove('hidden');
+            if (window.applyInvoicePadSettings) window.applyInvoicePadSettings();
             lucide.createIcons();
         };
 
@@ -5217,6 +5623,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
                         </tbody>
                     </table>`;
             }
+            if (window.applyInvoicePadSettings) window.applyInvoicePadSettings();
             if (window.lucide) lucide.createIcons();
         };
 
@@ -5250,6 +5657,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
             document.body.classList.add('printing-report');
             const cleanup = () => document.body.classList.remove('printing-report');
             window.addEventListener('afterprint', cleanup, { once: true });
+            window.preparePrintPagination('#report-print-area');
             window.print();
             setTimeout(cleanup, 1000);
         };
@@ -6099,6 +6507,13 @@ DEFAULT_SETTINGS = {
     "paymentNumber": "01400-570014",
     "shopAddress": "Rayerbag, Dhaka, Bangladesh.",
     "showStockToCustomers": True,
+    "invoicePadUrl": "/official-pad-background.jpg",
+    "invoicePadFilename": "official_pad_background.jpg",
+    "invoiceMarginTop": "58",
+    "invoiceMarginBottom": "48",
+    "invoiceMarginLeft": "18",
+    "invoiceMarginRight": "18",
+    "invoiceMarginUnit": "mm",
 }
 DELIVERY_OPTIONS = (60, 120)           # Dhaka / outside Dhaka (must match the radio buttons)
 PAYMENT_METHODS = ("Cash on Delivery", "bKash", "Nagad")
@@ -7033,6 +7448,51 @@ def logo_upload():
     save_doc(db, "settings", "logo", {"mimetype": mimetype, "data": base64.b64encode(image_bytes).decode("ascii"), "updatedAt": now_ms()})
     return jsonify(ok=True, logoUrl=f"/logo.png?v={now_ms()}")
 
+
+@app.post("/api/invoice-pad")
+@admin_required
+def invoice_pad_upload():
+    data_url = str(body().get("dataUrl", "")).strip()
+    if not data_url.startswith("data:image/") or "," not in data_url:
+        return err("Please choose an image file.")
+
+    header, encoded = data_url.split(",", 1)
+    mimetype = header[5:].split(";")[0].lower() or "image/png"
+    if not mimetype.startswith("image/"):
+        return err("Please choose an image file.")
+
+    try:
+        image_bytes = base64.b64decode(encoded)
+    except Exception:
+        return err("Could not read the image file.")
+
+    if not image_bytes:
+        return err("Could not read the image file.")
+    if len(image_bytes) > 8 * 1024 * 1024:
+        return err("Image must be smaller than 8 MB.")
+
+    db = get_db()
+    save_doc(db, "settings", "invoice_pad", {"mimetype": mimetype, "data": base64.b64encode(image_bytes).decode("ascii"), "updatedAt": now_ms()})
+
+    s = dict(get_doc(db, "settings", "store_config") or DEFAULT_SETTINGS)
+    pad_url = f"/invoice-pad-background.jpg?v={now_ms()}"
+    s["invoicePadUrl"] = pad_url
+    s["invoicePadFilename"] = str(body().get("filename", "invoice-pad.jpg"))[:200]
+    s.pop("id", None)
+    s.pop("adminUser", None)
+    s.pop("adminPass", None)
+    save_doc(db, "settings", "store_config", s)
+    return jsonify(ok=True, padUrl=pad_url, invoicePadUrl=pad_url)
+
+
+@app.get("/invoice-pad-background.jpg")
+def invoice_pad_background():
+    db = get_db()
+    doc = get_doc(db, "settings", "invoice_pad")
+    if doc and doc.get("data"):
+        return Response(base64.b64decode(doc["data"]), mimetype=doc.get("mimetype") or "image/jpeg")
+    with open(os.path.join(BASE_DIR, "official_pad_background.jpg"), "rb") as f:
+        return Response(f.read(), mimetype="image/jpeg")
 
 # ------------------------------- delete ---------------------------------
 
@@ -8127,6 +8587,116 @@ INDEX_HTML = r"""<!DOCTYPE html>
             .no-print { display: none !important; }
         }
 
+        /* Dynamic TAHAM pad sizing, safe margins, and multi-page printing */
+        @media print {
+            @page {
+                size: A4;
+                margin: 0;
+                width: 210mm;
+                height: 297mm;
+                background-image: url("/official-pad-background.jpg");
+                background-size: cover;
+                background-position: center;
+                background-repeat: no-repeat;
+                print-color-adjust: exact;
+                -webkit-print-color-adjust: exact;
+            }
+
+            html, body { width: 210mm; margin: 0 !important; padding: 0 !important; }
+
+            .print-pad {
+                position: relative !important;
+                width: 210mm !important;
+                height: 297mm !important;
+                max-width: 210mm !important;
+                max-height: none !important;
+                min-height: 297mm !important;
+                margin: 0 !important;
+                padding: var(--invoice-margin-top, 58mm) var(--invoice-margin-right, 18mm) var(--invoice-margin-bottom, 48mm) var(--invoice-margin-left, 18mm) !important;
+                box-sizing: border-box !important;
+                overflow: visible !important;
+                border: 0 !important;
+                border-radius: 0 !important;
+                box-shadow: none !important;
+                background-color: transparent !important;
+                background-image: var(--invoice-pad-image, url("/official-pad-background.jpg")) !important;
+                background-size: cover !important;
+                background-position: center !important;
+                background-repeat: no-repeat !important;
+                page-break-inside: auto !important;
+                break-inside: auto !important;
+                -webkit-print-color-adjust: exact !important;
+                print-color-adjust: exact !important;
+            }
+
+            #invoice-print-area, #report-print-area {
+                padding: var(--invoice-margin-top, 58mm) var(--invoice-margin-right, 18mm) var(--invoice-margin-bottom, 48mm) var(--invoice-margin-left, 18mm) !important;
+            }
+
+            .print-pad-background {
+                position: absolute !important;
+                top: 0 !important;
+                right: 0 !important;
+                bottom: 0 !important;
+                left: 0 !important;
+                width: 100% !important;
+                height: 100% !important;
+                max-width: none !important;
+                min-width: 0 !important;
+                object-fit: cover !important;
+                object-position: center center !important;
+                z-index: 0 !important;
+                visibility: visible !important;
+                pointer-events: none !important;
+                -webkit-print-color-adjust: exact !important;
+                print-color-adjust: exact !important;
+            }
+
+            .print-pad > :not(.print-pad-background) { position: relative; z-index: 1; }
+
+            .invoice-table, .report-print-table, table { page-break-inside: auto !important; break-inside: auto !important; }
+            .invoice-table thead, .report-print-table thead { display: table-header-group !important; }
+            .invoice-table tfoot, .report-print-table tfoot { display: table-footer-group !important; }
+            .invoice-table tbody tr, .report-print-table tbody tr, table tbody tr {
+                page-break-inside: avoid !important;
+                break-inside: avoid !important;
+                page-break-after: auto !important;
+                break-after: auto !important;
+            }
+            .invoice-totals, .invoice-payment-box, .invoice-signatures-footer, .report-print-header { page-break-inside: avoid !important; break-inside: avoid !important; }
+            .no-print { display: none !important; }
+        }
+
+        /* Invoice Setup live preview */
+        .invoice-pad-live-preview {
+            position: relative;
+            width: 100%;
+            max-width: 420px;
+            aspect-ratio: 210 / 297;
+            overflow: hidden;
+            border: 1px solid #d8dee9;
+            border-radius: 12px;
+            background: #fff;
+            margin-top: 12px;
+        }
+        .invoice-pad-live-bg { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
+        .invoice-pad-live-safe {
+            position: absolute;
+            top: 58mm;
+            bottom: 48mm;
+            left: 18mm;
+            right: 18mm;
+            border: 1px dashed #c1121f;
+            background: rgba(255,255,255,0.35);
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            gap: 4px;
+            color: #0b1f3a;
+            font-size: 11px;
+            text-align: center;
+        }
         /* Floating 3D storefront footer */
         .footer-3d {
             position: relative;
@@ -8881,6 +9451,14 @@ INDEX_HTML = r"""<!DOCTYPE html>
                         <i data-lucide="file-cog" class="w-4 h-4"></i>
                         <span>Page Setup</span>
                     </button>
+                    <button type="button" onclick="switchSettingsSection('theme')" data-settings-section="theme" class="settings-submenu-btn w-full px-4 py-2.5 rounded-xl text-sm font-bold bg-white text-slate-700 hover:bg-slate-100 border border-slate-200 flex items-center justify-start gap-2">
+                        <i data-lucide="palette" class="w-4 h-4"></i>
+                        <span>Theme</span>
+                    </button>
+                    <button type="button" onclick="switchSettingsSection('invoice-setup')" data-settings-section="invoice-setup" class="settings-submenu-btn w-full px-4 py-2.5 rounded-xl text-sm font-bold bg-white text-slate-700 hover:bg-slate-100 border border-slate-200 flex items-center justify-start gap-2">
+                        <i data-lucide="file-text" class="w-4 h-4"></i>
+                        <span>Invoice Setup</span>
+                    </button>
                 </nav>
 
                 <div class="settings-content min-w-0 space-y-6">
@@ -9017,12 +9595,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
                                 </div>
                             </div>
 
-                            <div class="pt-4 border-t border-slate-100">
-                                <h4 class="text-sm font-bold text-slate-900 mb-3">Theme Selector</h4>
-                                <p class="text-xs text-slate-500 mb-3">Choose from 24 distinct color and UI themes. Selecting a theme applies it to the dashboard immediately.</p>
-                                <div id="theme-selector" class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3" data-selected="classic-pink"></div>
-                            </div>
-
+                            
                             <div class="pt-4 border-t border-slate-100">
                                 <label class="flex items-center justify-between gap-4 rounded-xl border border-slate-200 bg-slate-50 p-4 cursor-pointer">
                                     <span>
@@ -9041,6 +9614,53 @@ INDEX_HTML = r"""<!DOCTYPE html>
                             </button>
                         </form>
                     </section>
+<section id="settings-theme" class="settings-section hidden bg-white p-6 sm:p-8 rounded-2xl border border-slate-200 shadow-sm">
+    <h3 class="text-lg font-bold text-slate-900 mb-1">Theme</h3>
+    <p class="text-xs text-slate-500 mb-6 pb-4 border-b border-slate-100">Choose from 24 professional UI themes. Selecting a theme applies it to the dashboard immediately.</p>
+    <div id="theme-selector" class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3" data-selected="classic-pink"></div>
+</section>
+
+<section id="settings-invoice-setup" class="settings-section hidden bg-white p-6 sm:p-8 rounded-2xl border border-slate-200 shadow-sm">
+    <h3 class="text-lg font-bold text-slate-900 mb-1">Invoice Setup</h3>
+    <p class="text-xs text-slate-500 mb-6 pb-4 border-b border-slate-100">Custom TAHAM Official Pad template and printable safe-zone margins.</p>
+
+    <div class="space-y-6">
+        <div>
+            <h4 class="text-sm font-bold text-slate-900 mb-3">Custom Pad Upload &amp; Live Sync</h4>
+            <p class="text-xs text-slate-500 mb-3">Upload or replace the official pad template. Applies to invoices, delivery slips, Daily Report, Monthly Report, and every generated print page.</p>
+            <div class="flex flex-col sm:flex-row gap-4 items-start">
+                <img id="invoice-pad-preview" src="/official-pad-background.jpg" alt="Invoice pad preview" class="w-40 h-auto rounded-xl border border-slate-200 bg-white">
+                <div class="flex-1 space-y-3">
+                    <input type="file" id="invoice-pad-upload" accept="image/*" class="block w-full text-sm text-slate-500 file:mr-3 file:py-2 file:px-4 file:rounded-xl file:border-0 file:text-sm file:font-bold file:bg-slate-900 file:text-white hover:file:bg-slate-800">
+                    <button type="button" onclick="uploadInvoicePad()" class="px-4 py-2.5 rounded-xl bg-brand-600 hover:bg-brand-700 text-white text-sm font-bold">Upload Pad Template</button>
+                    <p id="invoice-pad-url" class="text-[11px] text-slate-500"></p>
+                </div>
+            </div>
+        </div>
+
+        <div class="pt-4 border-t border-slate-100">
+            <h4 class="text-sm font-bold text-slate-900 mb-3">Configurable Print Margins</h4>
+            <p class="text-xs text-slate-500 mb-3">Safe zone in millimetres. Content stays clear of the pad header and bottom signature/footer.</p>
+            <div class="grid grid-cols-2 sm:grid-cols-4 gap-3">
+                <label class="block text-xs font-bold text-slate-700">Top Margin<input type="number" id="invoice-margin-top" min="0" step="1" value="58" oninput="updateInvoicePadPreview(); saveInvoiceSetup();" class="mt-1 w-full px-3 py-2 rounded-xl border border-slate-200 text-sm"></label>
+                <label class="block text-xs font-bold text-slate-700">Bottom Margin<input type="number" id="invoice-margin-bottom" min="0" step="1" value="48" oninput="updateInvoicePadPreview(); saveInvoiceSetup();" class="mt-1 w-full px-3 py-2 rounded-xl border border-slate-200 text-sm"></label>
+                <label class="block text-xs font-bold text-slate-700">Left Margin<input type="number" id="invoice-margin-left" min="0" step="1" value="18" oninput="updateInvoicePadPreview(); saveInvoiceSetup();" class="mt-1 w-full px-3 py-2 rounded-xl border border-slate-200 text-sm"></label>
+                <label class="block text-xs font-bold text-slate-700">Right Margin<input type="number" id="invoice-margin-right" min="0" step="1" value="18" oninput="updateInvoicePadPreview(); saveInvoiceSetup();" class="mt-1 w-full px-3 py-2 rounded-xl border border-slate-200 text-sm"></label>
+            </div>
+            <p class="text-[11px] text-slate-500 mt-2">Units: mm. <button type="button" onclick="saveInvoiceSetup()" class="ml-2 px-3 py-1 rounded-lg bg-slate-900 text-white font-bold">Save Invoice Setup</button></p>
+        </div>
+
+        <div id="invoice-pad-live-preview" class="invoice-pad-live-preview" aria-label="Invoice pad live preview">
+            <img class="invoice-pad-live-bg" src="/official-pad-background.jpg" alt="">
+            <div id="invoice-pad-live-safe" class="invoice-pad-live-safe">
+                <strong>TAHAM Official Pad</strong>
+                <span>Safe printable area</span>
+                <span id="invoice-pad-live-dims">58mm / 48mm / 18mm / 18mm</span>
+            </div>
+        </div>
+    </div>
+</section>
+
                 </div>
             </div>
         </div>
@@ -9450,7 +10070,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
 
             <!-- Modal Action Buttons -->
             <div class="flex gap-3 mt-6 pt-4 border-t border-slate-100 no-print">
-                <button onclick="window.print()" class="flex-1 py-3 rounded-xl bg-slate-900 hover:bg-slate-800 text-white font-bold flex items-center justify-center gap-2 shadow-md">
+                <button onclick="preparePrintPagination('#invoice-print-area'); window.print()" class="flex-1 py-3 rounded-xl bg-slate-900 hover:bg-slate-800 text-white font-bold flex items-center justify-center gap-2 shadow-md">
                     <i data-lucide="printer" class="w-4 h-4"></i>
                     <span>Print Invoice</span>
                 </button>
@@ -10195,6 +10815,8 @@ INDEX_HTML = r"""<!DOCTYPE html>
             });
             if (sectionName === 'access-control') renderAccessControl();
             if (sectionName === 'user-management') loadUsers();
+            if (sectionName === 'theme') renderThemeSelector();
+            if (sectionName === 'invoice-setup') renderInvoicePadSettings();
             if (window.lucide) lucide.createIcons();
         };
 
@@ -10403,9 +11025,196 @@ INDEX_HTML = r"""<!DOCTYPE html>
 
             applyTheme(storeSettings.theme || 'classic-pink');
             renderThemeSelector();
+            renderInvoicePadSettings();
             renderProducts();
         }
 
+        window.getInvoicePadUrl = function() {
+            const url = (typeof storeSettings !== 'undefined' && storeSettings.invoicePadUrl) || '/official-pad-background.jpg';
+            return String(url || '/official-pad-background.jpg');
+        };
+
+        window.insertPrintPadBackground = function(root) {
+            if (!root) return;
+            const padUrl = window.getInvoicePadUrl();
+            let bg = root.querySelector(':scope > .print-pad-background');
+            if (!bg) {
+                bg = document.createElement('img');
+                bg.className = 'print-pad-background';
+                bg.alt = '';
+                bg.setAttribute('aria-hidden', 'true');
+                root.insertBefore(bg, root.firstChild);
+            }
+            bg.src = padUrl;
+            return bg;
+        };
+
+        window.applyInvoicePadSettings = function() {
+            const padUrl = window.getInvoicePadUrl();
+            const rootStyle = document.documentElement.style;
+            const ss = (typeof storeSettings !== 'undefined' && storeSettings) ? storeSettings : {};
+            const top = `${Number(ss.invoiceMarginTop || 58)}mm`;
+            const bottom = `${Number(ss.invoiceMarginBottom || 48)}mm`;
+            const left = `${Number(ss.invoiceMarginLeft || 18)}mm`;
+            const right = `${Number(ss.invoiceMarginRight || 18)}mm`;
+            rootStyle.setProperty('--invoice-pad-image', `url("${padUrl}")`);
+            rootStyle.setProperty('--invoice-margin-top', top);
+            rootStyle.setProperty('--invoice-margin-bottom', bottom);
+            rootStyle.setProperty('--invoice-margin-left', left);
+            rootStyle.setProperty('--invoice-margin-right', right);
+            let dynamicPadStyle = document.getElementById('taham-dynamic-pad-style');
+            if (!dynamicPadStyle) {
+                dynamicPadStyle = document.createElement('style');
+                dynamicPadStyle.id = 'taham-dynamic-pad-style';
+                document.head.appendChild(dynamicPadStyle);
+            }
+            const safePadUrl = padUrl.replace(/["'`+"]/g, '%22');
+            dynamicPadStyle.textContent = `@media print { @page { background-image: url("'${safePadUrl}"") !important; background-size: cover !important; background-position: center !important; background-repeat: no-repeat !important; print-color-adjust: exact; -webkit-print-color-adjust: exact; } .print-pad { background-image: url("'${safePadUrl}"") !important; } .print-pad-background { src: url("'${safePadUrl}""); } }`;
+            document.querySelectorAll('.print-pad').forEach(pad => {
+                pad.style.setProperty('--invoice-pad-image', `url("${padUrl}")`);
+                pad.style.backgroundImage = `url("${padUrl}")`;
+                window.insertPrintPadBackground(pad);
+            });
+            return padUrl;
+        };
+
+        window.preparePrintPagination = function(selector) {
+            const root = document.querySelector(selector);
+            if (!root) return;
+            window.applyInvoicePadSettings();
+            window.insertPrintPadBackground(root);
+            root.querySelectorAll('.print-pad').forEach(pad => window.insertPrintPadBackground(pad));
+            root.querySelectorAll('table').forEach(table => {
+                table.style.breakInside = 'auto';
+                table.style.pageBreakInside = 'auto';
+            });
+            root.querySelectorAll('table tbody tr').forEach(tr => {
+                tr.style.breakInside = 'avoid';
+                tr.style.pageBreakInside = 'avoid';
+                tr.style.pageBreakAfter = 'auto';
+            });
+            root.querySelectorAll('table thead').forEach(thead => { thead.style.display = 'table-header-group'; });
+            root.querySelectorAll('table tfoot').forEach(tfoot => { tfoot.style.display = 'table-footer-group'; });
+            root.classList.add('print-pad-paginated');
+        };
+
+        window.updateInvoicePadPreview = function() {
+            const ss = (typeof storeSettings !== 'undefined' && storeSettings) ? storeSettings : {};
+            const read = (id, fallback) => {
+                const el = document.getElementById(id);
+                const n = parseFloat(el ? el.value : ss[id]);
+                return Number.isFinite(n) && n >= 0 ? n : fallback;
+            };
+            const top = read('invoice-margin-top', Number(ss.invoiceMarginTop || 58));
+            const bottom = read('invoice-margin-bottom', Number(ss.invoiceMarginBottom || 48));
+            const left = read('invoice-margin-left', Number(ss.invoiceMarginLeft || 18));
+            const right = read('invoice-margin-right', Number(ss.invoiceMarginRight || 18));
+            const padUrl = window.getInvoicePadUrl();
+            const unit = (ss.invoiceMarginUnit || 'mm');
+
+            ['document', 'invoice-pad-live-preview'].forEach(() => {});
+            const setVar = (name, value) => document.documentElement.style.setProperty(name, value);
+            setVar('--invoice-margin-top', `${top}${unit}`);
+            setVar('--invoice-margin-bottom', `${bottom}${unit}`);
+            setVar('--invoice-margin-left', `${left}${unit}`);
+            setVar('--invoice-margin-right', `${right}${unit}`);
+
+            const preview = document.getElementById('invoice-pad-live-preview');
+            const safe = document.getElementById('invoice-pad-live-safe');
+            const bg = document.querySelector('.invoice-pad-live-bg');
+            const dims = document.getElementById('invoice-pad-live-dims');
+            const padImg = document.getElementById('invoice-pad-preview');
+            const urlText = document.getElementById('invoice-pad-url');
+            if (preview) preview.style.setProperty('--invoice-pad-image', `url("${padUrl}")`);
+            if (safe) {
+                safe.style.top = `${top}${unit}`;
+                safe.style.bottom = `${bottom}${unit}`;
+                safe.style.left = `${left}${unit}`;
+                safe.style.right = `${right}${unit}`;
+            }
+            if (bg) bg.src = padUrl;
+            if (padImg) padImg.src = padUrl;
+            if (urlText) urlText.innerText = padUrl;
+            if (dims) dims.innerText = `${top}${unit} / ${bottom}${unit} / ${left}${unit} / ${right}${unit}`;
+            window.applyInvoicePadSettings();
+        };
+
+        window.renderInvoicePadSettings = function() {
+            const ss = (typeof storeSettings !== 'undefined' && storeSettings) ? storeSettings : {};
+            const setValue = (id, value) => { const el = document.getElementById(id); if (el) el.value = value == null ? '' : value; };
+            setValue('invoice-margin-top', ss.invoiceMarginTop != null ? ss.invoiceMarginTop : 58);
+            setValue('invoice-margin-bottom', ss.invoiceMarginBottom != null ? ss.invoiceMarginBottom : 48);
+            setValue('invoice-margin-left', ss.invoiceMarginLeft != null ? ss.invoiceMarginLeft : 18);
+            setValue('invoice-margin-right', ss.invoiceMarginRight != null ? ss.invoiceMarginRight : 18);
+            const padImg = document.getElementById('invoice-pad-preview');
+            const bg = document.querySelector('.invoice-pad-live-bg');
+            const urlText = document.getElementById('invoice-pad-url');
+            if (padImg) padImg.src = window.getInvoicePadUrl();
+            if (bg) bg.src = window.getInvoicePadUrl();
+            if (urlText) urlText.innerText = window.getInvoicePadUrl();
+            window.updateInvoicePadPreview();
+        };
+
+        window.saveInvoiceSetup = async function() {
+            const ss = (typeof storeSettings !== 'undefined' && storeSettings) ? storeSettings : {};
+            const num = (id, fallback) => {
+                const el = document.getElementById(id);
+                const n = parseFloat(el ? el.value : fallback);
+                return Number.isFinite(n) && n >= 0 ? String(Math.round(n * 100) / 100) : String(fallback);
+            };
+            const payload = Object.assign({}, ss, {
+                invoiceMarginTop: num('invoice-margin-top', ss.invoiceMarginTop || 58),
+                invoiceMarginBottom: num('invoice-margin-bottom', ss.invoiceMarginBottom || 48),
+                invoiceMarginLeft: num('invoice-margin-left', ss.invoiceMarginLeft || 18),
+                invoiceMarginRight: num('invoice-margin-right', ss.invoiceMarginRight || 18),
+                invoiceMarginUnit: ss.invoiceMarginUnit || 'mm'
+            });
+            if (typeof storeSettings !== 'undefined') Object.assign(storeSettings, payload);
+            try {
+                if (typeof api === 'function') await api('PUT', '/api/settings/store_config', payload);
+                window.applyInvoicePadSettings();
+                window.updateInvoicePadPreview();
+            } catch (err) {
+                if (typeof showToast === 'function') showToast(err.message || 'Could not save invoice setup.', 'error');
+            }
+        };
+
+        window.uploadInvoicePad = async function() {
+            const input = document.getElementById('invoice-pad-upload');
+            if (!input || !input.files || !input.files[0]) {
+                if (typeof showToast === 'function') showToast('Please choose an image file.', 'error');
+                return;
+            }
+            const file = input.files[0];
+            if (!file.type.startsWith('image/')) {
+                if (typeof showToast === 'function') showToast('Please choose an image file.', 'error');
+                return;
+            }
+            if (file.size > 8 * 1024 * 1024) {
+                if (typeof showToast === 'function') showToast('Image must be smaller than 8 MB.', 'error');
+                return;
+            }
+            const dataUrl = await new Promise((resolve, reject) => {
+                const reader = new FileReader();
+                reader.onload = () => resolve(reader.result);
+                reader.onerror = () => reject(new Error('Could not read the image file.'));
+                reader.readAsDataURL(file);
+            });
+            try {
+                const result = await api('POST', '/api/invoice-pad', { dataUrl, filename: file.name });
+                const padUrl = result.padUrl || result.invoicePadUrl || '/invoice-pad-background.jpg';
+                if (typeof storeSettings !== 'undefined') {
+                    storeSettings.invoicePadUrl = padUrl;
+                    storeSettings.invoicePadFilename = file.name;
+                }
+                await api('PUT', '/api/settings/store_config', Object.assign({}, storeSettings, { invoicePadUrl: padUrl, invoicePadFilename: file.name }));
+                window.applyInvoicePadSettings();
+                window.renderInvoicePadSettings();
+                if (typeof showToast === 'function') showToast('Invoice pad uploaded and applied.');
+            } catch (err) {
+                if (typeof showToast === 'function') showToast(err.message || 'Could not upload invoice pad.', 'error');
+            }
+        };
         function updatePendingBadge() {
             const pendingCount = orders.filter(o => o.status === 'Pending').length;
             const badge = document.getElementById('pending-orders-badge');
@@ -11084,6 +11893,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
             setText('inv-due', money(due));
 
             document.getElementById('invoice-modal').classList.remove('hidden');
+            if (window.applyInvoicePadSettings) window.applyInvoicePadSettings();
             lucide.createIcons();
         };
 
@@ -11303,6 +12113,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
                         </tbody>
                     </table>`;
             }
+            if (window.applyInvoicePadSettings) window.applyInvoicePadSettings();
             if (window.lucide) lucide.createIcons();
         };
 
@@ -11336,6 +12147,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
             document.body.classList.add('printing-report');
             const cleanup = () => document.body.classList.remove('printing-report');
             window.addEventListener('afterprint', cleanup, { once: true });
+            window.preparePrintPagination('#report-print-area');
             window.print();
             setTimeout(cleanup, 1000);
         };
