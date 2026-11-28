@@ -119,6 +119,13 @@ app = Flask(__name__, static_folder=None)
 
 
 def _load_secret():
+    configured_secret = (os.environ.get("SESSION_SECRET") or "").strip()
+    if configured_secret:
+        if len(configured_secret) < 32:
+            raise RuntimeError("SESSION_SECRET must be at least 32 characters long.")
+        return configured_secret
+    if os.environ.get("VERCEL") or os.environ.get("VERCEL_ENV"):
+        raise RuntimeError("SESSION_SECRET must be configured for Vercel deployments.")
     if not os.path.exists(SECRET_PATH):
         with open(SECRET_PATH, "w") as f:
             f.write(secrets.token_hex(32))
@@ -129,10 +136,15 @@ def _load_secret():
 app.secret_key = _load_secret()
 app.config.update(
     SESSION_COOKIE_HTTPONLY=True,
-    SESSION_COOKIE_SAMESITE="Lax",
-    SESSION_COOKIE_SECURE=bool(os.environ.get("VERCEL") or os.environ.get("SESSION_COOKIE_SECURE") == "1"),
+    SESSION_COOKIE_SECURE=(
+        bool(os.environ.get("VERCEL") or os.environ.get("VERCEL_ENV"))
+        or os.environ.get("SESSION_COOKIE_SECURE", "").strip().lower() in ("1", "true", "yes", "on")
+    ),
+    SESSION_COOKIE_PATH="/",
+    SESSION_COOKIE_SAMESITE=os.environ.get("SESSION_COOKIE_SAMESITE", "Lax"),
     SESSION_COOKIE_NAME="taham_session",
     PERMANENT_SESSION_LIFETIME=timedelta(hours=12),
+    SESSION_REFRESH_EACH_REQUEST=True,
     MAX_CONTENT_LENGTH=24 * 1024 * 1024,
 )
 
@@ -2518,8 +2530,8 @@ INDEX_HTML = r"""<!DOCTYPE html>
             }
             .no-print { display: none !important; }
         }
-            /* Reports screen stays clean; letterhead exists only in print. */
-        .print-pad-background { display: none !important; }
+            /* Single letterhead pad layer (screen + print). */
+        .print-pad-background { display: block; }
 
         @media print {
             @page {
@@ -4167,7 +4179,10 @@ INDEX_HTML = r"""<!DOCTYPE html>
             let data = null;
             try { data = await res.json(); } catch (e) { /* empty body */ }
             if (!res.ok) {
-                if (res.status === 401 && isAdminAuthenticated && url !== '/api/login') sessionExpired();
+                if (res.status === 401 && isAdminAuthenticated && url !== '/api/login' && !window.__sessionExpiredSuppress) {
+                    const stillAdmin = await checkAdminSession();
+                    if (stillAdmin === false && !window.__sessionExpiredSuppress) sessionExpired();
+                }
                 const err = new Error((data && data.error) || 'Something went wrong on the server');
                 err.status = res.status;
                 throw err;
@@ -4175,7 +4190,19 @@ INDEX_HTML = r"""<!DOCTYPE html>
             return data;
         }
 
+        async function checkAdminSession() {
+            try {
+                const res = await fetch('/api/me', { credentials: 'same-origin', cache: 'no-store' });
+                if (!res.ok) return null;
+                const data = await res.json();
+                return typeof data.admin === 'boolean' ? data.admin : null;
+            } catch (e) {
+                return null;
+            }
+        }
+
         function sessionExpired() {
+            if (window.__sessionExpiredSuppress || !isAdminAuthenticated) return;
             isAdminAuthenticated = false;
             document.getElementById('admin-logout-btn').classList.add('hidden');
             showToast('Session expired, please log in again.', 'error');
@@ -4693,12 +4720,53 @@ INDEX_HTML = r"""<!DOCTYPE html>
                 dynamicPadStyle.id = 'taham-dynamic-pad-style';
                 document.head.appendChild(dynamicPadStyle);
             }
-            const safePadUrl = String(padUrl).replace(/[\x22\x27`\x5c]/g, '%22');
-            dynamicPadStyle.textContent = `@media print {
-                @page { background-image: url("${safePadUrl}") !important; background-size: cover !important; background-position: center !important; background-repeat: no-repeat !important; print-color-adjust: exact; -webkit-print-color-adjust: exact; }
-                .print-pad { background-image: url("${safePadUrl}") !important; }
-                .print-pad-background { visibility: visible !important; }
-            }`;
+            // Escape characters that could break out of a CSS url("...") token.
+            const safePadUrl = String(padUrl).replace(/["'`\\()]/g, encodeURIComponent);
+            const PAD_VARS = `--invoice-margin-top:${top};--invoice-margin-right:${right};--invoice-margin-bottom:${bottom};--invoice-margin-left:${left}`;
+            // SINGLE letterhead pad layer. Only `.print-pad-background` carries the pad image;
+            // `.print-pad`, `@page`, html/body and watermarks must NOT also paint it (no double pad).
+            const SINGLE_PAD_RESET = `
+    ${PAD_VARS};
+    position: relative !important;
+    box-sizing: border-box !important;
+    width: 210mm !important; max-width: 210mm !important;
+    min-height: 297mm !important; max-height: none !important; height: auto !important;
+    margin: 0 auto !important; border: 0 !important; border-radius: 0 !important; box-shadow: none !important;
+    background-color: transparent !important; background-image: none !important; background: transparent !important;
+    padding: ${top} ${right} ${bottom} ${left} !important;
+    overflow: visible !important;
+    -webkit-print-color-adjust: exact !important; print-color-adjust: exact !important;
+`;
+            const SINGLE_PAD_BG = `
+    display: block !important; visibility: visible !important; opacity: 1 !important;
+    position: absolute !important; top: 0 !important; left: 0 !important; right: 0 !important; bottom: 0 !important;
+    inset: 0 !important; width: 100% !important; height: 100% !important; margin: 0 !important; padding: 0 !important; border: 0 !important;
+    background-image: none !important; background: none !important;
+    object-fit: cover !important; object-position: center center !important; z-index: 0 !important; pointer-events: none !important;
+    -webkit-print-color-adjust: exact !important; print-color-adjust: exact !important;
+`;
+            dynamicPadStyle.textContent = `
+@media print { @page { size: A4 portrait; margin: 0; background-image: none !important; background: none !important; } }
+@media screen {
+  .print-pad, .print-pad.print-pad, #invoice-print-area.print-pad, #report-print-area.print-pad, #invoice-print-area, #report-print-area { background-image: none !important; background: transparent !important; }
+  .print-pad-background { display: block !important; }
+}
+@media print {
+  html, body { margin: 0 !important; padding: 0 !important; background: transparent !important; background-image: none !important; -webkit-print-color-adjust: exact !important; print-color-adjust: exact !important; }
+  .print-pad, .print-pad.print-pad, #invoice-print-area.print-pad, #report-print-area.print-pad, #invoice-print-area, #report-print-area { ${SINGLE_PAD_RESET} }
+  #invoice-print-area, #report-print-area { padding: ${top} ${right} ${bottom} ${left} !important; background-image: none !important; background: transparent !important; }
+  .print-pad-background { ${SINGLE_PAD_BG} }
+  .print-pad > :not(.print-pad-background) { position: relative; z-index: 1; }
+  /* proper page breaks + spacing inside pad boundaries on A4 */
+  .print-pad { page-break-inside: auto !important; break-inside: auto !important; }
+  table { page-break-inside: auto !important; break-inside: auto !important; }
+  thead { display: table-header-group !important; }
+  tfoot { display: table-footer-group !important; }
+  tr, .report-metrics-grid > *, .report-print-table tbody tr { page-break-inside: avoid !important; break-inside: avoid !important; }
+  .report-print-header, .report-orders-wrap, .invoice-totals, .invoice-payment-box, .invoice-signatures-footer { page-break-inside: avoid !important; break-inside: avoid !important; }
+  /* don't clip monthly/ daily content inside the pad */
+  .print-pad, #report-print-area, #invoice-print-area { overflow: visible !important; max-height: none !important; }
+}`;
             document.querySelectorAll('.print-pad').forEach(pad => {
                 pad.style.setProperty('--invoice-pad-image', `url("${padUrl}")`);
                 window.insertPrintPadBackground(pad);
@@ -4931,11 +4999,14 @@ INDEX_HTML = r"""<!DOCTYPE html>
                 document.getElementById('admin-logout-btn').classList.remove('hidden');
                 closeAdminLoginModal();
                 passwordEl.value = '';
+                window.__sessionExpiredSuppress = true;
                 try {
                     await window.__refreshAll();
                     await loadUsers();
                 } catch (refreshErr) {
                     console.warn('Login succeeded, but dashboard refresh failed:', refreshErr);
+                } finally {
+                    window.__sessionExpiredSuppress = false;
                 }
                 showToast('Welcome to the Super Admin panel!');
                 switchView('admin');
@@ -6702,6 +6773,13 @@ app = Flask(__name__, static_folder=None)
 
 
 def _load_secret():
+    configured_secret = (os.environ.get("SESSION_SECRET") or "").strip()
+    if configured_secret:
+        if len(configured_secret) < 32:
+            raise RuntimeError("SESSION_SECRET must be at least 32 characters long.")
+        return configured_secret
+    if os.environ.get("VERCEL") or os.environ.get("VERCEL_ENV"):
+        raise RuntimeError("SESSION_SECRET must be configured for Vercel deployments.")
     if not os.path.exists(SECRET_PATH):
         with open(SECRET_PATH, "w") as f:
             f.write(secrets.token_hex(32))
@@ -6712,10 +6790,15 @@ def _load_secret():
 app.secret_key = _load_secret()
 app.config.update(
     SESSION_COOKIE_HTTPONLY=True,
-    SESSION_COOKIE_SAMESITE="Lax",
-    SESSION_COOKIE_SECURE=bool(os.environ.get("VERCEL") or os.environ.get("SESSION_COOKIE_SECURE") == "1"),
+    SESSION_COOKIE_SECURE=(
+        bool(os.environ.get("VERCEL") or os.environ.get("VERCEL_ENV"))
+        or os.environ.get("SESSION_COOKIE_SECURE", "").strip().lower() in ("1", "true", "yes", "on")
+    ),
+    SESSION_COOKIE_PATH="/",
+    SESSION_COOKIE_SAMESITE=os.environ.get("SESSION_COOKIE_SAMESITE", "Lax"),
     SESSION_COOKIE_NAME="taham_session",
     PERMANENT_SESSION_LIFETIME=timedelta(hours=12),
+    SESSION_REFRESH_EACH_REQUEST=True,
     MAX_CONTENT_LENGTH=24 * 1024 * 1024,
 )
 
@@ -9101,8 +9184,8 @@ INDEX_HTML = r"""<!DOCTYPE html>
             }
             .no-print { display: none !important; }
         }
-            /* Reports screen stays clean; letterhead exists only in print. */
-        .print-pad-background { display: none !important; }
+            /* Single letterhead pad layer (screen + print). */
+        .print-pad-background { display: block; }
 
         @media print {
             @page {
@@ -10796,7 +10879,10 @@ INDEX_HTML = r"""<!DOCTYPE html>
             let data = null;
             try { data = await res.json(); } catch (e) { /* empty body */ }
             if (!res.ok) {
-                if (res.status === 401 && isAdminAuthenticated && url !== '/api/login') sessionExpired();
+                if (res.status === 401 && isAdminAuthenticated && url !== '/api/login' && !window.__sessionExpiredSuppress) {
+                    const stillAdmin = await checkAdminSession();
+                    if (stillAdmin === false && !window.__sessionExpiredSuppress) sessionExpired();
+                }
                 const err = new Error((data && data.error) || 'Something went wrong on the server');
                 err.status = res.status;
                 throw err;
@@ -10804,7 +10890,19 @@ INDEX_HTML = r"""<!DOCTYPE html>
             return data;
         }
 
+        async function checkAdminSession() {
+            try {
+                const res = await fetch('/api/me', { credentials: 'same-origin', cache: 'no-store' });
+                if (!res.ok) return null;
+                const data = await res.json();
+                return typeof data.admin === 'boolean' ? data.admin : null;
+            } catch (e) {
+                return null;
+            }
+        }
+
         function sessionExpired() {
+            if (window.__sessionExpiredSuppress || !isAdminAuthenticated) return;
             isAdminAuthenticated = false;
             document.getElementById('admin-logout-btn').classList.add('hidden');
             showToast('Session expired, please log in again.', 'error');
@@ -11322,8 +11420,53 @@ INDEX_HTML = r"""<!DOCTYPE html>
                 dynamicPadStyle.id = 'taham-dynamic-pad-style';
                 document.head.appendChild(dynamicPadStyle);
             }
-            const safePadUrl = padUrl.replace(/["'`+"]/g, '%22');
-            dynamicPadStyle.textContent = `@media print { @page { background-image: url("${safePadUrl}") !important; background-size: 100% 100% !important; background-position: 0 0 !important; background-repeat: no-repeat !important; print-color-adjust: exact; -webkit-print-color-adjust: exact; } .print-pad { background-image: url("${safePadUrl}") !important; } .print-pad-background { visibility: visible !important; } }`;
+            // Escape characters that could break out of a CSS url("...") token.
+            const safePadUrl = String(padUrl).replace(/["'`\\()]/g, encodeURIComponent);
+            const PAD_VARS = `--invoice-margin-top:${top};--invoice-margin-right:${right};--invoice-margin-bottom:${bottom};--invoice-margin-left:${left}`;
+            // SINGLE letterhead pad layer. Only `.print-pad-background` carries the pad image;
+            // `.print-pad`, `@page`, html/body and watermarks must NOT also paint it (no double pad).
+            const SINGLE_PAD_RESET = `
+    ${PAD_VARS};
+    position: relative !important;
+    box-sizing: border-box !important;
+    width: 210mm !important; max-width: 210mm !important;
+    min-height: 297mm !important; max-height: none !important; height: auto !important;
+    margin: 0 auto !important; border: 0 !important; border-radius: 0 !important; box-shadow: none !important;
+    background-color: transparent !important; background-image: none !important; background: transparent !important;
+    padding: ${top} ${right} ${bottom} ${left} !important;
+    overflow: visible !important;
+    -webkit-print-color-adjust: exact !important; print-color-adjust: exact !important;
+`;
+            const SINGLE_PAD_BG = `
+    display: block !important; visibility: visible !important; opacity: 1 !important;
+    position: absolute !important; top: 0 !important; left: 0 !important; right: 0 !important; bottom: 0 !important;
+    inset: 0 !important; width: 100% !important; height: 100% !important; margin: 0 !important; padding: 0 !important; border: 0 !important;
+    background-image: none !important; background: none !important;
+    object-fit: cover !important; object-position: center center !important; z-index: 0 !important; pointer-events: none !important;
+    -webkit-print-color-adjust: exact !important; print-color-adjust: exact !important;
+`;
+            dynamicPadStyle.textContent = `
+@media print { @page { size: A4 portrait; margin: 0; background-image: none !important; background: none !important; } }
+@media screen {
+  .print-pad, .print-pad.print-pad, #invoice-print-area.print-pad, #report-print-area.print-pad, #invoice-print-area, #report-print-area { background-image: none !important; background: transparent !important; }
+  .print-pad-background { display: block !important; }
+}
+@media print {
+  html, body { margin: 0 !important; padding: 0 !important; background: transparent !important; background-image: none !important; -webkit-print-color-adjust: exact !important; print-color-adjust: exact !important; }
+  .print-pad, .print-pad.print-pad, #invoice-print-area.print-pad, #report-print-area.print-pad, #invoice-print-area, #report-print-area { ${SINGLE_PAD_RESET} }
+  #invoice-print-area, #report-print-area { padding: ${top} ${right} ${bottom} ${left} !important; background-image: none !important; background: transparent !important; }
+  .print-pad-background { ${SINGLE_PAD_BG} }
+  .print-pad > :not(.print-pad-background) { position: relative; z-index: 1; }
+  /* proper page breaks + spacing inside pad boundaries on A4 */
+  .print-pad { page-break-inside: auto !important; break-inside: auto !important; }
+  table { page-break-inside: auto !important; break-inside: auto !important; }
+  thead { display: table-header-group !important; }
+  tfoot { display: table-footer-group !important; }
+  tr, .report-metrics-grid > *, .report-print-table tbody tr { page-break-inside: avoid !important; break-inside: avoid !important; }
+  .report-print-header, .report-orders-wrap, .invoice-totals, .invoice-payment-box, .invoice-signatures-footer { page-break-inside: avoid !important; break-inside: avoid !important; }
+  /* don't clip monthly/ daily content inside the pad */
+  .print-pad, #report-print-area, #invoice-print-area { overflow: visible !important; max-height: none !important; }
+}`;
             document.querySelectorAll('.print-pad').forEach(pad => {
                 pad.style.setProperty('--invoice-pad-image', `url("${padUrl}")`);
                 window.insertPrintPadBackground(pad);
@@ -11556,11 +11699,14 @@ INDEX_HTML = r"""<!DOCTYPE html>
                 document.getElementById('admin-logout-btn').classList.remove('hidden');
                 closeAdminLoginModal();
                 passwordEl.value = '';
+                window.__sessionExpiredSuppress = true;
                 try {
                     await window.__refreshAll();
                     await loadUsers();
                 } catch (refreshErr) {
                     console.warn('Login succeeded, but dashboard refresh failed:', refreshErr);
+                } finally {
+                    window.__sessionExpiredSuppress = false;
                 }
                 showToast('Welcome to the Super Admin panel!');
                 switchView('admin');

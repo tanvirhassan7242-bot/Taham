@@ -19,3 +19,10 @@ to get the new English sample data (or keep it - your old products keep working)
 
 Optional:  PORT=8000 python app.py     HOST=0.0.0.0 python app.py (open to your Wi-Fi)
 Note: Tailwind CSS / icons / Google Fonts load from the internet.
+
+Vercel login sessions:
+Set SESSION_SECRET (at least 32 characters) in Vercel Project Settings > Environment Variables
+for every deployed environment. Use the same strong random value across all instances in
+that environment; do not rely on secret.key under Vercel's temporary /tmp directory.
+The app will not start on Vercel without SESSION_SECRET. Changing it invalidates existing
+login cookies. Local runs continue to use the persistent secret.key file.
