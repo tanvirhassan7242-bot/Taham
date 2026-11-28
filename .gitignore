@@ -1,0 +1,19 @@
+# Private data - NEVER commit these
+secret.key
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+uploads/
+.env
+.env.local
+.vercel/
+
+# Python / editor
+__pycache__/
+*.pyc
+venv/
+.venv/
+.idea/
+.vscode/
+.DS_Store
