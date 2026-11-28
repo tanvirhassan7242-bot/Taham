@@ -2518,7 +2518,124 @@ INDEX_HTML = r"""<!DOCTYPE html>
             }
             .no-print { display: none !important; }
         }
-    </style>
+            /* Reports screen stays clean; letterhead exists only in print. */
+        .print-pad-background { display: none !important; }
+
+        @media print {
+            @page {
+                size: A4 portrait;
+                margin: 0;
+                width: 210mm;
+                height: 297mm;
+                background-image: url("/official-pad-background.jpg");
+                background-size: 100% 100%;
+                background-position: 0 0;
+                background-repeat: no-repeat;
+                print-color-adjust: exact;
+                -webkit-print-color-adjust: exact;
+            }
+
+            html, body {
+                width: 210mm !important;
+                min-height: 297mm !important;
+                margin: 0 !important;
+                padding: 0 !important;
+                background: transparent !important;
+            }
+
+            body * { visibility: hidden !important; }
+
+            #report-print-area,
+            #report-print-area *,
+            #invoice-print-area,
+            #invoice-print-area *,
+            .print-pad,
+            .print-pad *,
+            .print-pad-background {
+                visibility: visible !important;
+            }
+
+            .print-pad {
+                display: block !important;
+                position: relative !important;
+                z-index: 1 !important;
+                width: 210mm !important;
+                height: 297mm !important;
+                min-height: 297mm !important;
+                max-width: 210mm !important;
+                max-height: none !important;
+                margin: 0 !important;
+                padding: var(--invoice-margin-top, 58mm) var(--invoice-margin-right, 18mm) var(--invoice-margin-bottom, 48mm) var(--invoice-margin-left, 18mm) !important;
+                box-sizing: border-box !important;
+                overflow: visible !important;
+                border: 0 !important;
+                border-radius: 0 !important;
+                box-shadow: none !important;
+                color: #172033 !important;
+                background-color: transparent !important;
+                background-image: var(--invoice-pad-image, url("/official-pad-background.jpg")) !important;
+                background-size: 100% 100% !important;
+                background-position: 0 0 !important;
+                background-repeat: no-repeat !important;
+                -webkit-print-color-adjust: exact !important;
+                print-color-adjust: exact !important;
+            }
+
+            #report-print-area.print-pad,
+            #invoice-print-area.print-pad {
+                position: relative !important;
+                inset: auto !important;
+                padding: var(--invoice-margin-top, 58mm) var(--invoice-margin-right, 18mm) var(--invoice-margin-bottom, 48mm) var(--invoice-margin-left, 18mm) !important;
+            }
+
+            .print-pad-background {
+                display: block !important;
+                position: absolute !important;
+                top: 0 !important;
+                right: 0 !important;
+                bottom: 0 !important;
+                left: 0 !important;
+                width: 100% !important;
+                height: 100% !important;
+                max-width: none !important;
+                max-height: none !important;
+                min-width: 0 !important;
+                min-height: 0 !important;
+                margin: 0 !important;
+                padding: 0 !important;
+                border: 0 !important;
+                transform: none !important;
+                object-fit: cover !important;
+                object-position: center center !important;
+                background-size: 100% 100% !important;
+                z-index: 0 !important;
+                visibility: visible !important;
+                opacity: 1 !important;
+                pointer-events: none !important;
+                -webkit-print-color-adjust: exact !important;
+                print-color-adjust: exact !important;
+            }
+
+            .print-pad > :not(.print-pad-background) {
+                position: relative;
+                z-index: 2 !important;
+                visibility: visible !important;
+            }
+
+            .report-print-header,
+            .report-metrics-grid,
+            .report-orders-wrap,
+            .report-print-table,
+            .report-print-table *,
+            .invoice-table,
+            .invoice-table * {
+                visibility: visible !important;
+                opacity: 1 !important;
+            }
+
+            .no-print { display: none !important; }
+        }
+</style>
 </head>
 <body class="bg-slate-50 text-slate-800 font-sans antialiased selection:bg-brand-500 selection:text-white">
 
@@ -4584,7 +4701,6 @@ INDEX_HTML = r"""<!DOCTYPE html>
             }`;
             document.querySelectorAll('.print-pad').forEach(pad => {
                 pad.style.setProperty('--invoice-pad-image', `url("${padUrl}")`);
-                pad.style.backgroundImage = `url("${padUrl}")`;
                 window.insertPrintPadBackground(pad);
             });
             return padUrl;
@@ -8985,7 +9101,124 @@ INDEX_HTML = r"""<!DOCTYPE html>
             }
             .no-print { display: none !important; }
         }
-    </style>
+            /* Reports screen stays clean; letterhead exists only in print. */
+        .print-pad-background { display: none !important; }
+
+        @media print {
+            @page {
+                size: A4 portrait;
+                margin: 0;
+                width: 210mm;
+                height: 297mm;
+                background-image: url("/official-pad-background.jpg");
+                background-size: 100% 100%;
+                background-position: 0 0;
+                background-repeat: no-repeat;
+                print-color-adjust: exact;
+                -webkit-print-color-adjust: exact;
+            }
+
+            html, body {
+                width: 210mm !important;
+                min-height: 297mm !important;
+                margin: 0 !important;
+                padding: 0 !important;
+                background: transparent !important;
+            }
+
+            body * { visibility: hidden !important; }
+
+            #report-print-area,
+            #report-print-area *,
+            #invoice-print-area,
+            #invoice-print-area *,
+            .print-pad,
+            .print-pad *,
+            .print-pad-background {
+                visibility: visible !important;
+            }
+
+            .print-pad {
+                display: block !important;
+                position: relative !important;
+                z-index: 1 !important;
+                width: 210mm !important;
+                height: 297mm !important;
+                min-height: 297mm !important;
+                max-width: 210mm !important;
+                max-height: none !important;
+                margin: 0 !important;
+                padding: var(--invoice-margin-top, 58mm) var(--invoice-margin-right, 18mm) var(--invoice-margin-bottom, 48mm) var(--invoice-margin-left, 18mm) !important;
+                box-sizing: border-box !important;
+                overflow: visible !important;
+                border: 0 !important;
+                border-radius: 0 !important;
+                box-shadow: none !important;
+                color: #172033 !important;
+                background-color: transparent !important;
+                background-image: var(--invoice-pad-image, url("/official-pad-background.jpg")) !important;
+                background-size: 100% 100% !important;
+                background-position: 0 0 !important;
+                background-repeat: no-repeat !important;
+                -webkit-print-color-adjust: exact !important;
+                print-color-adjust: exact !important;
+            }
+
+            #report-print-area.print-pad,
+            #invoice-print-area.print-pad {
+                position: relative !important;
+                inset: auto !important;
+                padding: var(--invoice-margin-top, 58mm) var(--invoice-margin-right, 18mm) var(--invoice-margin-bottom, 48mm) var(--invoice-margin-left, 18mm) !important;
+            }
+
+            .print-pad-background {
+                display: block !important;
+                position: absolute !important;
+                top: 0 !important;
+                right: 0 !important;
+                bottom: 0 !important;
+                left: 0 !important;
+                width: 100% !important;
+                height: 100% !important;
+                max-width: none !important;
+                max-height: none !important;
+                min-width: 0 !important;
+                min-height: 0 !important;
+                margin: 0 !important;
+                padding: 0 !important;
+                border: 0 !important;
+                transform: none !important;
+                object-fit: cover !important;
+                object-position: center center !important;
+                background-size: 100% 100% !important;
+                z-index: 0 !important;
+                visibility: visible !important;
+                opacity: 1 !important;
+                pointer-events: none !important;
+                -webkit-print-color-adjust: exact !important;
+                print-color-adjust: exact !important;
+            }
+
+            .print-pad > :not(.print-pad-background) {
+                position: relative;
+                z-index: 2 !important;
+                visibility: visible !important;
+            }
+
+            .report-print-header,
+            .report-metrics-grid,
+            .report-orders-wrap,
+            .report-print-table,
+            .report-print-table *,
+            .invoice-table,
+            .invoice-table * {
+                visibility: visible !important;
+                opacity: 1 !important;
+            }
+
+            .no-print { display: none !important; }
+        }
+</style>
 </head>
 <body class="bg-slate-50 text-slate-800 font-sans antialiased selection:bg-brand-500 selection:text-white">
 
@@ -11090,10 +11323,9 @@ INDEX_HTML = r"""<!DOCTYPE html>
                 document.head.appendChild(dynamicPadStyle);
             }
             const safePadUrl = padUrl.replace(/["'`+"]/g, '%22');
-            dynamicPadStyle.textContent = `@media print { @page { background-image: url("'${safePadUrl}"") !important; background-size: cover !important; background-position: center !important; background-repeat: no-repeat !important; print-color-adjust: exact; -webkit-print-color-adjust: exact; } .print-pad { background-image: url("'${safePadUrl}"") !important; } .print-pad-background { src: url("'${safePadUrl}""); } }`;
+            dynamicPadStyle.textContent = `@media print { @page { background-image: url("${safePadUrl}") !important; background-size: 100% 100% !important; background-position: 0 0 !important; background-repeat: no-repeat !important; print-color-adjust: exact; -webkit-print-color-adjust: exact; } .print-pad { background-image: url("${safePadUrl}") !important; } .print-pad-background { visibility: visible !important; } }`;
             document.querySelectorAll('.print-pad').forEach(pad => {
                 pad.style.setProperty('--invoice-pad-image', `url("${padUrl}")`);
-                pad.style.backgroundImage = `url("${padUrl}")`;
                 window.insertPrintPadBackground(pad);
             });
             return padUrl;
