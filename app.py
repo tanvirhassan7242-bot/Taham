@@ -13369,3 +13369,13375 @@ if __name__ == "__main__":
     if os.environ.get("NO_BROWSER") != "1":
         threading.Timer(1.2, lambda: webbrowser.open(url)).start()
     app.run(host=HOST, port=port, debug=False, threaded=True)
+
+"""
+Taham Store  -  Flask + SQLite  (single file: backend + whole website)
+----------------------------------------------------------------------
+Run:      python app.py          ->  http://localhost:5000   (browser opens automatically)
+Admin:    "Super Admin" button   (default login: see DEFAULT_ADMIN_* below, change it in Admin > Settings)
+
+Everything is inside this ONE file:
+  * the server / database / business logic (prices, stock, order status, login)
+  * the full web page (INDEX_HTML at the bottom of this file)
+
+Data is saved in taham.db (next to this file). Delete taham.db to start from scratch.
+Optional env vars:  PORT=8000   HOST=0.0.0.0 (open to your Wi-Fi)   NO_BROWSER=1   TAHAM_DB=path/to/file.db
+"""
+import json
+import os
+import socket
+import subprocess
+import sys
+import random
+import secrets
+import sqlite3
+import threading
+import time
+import webbrowser
+from datetime import datetime, timedelta
+from functools import wraps
+
+import base64
+import re
+from functools import lru_cache
+from urllib.parse import quote
+from xml.sax.saxutils import escape as xml_escape
+
+try:
+    from flask import Flask, Response, g, jsonify, request, session
+except ImportError:                                   # first run: install Flask automatically
+    print("Flask paoa jayni, install kora hocche... (pip install Flask)")
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "Flask>=3.0"])
+    from flask import Flask, Response, g, jsonify, request, session
+from werkzeug.security import check_password_hash, generate_password_hash
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DEFAULT_DB_PATH = os.path.join("/tmp" if os.environ.get("VERCEL") else BASE_DIR, "taham.db")
+DB_PATH = os.environ.get("TAHAM_DB", DEFAULT_DB_PATH)
+SECRET_PATH = os.path.join(os.path.dirname(DB_PATH), "secret.key")
+if os.path.dirname(DB_PATH):
+    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+HOST = os.environ.get("HOST", "127.0.0.1")   # set HOST=0.0.0.0 to open it to your Wi-Fi/LAN
+PORT = int(os.environ.get("PORT", "5000"))
+
+# ======================= EASY SETTINGS (edit here) =======================
+DEFAULT_ADMIN_USER = os.environ.get("TAHAM_ADMIN_USER", "taham@1234")      # used only the FIRST time (when taham.db is created)
+DEFAULT_ADMIN_PASS = os.environ.get("TAHAM_ADMIN_PASS", "taham@1234")      # change it later from Admin > Settings
+DEFAULT_SETTINGS = {
+    "shopName": "Taham",
+    "pageName": "Taham",
+    "theme": "classic-pink",
+    "shopPhone": "01400-570014",
+    "paymentNumber": "01400-570014",
+    "shopAddress": "Rayerbag, Dhaka, Bangladesh.",
+    "showStockToCustomers": True,
+    "invoicePadUrl": "/official-pad-background.jpg",
+    "invoicePadFilename": "official_pad_background.jpg",
+    "invoiceMarginTop": "58",
+    "invoiceMarginBottom": "48",
+    "invoiceMarginLeft": "18",
+    "invoiceMarginRight": "18",
+    "invoiceMarginUnit": "mm",
+}
+DELIVERY_OPTIONS = (60, 120)           # Dhaka / outside Dhaka (must match the radio buttons)
+PAYMENT_METHODS = ("Cash on Delivery", "bKash", "Nagad")
+ORDER_STATUSES = ("Pending", "Processing", "Delivered", "Cancelled")
+SIZES = ("S", "M", "L", "XL")
+DEFAULT_PRODUCTS = [{'name': 'Premium Embroidered Cotton Panjabi',
+  'category': 'Panjabi',
+  'buyingPrice': 950,
+  'price': 1550,
+  'stock': 25,
+  'image': '/placeholder.svg?w=600&h=700&bg=1e293b&text=Premium+Cotton+Panjabi',
+  'desc': '100% pure cotton Panjabi with fine hand-embroidered detailing.'},
+ {'name': 'Traditional Dhakai Jamdani Saree',
+  'category': 'Saree',
+  'buyingPrice': 2100,
+  'price': 3200,
+  'stock': 12,
+  'image': '/placeholder.svg?w=600&h=700&bg=9d174d&text=Dhakai+Jamdani+Saree',
+  'desc': 'An elegant Dhakai Jamdani saree for festivals and parties (blouse piece included).'},
+ {'name': 'Luxury Boutique Lawn Three-Piece',
+  'category': 'Salwar Kameez',
+  'buyingPrice': 1150,
+  'price': 1850,
+  'stock': 18,
+  'image': '/placeholder.svg?w=600&h=700&bg=0f766e&text=Boutique+Three+Piece',
+  'desc': 'Comfortable soft cotton orna with a designer salwar kameez set.'},
+ {'name': 'Men’s Casual Polo T-Shirt',
+  'category': 'T-Shirt',
+  'buyingPrice': 380,
+  'price': 650,
+  'stock': 40,
+  'image': '/placeholder.svg?w=600&h=700&bg=1d4ed8&text=Mens+Polo+T-Shirt',
+  'desc': 'Stylish polo T-shirt with colour guarantee, for everyday wear.'},
+ {'name': 'Kids’ Festive Panjabi Set',
+  'category': 'Kids',
+  'buyingPrice': 550,
+  'price': 950,
+  'stock': 4,
+  'image': '/placeholder.svg?w=600&h=700&bg=b45309&text=Kids+Festive+Set',
+  'desc': 'Soft cotton Panjabi and pajama set for little ones.'}]
+# =========================================================================
+
+# Windows consoles can choke on Bengali text; make printing safe
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
+app = Flask(__name__, static_folder=None)
+
+
+def _load_secret():
+    configured_secret = (os.environ.get("SESSION_SECRET") or "").strip()
+    if configured_secret:
+        if len(configured_secret) < 32:
+            raise RuntimeError("SESSION_SECRET must be at least 32 characters long.")
+        return configured_secret
+    if os.environ.get("VERCEL") or os.environ.get("VERCEL_ENV"):
+        raise RuntimeError("SESSION_SECRET must be configured for Vercel deployments.")
+    if not os.path.exists(SECRET_PATH):
+        with open(SECRET_PATH, "w") as f:
+            f.write(secrets.token_hex(32))
+    with open(SECRET_PATH) as f:
+        return f.read().strip()
+
+
+app.secret_key = _load_secret()
+app.config.update(
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SECURE=(
+        bool(os.environ.get("VERCEL") or os.environ.get("VERCEL_ENV"))
+        or os.environ.get("SESSION_COOKIE_SECURE", "").strip().lower() in ("1", "true", "yes", "on")
+    ),
+    SESSION_COOKIE_PATH="/",
+    SESSION_COOKIE_SAMESITE=os.environ.get("SESSION_COOKIE_SAMESITE", "Lax"),
+    SESSION_COOKIE_NAME="taham_session",
+    PERMANENT_SESSION_LIFETIME=timedelta(hours=12),
+    SESSION_REFRESH_EACH_REQUEST=True,
+    MAX_CONTENT_LENGTH=24 * 1024 * 1024,
+)
+
+# ----------------------------- database ---------------------------------
+
+
+def get_db():
+    if "db" not in g:
+        g.db = sqlite3.connect(DB_PATH, timeout=10, isolation_level=None)  # autocommit; BEGIN used where needed
+        g.db.row_factory = sqlite3.Row
+    return g.db
+
+
+@app.teardown_appcontext
+def close_db(_exc):
+    db = g.pop("db", None)
+    if db is not None:
+        db.close()
+
+
+def now_ms():
+    return int(time.time() * 1000)
+
+
+def init_db():
+    db = sqlite3.connect(DB_PATH, isolation_level=None)
+    db.execute("CREATE TABLE IF NOT EXISTS docs (col TEXT NOT NULL, id TEXT NOT NULL, data TEXT NOT NULL, "
+               "created INTEGER NOT NULL, PRIMARY KEY (col, id))")
+    db.execute("CREATE TABLE IF NOT EXISTS admin (id INTEGER PRIMARY KEY CHECK (id = 1), "
+               "username TEXT NOT NULL, pw_hash TEXT NOT NULL)")
+    if not db.execute("SELECT 1 FROM admin").fetchone():
+        db.execute("INSERT INTO admin VALUES (1, ?, ?)", (DEFAULT_ADMIN_USER, generate_password_hash(DEFAULT_ADMIN_PASS)))
+    if not db.execute("SELECT 1 FROM docs WHERE col='settings'").fetchone():
+        db.execute("INSERT INTO docs VALUES ('settings', 'store_config', ?, ?)",
+                   (json.dumps(DEFAULT_SETTINGS, ensure_ascii=False), now_ms()))
+    if not db.execute("SELECT 1 FROM docs WHERE col='products'").fetchone():
+        base = now_ms()
+        for i, p in enumerate(DEFAULT_PRODUCTS):
+            kind, val = DEFAULT_DISCOUNTS.get(i, ("none", 0))
+            p = dict(p, createdAt=base + i, discountType=kind, discountValue=val)
+            db.execute("INSERT INTO docs VALUES ('products', ?, ?, ?)",
+                       (secrets.token_hex(8), json.dumps(p, ensure_ascii=False), base + i))
+    if not db.execute("SELECT 1 FROM docs WHERE col='collections'").fetchone():
+        base = now_ms()
+        for i, c in enumerate(DEFAULT_COLLECTIONS):
+            c = dict(c, createdAt=base + i)
+            db.execute("INSERT INTO docs VALUES ('collections', ?, ?, ?)",
+                       (secrets.token_hex(8), json.dumps(c, ensure_ascii=False), base + i))
+    known = {json.loads(r[0]).get("name") for r in db.execute("SELECT data FROM docs WHERE col='collections'")}
+    for (data,) in db.execute("SELECT data FROM docs WHERE col='products'").fetchall():
+        cat = (json.loads(data).get("category") or "").strip()      # keep older products visible
+        if cat and cat not in known:
+            c = {"name": cat, "image": f"/placeholder.svg?w=600&h=750&text={quote(cat)}", "createdAt": now_ms()}
+            db.execute("INSERT INTO docs VALUES ('collections', ?, ?, ?)",
+                       (secrets.token_hex(8), json.dumps(c, ensure_ascii=False), now_ms()))
+            known.add(cat)
+    row = db.execute("SELECT pw_hash FROM admin WHERE id=1").fetchone()
+    if check_password_hash(row[0], DEFAULT_ADMIN_PASS):
+        print("!! WARNING: the admin password is still the default. Change it in Admin > Settings.")
+    db.close()
+
+
+def _row_to_doc(row):
+    d = json.loads(row["data"])
+    d["id"] = row["id"]
+    return d
+
+
+def get_doc(db, col, doc_id):
+    row = db.execute("SELECT * FROM docs WHERE col=? AND id=?", (col, doc_id)).fetchone()
+    return _row_to_doc(row) if row else None
+
+
+def list_docs(db, col):
+    rows = db.execute("SELECT * FROM docs WHERE col=? ORDER BY created DESC", (col,)).fetchall()
+    return [_row_to_doc(r) for r in rows]
+
+
+def save_doc(db, col, doc_id, data):
+    data = {k: v for k, v in data.items() if k != "id"}
+    db.execute("INSERT INTO docs (col, id, data, created) VALUES (?, ?, ?, ?) "
+               "ON CONFLICT(col, id) DO UPDATE SET data=excluded.data",
+               (col, doc_id, json.dumps(data, ensure_ascii=False), data.get("createdAt") or now_ms()))
+    return dict(data, id=doc_id)
+
+
+# ------------------------------ helpers ---------------------------------
+
+
+def err(message, code=400):
+    return jsonify(error=message), code
+
+
+def body():
+    d = request.get_json(silent=True)
+    return d if isinstance(d, dict) else {}
+
+
+def is_admin():
+    return session.get("admin") is True
+
+
+def is_super_admin():
+    return session.get("admin") is True
+
+
+def admin_required(fn):
+    @wraps(fn)
+    def wrapper(*args, **kwargs):
+        if not is_admin():
+            return err("Admin login required", 401)
+        return fn(*args, **kwargs)
+    return wrapper
+
+
+def super_admin_required(fn):
+    @wraps(fn)
+    def wrapper(*args, **kwargs):
+        if not is_super_admin():
+            return err("Only the Super Admin can perform this action.", 403)
+        return fn(*args, **kwargs)
+    return wrapper
+
+
+def to_int(value, label):
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"{label} is not a valid number")
+    if n < 0:
+        raise ValueError(f"{label} cannot be negative")
+    return n
+
+
+# ------------------------------ pages -----------------------------------
+
+
+@app.get("/")
+def index():
+    resp = Response(INDEX_HTML, mimetype="text/html")
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+
+@app.get("/placeholder.svg")
+def placeholder():
+    """Local replacement for placehold.co, so product images still look fine offline."""
+    def num(key, default):
+        try:
+            return max(20, min(int(request.args.get(key, default)), 1200))
+        except ValueError:
+            return default
+    w, h = num("w", 600), num("h", 700)
+    text = xml_escape(request.args.get("text", "Taham").replace("+", " ")[:40])
+    bg = request.args.get("bg", "be185d")
+    if not (len(bg) in (3, 6) and all(c in "0123456789abcdefABCDEF" for c in bg)):
+        bg = "be185d"
+    svg = (f'<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}" viewBox="0 0 {w} {h}">'
+           f'<rect width="100%" height="100%" fill="#{bg}"/>'
+           f'<text x="50%" y="50%" fill="#ffffff" font-family="Arial, sans-serif" font-size="{max(12, w // 14)}" '
+           f'text-anchor="middle" dominant-baseline="middle">{text}</text></svg>')
+    resp = Response(svg, mimetype="image/svg+xml")
+    resp.headers["Cache-Control"] = "public, max-age=86400"
+    return resp
+
+
+@lru_cache(maxsize=1)
+def _logo_bytes():
+    return base64.b64decode(LOGO_PNG_B64)
+
+
+@app.get("/logo.png")
+@app.get("/favicon.ico")
+def logo():
+    db = get_db()
+    logo_doc = get_doc(db, "settings", "logo")
+    if logo_doc and logo_doc.get("data"):
+        try:
+            image_bytes = base64.b64decode(logo_doc["data"])
+        except Exception:
+            image_bytes = _logo_bytes()
+        resp = Response(image_bytes, mimetype=logo_doc.get("mimetype") or "image/png")
+        resp.headers["Cache-Control"] = "no-store"
+        return resp
+
+    resp = Response(_logo_bytes(), mimetype="image/png")
+    resp.headers["Cache-Control"] = "public, max-age=86400"
+    return resp
+
+
+@lru_cache(maxsize=1)
+def _hero_bytes():
+    return base64.b64decode(HERO_JPG_B64)
+
+
+@app.get("/hero.jpg")
+def hero():
+    resp = Response(_hero_bytes(), mimetype="image/jpeg")
+    resp.headers["Cache-Control"] = "public, max-age=86400"
+    return resp
+
+
+@app.get("/official-pad-background.jpg")
+def official_pad_background():
+    path = os.path.join(BASE_DIR, "official_pad_background.jpg")
+    with open(path, "rb") as f:
+        image_bytes = f.read()
+    resp = Response(image_bytes, mimetype="image/jpeg")
+    resp.headers["Cache-Control"] = "public, max-age=86400"
+    return resp
+
+
+@app.after_request
+def no_cache_api(resp):
+    if request.path.startswith("/api/"):
+        resp.headers["Cache-Control"] = "no-store"
+    resp.headers.setdefault("X-Content-Type-Options", "nosniff")
+    return resp
+
+
+# ------------------------------- auth -----------------------------------
+SUPER_ADMIN_ROLE = "Super Admin"
+USER_ROLES = ("Admin", "Manager", "Salesman", "Marketing")
+PERMISSION_DEFS = (
+    {"key": "viewOrders", "label": "View Orders"},
+    {"key": "editOrders", "label": "Edit Orders"},
+    {"key": "manageProducts", "label": "Manage Products & Stock"},
+    {"key": "addCollections", "label": "Add Collections"},
+    {"key": "deleteCollections", "label": "Delete Collections"},
+    {"key": "manageExpenses", "label": "Manage Daily Expenses"},
+    {"key": "viewProfit", "label": "View Profit/Revenue Stats"},
+    {"key": "accessSettings", "label": "Access Settings"},
+    {"key": "userManagement", "label": "User Management"},
+)
+PERMISSION_KEYS = tuple(p["key"] for p in PERMISSION_DEFS)
+DEFAULT_PERMISSIONS = {key: False for key in PERMISSION_KEYS}
+EMAIL_RE = re.compile(r"^[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}$")
+STRONG_PASSWORD_RE = re.compile(r"^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[^A-Za-z0-9]).{10,}$")
+
+
+def sanitize_permissions(d):
+    src = d if isinstance(d, dict) else {}
+    return {key: bool(src.get(key, False)) for key in PERMISSION_KEYS}
+
+
+def public_user(u):
+    return {
+        "id": u.get("id", ""),
+        "fullName": u.get("fullName", ""),
+        "role": u.get("role", "Marketing"),
+        "email": u.get("email", ""),
+        "permissions": sanitize_permissions(u.get("permissions")),
+        "isSuperAdmin": False,
+    }
+
+
+def super_admin_user():
+    db = get_db()
+    row = db.execute("SELECT username FROM admin WHERE id=1").fetchone()
+    username = row["username"] if row else "Super Admin"
+    return {
+        "id": "super-admin",
+        "fullName": username,
+        "role": SUPER_ADMIN_ROLE,
+        "email": "",
+        "permissions": {key: True for key in PERMISSION_KEYS},
+        "isSuperAdmin": True,
+    }
+
+_FAILS = {}
+
+
+@app.get("/api/me")
+def me():
+    admin = is_admin()
+    return jsonify(
+        admin=admin,
+        role=SUPER_ADMIN_ROLE if admin else None,
+        isSuperAdmin=admin,
+        permissions={key: admin for key in PERMISSION_KEYS},
+    )
+
+
+@app.post("/api/login")
+def login():
+    ip = request.remote_addr or "?"
+    now = time.time()
+    _FAILS[ip] = [t for t in _FAILS.get(ip, []) if now - t < 300]
+    if len(_FAILS[ip]) >= 5:
+        return err("Too many wrong attempts, please try again in 5 minutes.", 429)
+    d = body()
+    row = get_db().execute("SELECT * FROM admin WHERE id=1").fetchone()
+    ok = (row is not None and str(d.get("username", "")).strip() == row["username"]
+          and check_password_hash(row["pw_hash"], str(d.get("password", ""))))
+    if not ok:
+        _FAILS[ip].append(now)
+        time.sleep(0.5)
+        return err("Wrong username or password!", 401)
+    session.clear()
+    session["admin"] = True
+    session["role"] = SUPER_ADMIN_ROLE
+    session.permanent = True
+    return jsonify(ok=True)
+
+
+@app.post("/api/logout")
+def logout():
+    session.clear()
+    return jsonify(ok=True)
+
+
+@app.get("/api/users")
+@admin_required
+def users_list():
+    db = get_db()
+    users = [public_user(u) for u in list_docs(db, "users")]
+    users.sort(key=lambda u: (u.get("fullName") or u.get("email") or "").lower())
+    return jsonify(
+        users=users,
+        superAdmin=super_admin_user(),
+        roles=list(USER_ROLES),
+        permissionDefs=list(PERMISSION_DEFS),
+        isSuperAdmin=is_super_admin(),
+    )
+
+
+@app.post("/api/users")
+@admin_required
+def users_add():
+    d = body()
+    full_name = str(d.get("fullName", "")).strip()[:120]
+    role = str(d.get("role", "")).strip()
+    email = str(d.get("email", "")).strip().lower()[:200]
+    password = str(d.get("password", ""))
+
+    if not full_name:
+        return err("Full name is required.")
+    if role not in USER_ROLES or role == SUPER_ADMIN_ROLE:
+        return err("Invalid role. Super Admin is reserved for the primary owner account.")
+    if not EMAIL_RE.fullmatch(email):
+        return err("Please enter a strict valid email address.")
+    if not STRONG_PASSWORD_RE.fullmatch(password):
+        return err("Password must be at least 10 characters and include uppercase, lowercase, number, and special character.")
+
+    db = get_db()
+    if any(str(u.get("email", "")).lower() == email for u in list_docs(db, "users")):
+        return err("A user with this email already exists.", 409)
+
+    user = {
+        "id": secrets.token_hex(8),
+        "fullName": full_name,
+        "role": role,
+        "email": email,
+        "pw_hash": generate_password_hash(password),
+        "permissions": sanitize_permissions(d.get("permissions")),
+        "createdAt": now_ms(),
+    }
+    saved = save_doc(db, "users", user["id"], user)
+    return jsonify(public_user(saved)), 201
+
+
+@app.put("/api/users/<user_id>/permissions")
+@super_admin_required
+def user_permissions_update(user_id):
+    db = get_db()
+    user = get_doc(db, "users", user_id)
+    if not user:
+        return err("User not found.", 404)
+    user["permissions"] = sanitize_permissions(body().get("permissions"))
+    saved = save_doc(db, "users", user_id, user)
+    return jsonify(public_user(saved))
+
+
+@app.delete("/api/users/<user_id>")
+@super_admin_required
+def users_delete(user_id):
+    if user_id == "super-admin":
+        return err("Super Admin cannot be deleted.", 403)
+    db = get_db()
+    if not get_doc(db, "users", user_id):
+        return err("User not found.", 404)
+    db.execute("DELETE FROM docs WHERE col='users' AND id=?", (user_id,))
+    return jsonify(ok=True)
+
+
+# ----------------------------- products ---------------------------------
+DEFAULT_COLLECTIONS = [
+    {"name": "Panjabi", "image": "/placeholder.svg?w=600&h=750&bg=1e293b&text=Panjabi"},
+    {"name": "Saree", "image": "/placeholder.svg?w=600&h=750&bg=9d174d&text=Saree"},
+    {"name": "Salwar Kameez", "image": "/placeholder.svg?w=600&h=750&bg=0f766e&text=Salwar+Kameez"},
+    {"name": "T-Shirt", "image": "/placeholder.svg?w=600&h=750&bg=1d4ed8&text=T-Shirt"},
+    {"name": "Kids", "image": "/placeholder.svg?w=600&h=750&bg=b45309&text=Kids"},
+]
+DEFAULT_DISCOUNTS = {0: ("percent", 10), 4: ("amount", 100)}   # demo discounts for the first run
+
+
+HEX_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
+
+
+def clean_colors(raw):
+    """Colour options of a product: [{name, hex}] (max 30, no duplicates)."""
+    if not isinstance(raw, list):
+        raise ValueError("Colours must be a list.")
+    out, seen = [], set()
+    for c in raw[:30]:
+        if not isinstance(c, dict):
+            continue
+        name = str(c.get("name", "")).strip()[:30]
+        hexv = str(c.get("hex", "")).strip()
+        if not name or name.lower() in seen:
+            continue
+        seen.add(name.lower())
+        out.append({"name": name, "hex": hexv if HEX_RE.match(hexv) else "#9ca3af"})
+    return out
+
+
+def clean_images(raw):
+    """Photos of a product: [{src, color}] (max 8)."""
+    if not isinstance(raw, list):
+        raise ValueError("Photos must be a list.")
+    if len(raw) > 8:
+        raise ValueError("Too many photos (max 8).")
+    out = []
+    for im in raw:
+        if not isinstance(im, dict):
+            continue
+        src = str(im.get("src", "")).strip()
+        if not src:
+            continue
+        if len(src) > 3_000_000:
+            raise ValueError("Image is too large, please use a smaller one.")
+        out.append({"src": src, "color": str(im.get("color", "")).strip()[:30]})
+    return out
+
+
+def sale_price(p):
+    """Price the customer really pays (after the product discount)."""
+    price = int(p.get("price", 0))
+    kind = p.get("discountType", "none")
+    val = int(p.get("discountValue", 0) or 0)
+    if kind == "percent" and 0 < val <= 95:
+        return max(0, price - int(price * val / 100 + 0.5))
+    if kind == "amount" and 0 < val < price:
+        return price - val
+    return price
+
+
+def check_product(db, p):
+    names = {c.get("name") for c in list_docs(db, "collections")}
+    if p.get("category") not in names:
+        raise ValueError("Please choose a valid collection.")
+    names = {c["name"].lower(): c["name"] for c in p.get("colors") or []}
+    for im in p.get("images") or []:                  # a photo can only point to one of the product's colours
+        im["color"] = names.get(im.get("color", "").lower(), "")
+    kind, val = p.get("discountType", "none"), int(p.get("discountValue", 0) or 0)
+    if kind == "none" or val == 0:
+        p["discountType"], p["discountValue"] = "none", 0
+    elif kind == "percent" and not 1 <= val <= 95:
+        raise ValueError("Percentage discount must be between 1 and 95.")
+    elif kind == "amount" and val >= int(p.get("price", 0)):
+        raise ValueError("Discount amount must be less than the selling price.")
+
+
+PRODUCT_TEXT = ("name", "category", "image", "desc")
+PRODUCT_NUM = {"stock": "Stock", "buyingPrice": "Buying price", "price": "Selling price"}
+
+
+def clean_product(d):
+    out = {}
+    for key in PRODUCT_TEXT:
+        if key in d:
+            val = str(d[key]).strip()
+            if key == "image" and len(val) > 3_000_000:
+                raise ValueError("Image is too large, please use a smaller one.")
+            out[key] = val[:2000] if key != "image" else val
+    for key, label in PRODUCT_NUM.items():
+        if key in d:
+            out[key] = to_int(d[key], label)
+    if "discountType" in d:
+        kind = str(d["discountType"]).strip()
+        if kind not in ("none", "percent", "amount"):
+            raise ValueError("Discount type is not valid.")
+        out["discountType"] = kind
+    if "discountValue" in d:
+        out["discountValue"] = to_int(d["discountValue"] or 0, "Discount value")
+    if "colors" in d:
+        out["colors"] = clean_colors(d["colors"])
+    if "images" in d:
+        out["images"] = clean_images(d["images"])
+        if out["images"]:
+            out["image"] = out["images"][0]["src"]      # main photo = first photo
+    return out
+
+
+@app.get("/api/products")
+def products_list():
+    items = list_docs(get_db(), "products")
+    if not is_admin():                      # customers must not see your buying price
+        for p in items:
+            p.pop("buyingPrice", None)
+    for p in items:
+        p["salePrice"] = sale_price(p)
+    return jsonify(items)
+
+
+@app.post("/api/products")
+@admin_required
+def products_add():
+    try:
+        data = clean_product(body())
+    except ValueError as e:
+        return err(str(e))
+    if not data.get("name") or "price" not in data:
+        return err("Enter the product name and price.")
+    data = {"category": "", "stock": 0, "buyingPrice": 0, "image": "", "desc": "",
+            "discountType": "none", "discountValue": 0, "colors": [], "images": [], **data, "createdAt": now_ms()}
+    db = get_db()
+    try:
+        check_product(db, data)
+    except ValueError as e:
+        return err(str(e))
+    saved = save_doc(db, "products", secrets.token_hex(8), data)
+    saved["salePrice"] = sale_price(saved)
+    return jsonify(saved), 201
+
+
+@app.patch("/api/products/<pid>")
+@admin_required
+def products_update(pid):
+    db = get_db()
+    cur = get_doc(db, "products", pid)
+    if not cur:
+        return err("Product not found", 404)
+    try:
+        cur.update(clean_product(body()))
+        check_product(db, cur)
+    except ValueError as e:
+        return err(str(e))
+    saved = save_doc(db, "products", pid, cur)
+    saved["salePrice"] = sale_price(saved)
+    return jsonify(saved)
+
+
+# ----------------------------- collections ------------------------------
+
+
+def clean_collection(d):
+    out = {}
+    if "name" in d:
+        name = str(d["name"]).strip()[:40]
+        if not name:
+            raise ValueError("Collection name is required.")
+        out["name"] = name
+    if "image" in d:
+        img = str(d["image"]).strip()
+        if len(img) > 3_000_000:
+            raise ValueError("Image is too large, please use a smaller one.")
+        out["image"] = img
+    if "productIds" in d:
+        ids = d.get("productIds") or []
+        if not isinstance(ids, list):
+            raise ValueError("Assigned products must be a list.")
+        out["productIds"] = [str(x) for x in ids if str(x).strip()]
+    return out
+
+
+def _col_placeholder(name):
+    return f"/placeholder.svg?w=600&h=750&text={quote(name)}"
+
+
+@app.get("/api/collections")
+def collections_list():
+    items = list_docs(get_db(), "collections")
+    items.sort(key=lambda c: c.get("createdAt", 0))
+    return jsonify(items)
+
+
+@app.post("/api/collections")
+@admin_required
+def collections_add():
+    db = get_db()
+    try:
+        data = clean_collection(body())
+    except ValueError as e:
+        return err(str(e))
+    if "name" not in data:
+        return err("Collection name is required.")
+    if any(c.get("name", "").lower() == data["name"].lower() for c in list_docs(db, "collections")):
+        return err("A collection with this name already exists.", 409)
+    data = {"image": "", **data, "createdAt": now_ms()}
+    if not data["image"]:
+        data["image"] = _col_placeholder(data["name"])
+    return jsonify(save_doc(db, "collections", secrets.token_hex(8), data)), 201
+
+
+@app.patch("/api/collections/<cid>")
+@admin_required
+def collections_update(cid):
+    db = get_db()
+    try:
+        changes = clean_collection(body())
+    except ValueError as e:
+        return err(str(e))
+    db.execute("BEGIN IMMEDIATE")
+    try:
+        cur = get_doc(db, "collections", cid)
+        if not cur:
+            db.execute("ROLLBACK")
+            return err("Collection not found.", 404)
+        old, new = cur["name"], changes.get("name", cur["name"])
+        if any(c["name"].lower() == new.lower() for c in list_docs(db, "collections") if c["id"] != cid):
+            db.execute("ROLLBACK")
+            return err("A collection with this name already exists.", 409)
+        cur.update(changes)
+        if not cur.get("image"):
+            cur["image"] = _col_placeholder(new)
+        if new != old:                                   # rename -> move its products along
+            for p in list_docs(db, "products"):
+                if p.get("category") == old:
+                    p["category"] = new
+                    save_doc(db, "products", p["id"], p)
+        saved = save_doc(db, "collections", cid, cur)
+        db.execute("COMMIT")
+    except Exception:
+        db.execute("ROLLBACK")
+        raise
+    return jsonify(saved)
+
+
+# ------------------------------ orders ----------------------------------
+
+
+@app.get("/api/orders")
+@admin_required
+def orders_list():
+    return jsonify(list_docs(get_db(), "orders"))
+
+
+@app.post("/api/orders")
+def order_create():
+    """Customer checkout. Prices, totals and stock are all decided HERE, never trusted from the browser."""
+    d = body()
+    name = str(d.get("customerName", "")).strip()[:100]
+    phone = str(d.get("customerPhone", "")).strip()[:30]
+    address = str(d.get("customerAddress", "")).strip()[:300]
+    if not (name and phone and address):
+        return err("Please enter name, phone number and address.")
+    method = d.get("paymentMethod")
+    if method not in PAYMENT_METHODS:
+        return err("Invalid payment method.")
+    delivery = d.get("deliveryCharge")
+    delivery = delivery if delivery in DELIVERY_OPTIONS else DELIVERY_OPTIONS[0]
+
+    want = {}                                           # (productId, size) -> qty
+    for it in d.get("items") or []:
+        try:
+            pid, qty = str(it["productId"]), int(it["qty"])
+        except (KeyError, TypeError, ValueError):
+            return err("Invalid cart data.")
+        size = it.get("size") if it.get("size") in SIZES else "L"
+        if not 1 <= qty <= 100:
+            return err("Invalid quantity.")
+        color = str(it.get("color") or "").strip()[:30]
+        key = (pid, size, color)
+        want[key] = want.get(key, 0) + qty
+    if not want:
+        return err("Your cart is empty.")
+
+    db = get_db()
+    db.execute("BEGIN IMMEDIATE")
+    try:
+        need = {}
+        for (pid, _size, _color), q in want.items():
+            need[pid] = need.get(pid, 0) + q
+        prods = {}
+        for pid, q in need.items():
+            p = get_doc(db, "products", pid)
+            if not p:
+                raise ValueError("A product is no longer available.")
+            if int(p.get("stock", 0)) < q:
+                raise ValueError(f"Sorry! \"{p['name']}\" has only {p.get('stock', 0)} in stock.")
+            prods[pid] = p
+        items, subtotal, cost = [], 0, 0
+        for (pid, size, color), q in want.items():
+            p = prods[pid]
+            unit = sale_price(p)
+            options = {c["name"].lower(): c for c in p.get("colors") or []}
+            chosen = None
+            if options:                                    # product has colours -> customer must pick one
+                if not color:
+                    raise ValueError("Please choose a colour.")
+                chosen = options.get(color.lower())
+                if chosen is None:
+                    raise ValueError("This colour is not available.")
+            items.append({"productId": pid, "name": p["name"], "size": size, "qty": q,
+                          "color": chosen["name"] if chosen else "", "colorHex": chosen["hex"] if chosen else "",
+                          "price": unit, "originalPrice": int(p["price"]),
+                          "buyingPrice": p.get("buyingPrice", 0)})
+            subtotal += unit * q
+            cost += p.get("buyingPrice", 0) * q
+        for pid, q in need.items():
+            prods[pid]["stock"] = int(prods[pid]["stock"]) - q
+            save_doc(db, "products", pid, prods[pid])
+        order = {
+            "orderNumber": "ORD-" + str(random.randint(100000, 999999)),
+            "customerName": name, "customerPhone": phone, "customerAddress": address,
+            "paymentMethod": method, "trxId": str(d.get("trxId", "")).strip()[:40],
+            "customDesignNotes": str(d.get("customDesignNotes", "")).strip()[:2000],
+            "referenceImage": str(d.get("referenceImage") or d.get("customDesignReferenceImage") or "").strip()[:8000000],
+            "items": items, "subtotal": subtotal, "deliveryCharge": delivery,
+            "total": subtotal + delivery, "totalCost": cost,
+            "status": "Pending", "stockDeducted": True,
+            "dateStr": datetime.now().strftime("%d/%m/%Y, %I:%M %p"), "createdAt": now_ms(),
+        }
+        saved = save_doc(db, "orders", secrets.token_hex(8), order)
+        db.execute("COMMIT")
+    except ValueError as e:
+        db.execute("ROLLBACK")
+        return err(str(e), 409)
+    except Exception:
+        db.execute("ROLLBACK")
+        raise
+    public = {k: v for k, v in saved.items() if k not in ("totalCost", "stockDeducted")}
+    public["items"] = [{k: v for k, v in it.items() if k != "buyingPrice"} for it in saved["items"]]
+    return jsonify(public), 201
+
+
+@app.patch("/api/orders/<oid>")
+@admin_required
+def order_status(oid):
+    status = body().get("status")
+    if status not in ORDER_STATUSES:
+        return err("Invalid status.")
+    db = get_db()
+    db.execute("BEGIN IMMEDIATE")
+    try:
+        order = get_doc(db, "orders", oid)
+        if not order:
+            db.execute("ROLLBACK")
+            return err("Order not found", 404)
+        if status == "Cancelled" and order.get("stockDeducted"):            # cancelled -> put stock back
+            _shift_stock(db, order, +1)
+            order["stockDeducted"] = False
+        elif order["status"] == "Cancelled" and status != "Cancelled" and not order.get("stockDeducted"):
+            _shift_stock(db, order, -1)                                      # restored -> take stock again
+            order["stockDeducted"] = True
+        order["status"] = status
+        saved = save_doc(db, "orders", oid, order)
+        db.execute("COMMIT")
+    except Exception:
+        db.execute("ROLLBACK")
+        raise
+    return jsonify(saved)
+
+
+def _shift_stock(db, order, sign):
+    for it in order.get("items", []):
+        p = get_doc(db, "products", it["productId"])
+        if p:
+            p["stock"] = max(0, int(p.get("stock", 0)) + sign * int(it["qty"]))
+            save_doc(db, "products", p["id"], p)
+
+
+# ------------------------------ expenses --------------------------------
+
+
+@app.get("/api/expenses")
+@admin_required
+def expenses_list():
+    return jsonify(list_docs(get_db(), "expenses"))
+
+
+@app.post("/api/expenses")
+@admin_required
+def expenses_add():
+    d = body()
+    title = str(d.get("title", "")).strip()[:120]
+    if not title:
+        return err("Enter the expense description.")
+    try:
+        amount = to_int(d.get("amount"), "Expense amount")
+    except ValueError as e:
+        return err(str(e))
+    data = {"title": title, "category": str(d.get("category", "")).strip()[:40], "amount": amount,
+            "dateStr": datetime.now().strftime("%d/%m/%Y"), "createdAt": now_ms()}
+    return jsonify(save_doc(get_db(), "expenses", secrets.token_hex(8), data)), 201
+
+
+# ------------------------------ settings --------------------------------
+
+
+@app.get("/api/settings")
+def settings_get():
+    db = get_db()
+    s = get_doc(db, "settings", "store_config") or dict(DEFAULT_SETTINGS, id="store_config")
+    if is_admin():
+        s["adminUser"] = db.execute("SELECT username FROM admin WHERE id=1").fetchone()["username"]
+    return jsonify([s])
+
+
+@app.put("/api/settings/store_config")
+@admin_required
+def settings_put():
+    d = body()
+    db = get_db()
+    s = dict(get_doc(db, "settings", "store_config") or DEFAULT_SETTINGS)
+
+    required_keys = ("shopName", "shopPhone", "paymentNumber", "shopAddress", "pageName", "theme")
+    for key in DEFAULT_SETTINGS:
+        if key in d:
+            if key == "showStockToCustomers":
+                raw = d.get(key)
+                s[key] = raw is True or str(raw).strip().lower() in ("true", "1", "on", "yes")
+                continue
+            val = str(d.get(key, "")).strip()[:200]
+            if key in required_keys and not val:
+                return err("Please fill in all the shop details.")
+            s[key] = val
+        elif key not in s:
+            default = DEFAULT_SETTINGS.get(key, "")
+            s[key] = default if isinstance(default, bool) else str(default).strip()
+
+    if not str(s.get("pageName", "")).strip():
+        s["pageName"] = str(s.get("shopName", "Taham")).strip() or "Taham"
+    if not str(s.get("theme", "")).strip():
+        s["theme"] = "classic-pink"
+
+    s.pop("id", None)
+    s.pop("adminUser", None)
+    s.pop("adminPass", None)
+
+    user, pw = str(d.get("adminUser", "")).strip()[:60], str(d.get("adminPass", ""))
+    if pw and not STRONG_PASSWORD_RE.fullmatch(pw):
+        return err("Password must be at least 10 characters and include uppercase, lowercase, number, and special character.")
+
+    save_doc(db, "settings", "store_config", s)
+    if user:
+        db.execute("UPDATE admin SET username=? WHERE id=1", (user,))
+    if pw:
+        db.execute("UPDATE admin SET pw_hash=? WHERE id=1", (generate_password_hash(pw),))
+    return jsonify(ok=True)
+
+
+@app.post("/api/logo")
+@admin_required
+def logo_upload():
+    data_url = str(body().get("dataUrl", "")).strip()
+    if not data_url.startswith("data:image/") or "," not in data_url:
+        return err("Please choose an image file.")
+
+    header, encoded = data_url.split(",", 1)
+    mimetype = header[5:].split(";")[0].lower() or "image/png"
+    if not mimetype.startswith("image/"):
+        return err("Please choose an image file.")
+
+    try:
+        image_bytes = base64.b64decode(encoded)
+    except Exception:
+        return err("Could not read the image file.")
+
+    if not image_bytes:
+        return err("Could not read the image file.")
+    if len(image_bytes) > 8 * 1024 * 1024:
+        return err("Image must be smaller than 8 MB.")
+
+    db = get_db()
+    save_doc(db, "settings", "logo", {"mimetype": mimetype, "data": base64.b64encode(image_bytes).decode("ascii"), "updatedAt": now_ms()})
+    return jsonify(ok=True, logoUrl=f"/logo.png?v={now_ms()}")
+
+
+@app.post("/api/invoice-pad")
+@admin_required
+def invoice_pad_upload():
+    data_url = str(body().get("dataUrl", "")).strip()
+    if not data_url.startswith("data:image/") or "," not in data_url:
+        return err("Please choose an image file.")
+
+    header, encoded = data_url.split(",", 1)
+    mimetype = header[5:].split(";")[0].lower() or "image/png"
+    if not mimetype.startswith("image/"):
+        return err("Please choose an image file.")
+
+    try:
+        image_bytes = base64.b64decode(encoded)
+    except Exception:
+        return err("Could not read the image file.")
+
+    if not image_bytes:
+        return err("Could not read the image file.")
+    if len(image_bytes) > 8 * 1024 * 1024:
+        return err("Image must be smaller than 8 MB.")
+
+    db = get_db()
+    save_doc(db, "settings", "invoice_pad", {"mimetype": mimetype, "data": base64.b64encode(image_bytes).decode("ascii"), "updatedAt": now_ms()})
+
+    s = dict(get_doc(db, "settings", "store_config") or DEFAULT_SETTINGS)
+    pad_url = f"/invoice-pad-background.jpg?v={now_ms()}"
+    s["invoicePadUrl"] = pad_url
+    s["invoicePadFilename"] = str(body().get("filename", "invoice-pad.jpg"))[:200]
+    s.pop("id", None)
+    s.pop("adminUser", None)
+    s.pop("adminPass", None)
+    save_doc(db, "settings", "store_config", s)
+    return jsonify(ok=True, padUrl=pad_url, invoicePadUrl=pad_url)
+
+
+@app.get("/invoice-pad-background.jpg")
+def invoice_pad_background():
+    db = get_db()
+    doc = get_doc(db, "settings", "invoice_pad")
+    if doc and doc.get("data"):
+        return Response(base64.b64decode(doc["data"]), mimetype=doc.get("mimetype") or "image/jpeg")
+    with open(os.path.join(BASE_DIR, "official_pad_background.jpg"), "rb") as f:
+        return Response(f.read(), mimetype="image/jpeg")
+
+# ------------------------------- delete ---------------------------------
+
+
+@app.delete("/api/<col>/<doc_id>")
+@admin_required
+def doc_delete(col, doc_id):
+    if col not in ("products", "orders", "expenses", "collections"):
+        return err("Not found", 404)
+    db = get_db()
+    db.execute("BEGIN IMMEDIATE")
+    try:
+        if col == "orders":                      # Pending/Processing order deleted -> put its stock back
+            order = get_doc(db, "orders", doc_id)
+            if order and order.get("stockDeducted") and order.get("status") in ("Pending", "Processing"):
+                _shift_stock(db, order, +1)
+        if col == "collections":
+            c = get_doc(db, "collections", doc_id)
+            if c and any(p.get("category") == c.get("name") for p in list_docs(db, "products")):
+                db.execute("ROLLBACK")
+                return err("This collection still has products. Move or delete them first.", 409)
+        db.execute("DELETE FROM docs WHERE col=? AND id=?", (col, doc_id))
+        db.execute("COMMIT")
+    except Exception:
+        db.execute("ROLLBACK")
+        raise
+    return jsonify(ok=True)
+
+
+init_db()
+
+
+# Taham hero banner (JPEG, embedded)
+HERO_JPG_B64 = (
+    "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"
+    "6hh4+aXWyOee3gi1UbWHP1lmn3Wfx9tdGejKmDjaa6nyhuncnaSeXoEYJ5uuc/rm4Uxr3j5RcRnakrR7bdkXOMBsGKjIWH3J"
+    "ieQYC0tad7YYfXJEXT1yh3sHZygp7mIjBOjKU0sPv/XuilxpjYCCh+Jr3DiqruZP1U076B26p+WuFUN8kbRtJGcsdRfZvcX7"
+    "0n4P9oiL55enoTRq+0zhIxDfD+gefSM/VHNFO9HNf+AehCLbbpOL5I5/aDT0ZfPCTIieGg7S2viqw/TAdlRSYXKzqdXpCLE1"
+    "H9CM3ArlbDRUF0Qq1qv2lndETaeu9omxSv3OlOaMCJk+E0SwHdvXCh0LExOw9Tx9uxrSMztSlrDO0F2DRrgqocphKnjlULk6"
+    "S7cHhC1Wj31L1AaKzjPJc7hnDF5HLdXS+HnF4DQHVLS6hdzSp5tpbbqOHCh1T+Mbnl+AaCS1nLnrBemKgaZ3I3GuTNSbRsbm"
+    "Kpn8L6e6PLSuxuPXRNwNRpxIZLeWO3kdg0WX+9pRHWbQqVQphKTEk3aibhI+bzdqtdRXu+H4B/hGqlFq8ykCWA+mWmfzfLGM"
+    "zkLRpiZ/4imCn+jn/QMd3KXaEdeUuW/vpHHR/T9f43rfYffQswtpmMzawJLl4y5bunW1/OERyxZFRvx01CdfVE7stpCM4mqc"
+    "6f328llipTqrQhkxVeMRAnjRyb/sF+DLuKLkk1qhd3MqkmS8KdS1FXsdvin8BGHPj8xed7cqfzNpPUdCy1BFjJWLftXAIcuF"
+    "l55t/XPE3GNwx+iCeidyFX6ErtNXmU2mRGjCYJaOS2PfTn3in6picfxt8e/B8qaPIpNKhYJpr5o0RPfJcJtC90/lj6T2UVn2"
+    "cUcg/U9dpKmaOuuXneUWJDeUO2pJO4dRWx98mQxn7nN0hkkHObcnK/YFOkGj8ktXcJZuR0fvV/eOYvsxuX8ntjanl1Ebnu5I"
+    "a1JA6qqGQpxVbHijdFWkNK0ryZbc68t9btdfVL3L5Ye3lPlECk05k0zlLik6hlqKclWNitXrQnbDFXmLk1rvvw50Pmya5kiD"
+    "d3sE9mkTBv8AijmM4Zr/AOiav4Ig+b49a/WH21I9nZqkbuolrGa+sBhShJq6nc0ZxwsirVzcUM0cJGjqK6mt7/g90ain5w1k"
+    "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"
+    "+Ui1GUXRW4Ps+tMp9dlKrXyVFsnrB9HSBiQWX73f7hSE5o+zk+kLSqJHMpLMk8eWzBqq0cIXzJ3klCRIcuWG/DVibfgOEUX6"
+    "HzYJQVQMZ7KKCRPMmapVUDzF85dppnLwRuKKRLvdzLCIwPMzN08+WSrt5Tu0N1Vpl63lziNPJO450fCydrJnP8V8eaqLTgz3"
+    "Nu5bXXjgo+mg6Vyn8HGbfqj6W23bimyPdBVK3qSrqeWXnhEiomesXyrRRymXgKpd3j+/xsndGwrbcgWSWiUJS9GzqlP3sU5i"
+    "aKl7V2s2Khfhr6yZoGPl7t6Md/fHBlOE+isVDLJ7uW09GzJlMrlUsL2auCLXdRxxrsYjX2gzqW1R6Jluf4yZ+1m2ZUy5zrMX"
+    "BF8DYu+PdHYWPoe1g8spObU01o1cklmzhs7eoaXd7RVviYOvfvFu46nv5d8S+xrcmWUWATVeZULSCMqmLhLNzTBRZV04wo75"
+    "iFOqY1yEe7kyZe6IJwDdsLpy/dgbk186UwWic6c33K2qnyjfuiLbr3dGzW0imd07ZYhKJfGRUhJGLhKZslTnWUOZ0zvkV5ur"
+    "tfkD2NbZYFQu6IphCRV1JtLNG6ucNzkVOgs2UyZLyahckYZYcPcj3YDR2Ubk2y+xejp7S9N0ujGVT4kUZvpFY7s8wTyRLcVO"
+    "fm5Dx1d6Gt7IJweL7T5o0m8j9D9asXSLp0V/LoxRRVgc0LuY3vngOE17NXVm7OsrTZan2/JrXajlfkPGFz8yI+k9k24OsXsU"
+    "rolW01TC6c8bxjFkd6+WcptL3QkUjkhH243owG0nW41shn9KVDTb6l1FpNUM87JH6MJi52r/AHy4sD37xN4xtUuqIZ4FsOpj"
+    "sLtLtXkvf29gaWL1zy1qofzjjre4D3LNCw3OFP2voMn8a7cSmbI4mfHwd/OG/I8XiD17+5os57MalqfQJ9M1JI+xuZLZ8ttW"
+    "GGRLCuXrpNRMkLxdYSmy6zGm7HKIltIUox0bT8vv5q1O4OuYt48VDa6kYmjrHNwxER8nEpzL4eg8LS/P20XvZXhZtiwxL2c3"
+    "8l3h4ut7w6haLYfIred3tQFD1TGYNJc4s1ZrK6PcYC5TppK5N/WHqo/od9g/phdmHYR29j59o/PltH497LfzbLd4ebxfFHWV"
+    "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"
+    "o3Oez1IijNCYoYmdsdRe/wBEaP5p/rjQ1wc+g0f6V+YJ6szzd3hroYiDi9f+iJcvvDn1alXYS5JivHGzd0bX8MtzUj8MB1Fa"
+    "3DE7zOyp83t8hG6TGnJfx+21eMtzvJGGwr9/I3eJLVDoDOpyg3c3jnUyTWQQ5uNsvpE07GJVT8wzF+7kaHhInRVUNv8AkwGv"
+    "FFM9qarcT6mVzo2OXHvONZKrfXeN6rS1Ca+/xvjHXKZc0naHJF12j8ktwSX3DV2TEwi+/Df+YcyntlFNzxHHpedI593WS3EP"
+    "1O7ARSmG08s7rBod2xOTa4K6KkNVVI28cvvRKNmCarp5MEyYmrzQEkUErcUeTuh9gPQ06b7F7LavYIPyP2GnMZudDi6zZO/9"
+    "A9fjzruCaAaWf7ndig0d58lMH7yYY3iGUuJwN7ZSJlyj0UPNVa3nfyzOwh/LaVJwCgA40jKAYABEAcIHEMA4AtwQxgADAEAA"
+    "ABIA4ACIcUJwioBCAAACIYAACIA4QOAR5HF0KGH1A+TgHCBwCHAAAjMAYAcEjV1DU8lpOXZ3Opm1lLTiYztaCZb3gl9mPtQG"
+    "O2rymnFPadTqGWaF4mkM7Jg3vBMfuR9qI4pbZLWlUbo+y6RTZDO5Sduqc7JTkzcf9Qo5lO6eQl/7oSnpahmkpY5s7bsualcX"
+    "/VHUS1cjHLllw+lzu4aON8aYlzXP4Xsew3NTyVu7YNF5syQdzEl9kio4KVRyXxIc/wCAWnNbU8zz/HnsrQ0ecpHuI7IXNlDc"
+    "Qqu/qZe5lHkioatzi02wp30UqlnnqXAtYeqFm9uU6+6KvbI/i1RiWv42T+2uZU0fwxO4/wA2PXx6wkTdpLXempem0mJ8Fkvn"
+    "BMNybwSRy5Dx94X53UkppvAUm0yZSlNwrgpZ0tBPFU8EuXujxQzmS/YFQlNP/X9PVyVt+DPkUJ+ePSO6rpLssscnuH67lhyz"
+    "FLyOP5kTDLHVOkY57U4GGSkbE9rFXJVOkv59LZO7YNH8zatHb49xqgutBNRc3gkhHfjHf7g1vpl0mnUOguyWWaWv4OZZ2TEx"
+    "PA9/2uEee6eqf04LU5DOk/W9LUhnxvFfHSj+d9Qc0RoySqbj93VmjSdkul/sp37lYQGB1Y5ewmWf0M7KBvB7s8vqe5iVDKVJ"
+    "2pJk5k1PNiJYx5fjFzgpPCucOTfGJ2eU1o92/wCyGWZgxVzdw6zsmGgrHmHjlyQj7URwWzdypMN1tjr8urSDRY/Wi3bjli3/"
+    "AIe7X/8AO9D+tE6r8uv0OdharsOLp9T2nIawkVUKqaFnsvmyhOPmrsixi/BCI3g8hMKSkVH26WMdiaCDR3MJaVaZINVr3Cnr"
+    "mNw8MLw9dEGxDK6W+JMzVqIGw2wrdFHAAONg1wAAOIQwxDuVJXMWj5PlG6uN8QyxYfo4iQxPbiaZGOwuRx3xOLRpL0Dk18Ut"
+    "74xqsFdxs0xrLN3/AGR0y0QxNuyLm6vwcQ3xCVP1tFpYaHLnHjpG4HK09zHJjajgYSFBv1/OGfg4fJpjVSombpOHa6g1y1Wr"
+    "p8RP8YMYyQncrp97ELqTO5PUOnUL+aO0kmivuRimPcveJGJxLJJNHcwRxF0MNPw/CF+a5polc7v1pdNf6sd4QzSInXcJbNMW"
+    "JlNVE0cPkxcph4umiowdrkcZvqX/AAvYN8MAsyYIZ2nxFPDPfCAX5E5X5TD2Ykhz7Ea1Fyno7oPEF9FZPBw8TaAkY1zEWGfh"
+    "DCv98w+JzBkHmqCfKKbTqG/QCpHyd3d25U0hur6lqhTtSRTiVNpnjd7x+QW/q73ljyxU9a0ZZejmNLNM7m0Pt1cg+ovol1HT"
+    "Kudz5Mn1NuMadSk6bjBQJtl2l7bEh72qpk8QfI2S0VLKXx5rPF20+fNyYuj2quKin9+PwH6sN72YhEaZWVup9Dsiqya5qi4j"
+    "2ujHl3PULzC+NH4B0un44FKJr0hIu21eJgExHC/vqcYcmatpzapVm/HXPrqrL8i2ShwnP4JCw/RAbefWjxkbtBjS6502Mvb5"
+    "qkt0vhqeVH9Ajk2c1haaw5eRPW/+j3hoJlVD+YJ6Jqhush0TmKMSKIG97ul9mAzJDJ6orjt6ZTNdhJuOq9XVwy+R7InzOpGE"
+    "0l2iZb6pIJal+ZXc3/2gjg5ZSyy8nni7RdDHd8T+/vwGVaE+5DmC7PlVpPNseDFGVO2ihW6qCCt5FRI3FOT+waysJWgn283d"
+    "451j8TF1viERjUfNXbeYJ9Bzx1FytiS/qDmdMYEJe4x1M04tzYxNeMOhIrNJhKV00FzqLnJqbE929AREXWRziYYaYltnWJR9"
+    "eSWZYmHm7jj9bU/PECmq0yTmDFfA25BKXNTsHDTb51ifef0RGNyY0Uyxyat7XpyU6kQ82mGml2F9d3fzcmJ4UREXliktp+Xa"
+    "SqybZoofXzUnKDqLm0WS0fZPTU6YIYjuYNzuFfv986Z/iuDzjM5xUNrVS5sSCjxwrHeITgu/kh7MR56Fkl15Ih9DqZYtWx3a"
+    "c7gnqbh5aVJpQjmVP0+yUgTiqO25VvK3xOqCmVok0l+dpYLRorxV1LjZFP4ef5MIjRyiRUvRDtohqTqdd9X+1UOpDn9Y3wQH"
+    "WHiKFSI47ue5oolqHRXFK9nBvzUVLE/FrHu4ckyNbmZ03ePPaodTL+atFooI/Hxz+aILbM0k67RjPGbFGGarkgsdqQvyT5Pm"
+    "jESRzZRKZptOzPaeBcin+kaJGyypKfmPqSuhPWixbirXGIbFJ4JyRyZQY34eKmaeJ8sasRt7/EgrCZMZhyCjpRQ/HO6P7PD8"
+    "31hZI/TbrKJ+BxATSjI0zVSKborqn2jzfTK6JxPDJe+iPsDPq2mGkrwMwvrqXNc/NGw9rfmdVGsmFcSWcnEeQ2kLyuY4aimz"
+    "HoSkp2hUEpxE9omcg8lySQqTh2pr4ZCDt9lbzsfmOYY58DVGCeNreydjQzyYt7gX6zYZvtBz5Yiiio6baE29VnaCa5NTmHOI"
+    "1QDZvNEXabtDAUvmJ1hgRTLKz3mEWjyZuqgph88dP0whL8RdTZiBkJoNXqCH1/U7skvxMTluIOUZrN0et2dq+RO5xa1KW6uH"
+    "iCUSep5bWEpUXaKYiiROJ+aPJRGzucKjqNlaKkjdr7fZnJrjNLA1je1malPpCSWTebuk5nDzZLylT1o+Jz+bl/Qe4Yc5o1yw"
+    "Xq+cT2bNUYoIb95cmIXE8GEBftEqZdOUt8C/2wQ31xaYWY1BN5W0cP5TNmcq8Bo0Mou5jHjGyc3L7JviGeFm76mtVS45mta3"
+    "FbP+Db1BugoxdwzBvqJcGJrJ+9c4MkYdwR5o/pyr3UYNZFNZK4UjlitKFYqoJx9nCPv5PLgJlJmEslktVat5bMaHmCUdk/ey"
+    "szoy8PH1L0PIESrUtotMs0HcyfPXUmd8k9aqRzdX6MnvGKUONjEyZ+5gmlm7cy3TyS9vunyNhPpdW1kS6UxI6jM5Nf2Uya5T"
+    "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"
+)
+
+# Taham logo (PNG, embedded)
+LOGO_PNG_B64 = (
+    "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"
+)
+
+
+# ======================================================================
+#  THE WEBSITE (HTML + CSS + JavaScript)
+# ======================================================================
+INDEX_HTML = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Taham | Clothing Store & Admin Panel</title>
+    <link rel="icon" type="image/png" href="/logo.png?v=2">
+    <!-- Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com/3.4.17"></script>
+    <!-- Google Fonts: Hind Siliguri & Inter -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Hind+Siliguri:wght@400;500;600;700&family=Inter:wght@400;500;600;700&family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+    <!-- Lucide Icons -->
+    <script src="https://unpkg.com/lucide@0.469.0/dist/umd/lucide.min.js"></script>
+    <script>if (!window.lucide) window.lucide = { createIcons: function () {} };</script>
+    <script>
+        tailwind.config = {
+            theme: {
+                extend: {
+                    fontFamily: {
+                        sans: ['"Plus Jakarta Sans"', '"Inter"', '"Hind Siliguri"', 'sans-serif'],
+                    },
+                    colors: {
+                        brand: {
+                            50: 'var(--brand-50)',
+                            100: 'var(--brand-100)',
+                            300: 'var(--brand-300)',
+                            500: 'var(--brand-500)',
+                            600: 'var(--brand-600)',
+                            700: 'var(--brand-700)',
+                            900: 'var(--brand-900)',
+                        }
+                    }
+                }
+            }
+        }
+    </script>
+    <style>
+        :root {
+            --brand-50: #fdf2f8;
+            --brand-100: #fce7f3;
+            --brand-300: #fbcfe8;
+            --brand-500: #ec4899;
+            --brand-600: #db2777;
+            --brand-700: #be185d;
+            --brand-900: #831843;
+            --app-bg: #f8fafc;
+            --app-surface: #ffffff;
+            --app-text: #0f172a;
+        }
+
+        html {
+            font-family: "Plus Jakarta Sans", Inter, "Hind Siliguri", ui-sans-serif, system-ui, sans-serif;
+            font-size: 16px;
+        }
+
+        body {
+            background-color: var(--app-bg) !important;
+            color: var(--app-text);
+            font-family: "Plus Jakarta Sans", Inter, "Hind Siliguri", ui-sans-serif, system-ui, sans-serif;
+            font-weight: 400;
+            line-height: 1.5;
+            -webkit-font-smoothing: antialiased;
+            -moz-osx-font-smoothing: grayscale;
+        }
+
+        h1, h2, h3, h4, h5, h6 {
+            font-weight: 700;
+            letter-spacing: -0.012em;
+        }
+
+        h1 { font-weight: 800; letter-spacing: -0.02em; }
+        .text-\[11px\], .text-xs { font-weight: 500; }
+        .font-bold { font-weight: 700 !important; }
+        .font-semibold { font-weight: 600 !important; }
+
+        html { scroll-behavior: smooth; }
+        body { overflow-x: hidden; }
+        ::selection { background: var(--brand-500); color: #ffffff; }
+
+        /* Modern digital 3D + glassmorphism */
+        .glass,
+        .glass-card {
+            background: rgba(255, 255, 255, 0.72);
+            border: 1px solid rgba(255, 255, 255, 0.55);
+            box-shadow: 0 12px 34px rgba(15, 23, 42, 0.10), inset 0 1px 0 rgba(255, 255, 255, 0.70);
+            backdrop-filter: blur(16px) saturate(140%);
+            -webkit-backdrop-filter: blur(16px) saturate(140%);
+        }
+
+        .product-card {
+            position: relative;
+            border-radius: 1.25rem;
+            border: 1px solid rgba(148, 163, 184, 0.22);
+            background: rgba(255, 255, 255, 0.90);
+            box-shadow: 0 10px 28px rgba(15, 23, 42, 0.08), 0 2px 8px rgba(15, 23, 42, 0.05), inset 0 1px 0 rgba(255, 255, 255, 0.85);
+            transition: transform 240ms cubic-bezier(0.22, 1.18, 0.36, 1), box-shadow 240ms ease, border-color 240ms ease;
+            transform-style: preserve-3d;
+            will-change: transform;
+            backdrop-filter: blur(10px);
+        }
+
+        .product-card:hover {
+            border-color: rgba(var(--brand-rgb, 99, 102, 241), 0.30);
+            box-shadow: 0 22px 48px rgba(15, 23, 42, 0.16), 0 8px 18px rgba(15, 23, 42, 0.08), inset 0 1px 0 rgba(255, 255, 255, 0.90);
+        }
+
+        .tilt-3d {
+            transform-style: preserve-3d;
+            transition: transform 160ms cubic-bezier(0.22, 1.18, 0.36, 1), box-shadow 160ms ease, background-color 160ms ease, border-color 160ms ease;
+            will-change: transform;
+        }
+
+        .size-selector {
+            min-width: 2rem;
+            min-height: 2rem;
+            box-shadow: 0 4px 10px rgba(15, 23, 42, 0.08), inset 0 1px 0 rgba(255, 255, 255, 0.75);
+        }
+
+        .size-selector[aria-pressed="true"],
+        .size-selector.active,
+        .is-active {
+            box-shadow: 0 8px 18px rgba(var(--brand-rgb, 99, 102, 241), 0.32), 0 0 0 3px rgba(var(--brand-rgb, 99, 102, 241), 0.14), inset 0 1px 0 rgba(255, 255, 255, 0.35);
+        }
+
+        .action-button {
+            position: relative;
+            overflow: hidden;
+            box-shadow: 0 8px 18px rgba(var(--brand-rgb, 99, 102, 241), 0.24), inset 0 1px 0 rgba(255, 255, 255, 0.25);
+            transition: transform 160ms cubic-bezier(0.22, 1.18, 0.36, 1), box-shadow 160ms ease, background-color 160ms ease;
+        }
+
+        .action-button:hover:not(:disabled) {
+            box-shadow: 0 12px 26px rgba(var(--brand-rgb, 99, 102, 241), 0.32), 0 0 0 3px rgba(var(--brand-rgb, 99, 102, 241), 0.12), inset 0 1px 0 rgba(255, 255, 255, 0.30);
+        }
+
+        .action-button:active:not(:disabled) {
+            transform: translateY(1px) scale(0.97);
+            box-shadow: 0 4px 10px rgba(var(--brand-rgb, 99, 102, 241), 0.22);
+        }
+
+        .cat-btn.active,
+        .admin-sub-btn.bg-brand-600,
+        .admin-sub-btn.is-active {
+            box-shadow: 0 8px 18px rgba(var(--brand-rgb, 99, 102, 241), 0.28), 0 0 0 3px rgba(var(--brand-rgb, 99, 102, 241), 0.12);
+        }
+
+        button,
+        .tilt-3d {
+            -webkit-tap-highlight-color: transparent;
+        }
+
+        button:not(:disabled) { transition-property: transform, box-shadow, background-color, color, border-color, opacity; transition-duration: 160ms; }
+        button:not(:disabled):active { transform: translateY(1px) scale(0.97); }
+        button:disabled { cursor: not-allowed; }
+
+        .reveal {
+            opacity: 0;
+            transform: translateY(18px) scale(0.995);
+            will-change: opacity, transform;
+        }
+
+        .reveal-visible {
+            animation: reveal-up 520ms cubic-bezier(0.22, 1, 0.36, 1) both;
+        }
+
+        @keyframes reveal-up {
+            from { opacity: 0; transform: translateY(18px) scale(0.995); }
+            to { opacity: 1; transform: translateY(0) scale(1); }
+        }
+
+        @keyframes spring-press {
+            0% { transform: scale(1); }
+            45% { transform: scale(0.955); }
+            100% { transform: scale(1); }
+        }
+
+        button:not(:disabled):active { animation: spring-press 180ms ease-out; }
+
+        /* Universal TAHAM Official Pad printing */
+        .print-pad { background: #ffffff; }
+        .report-print-header { border-bottom: 1px solid #d8dee9; padding-bottom: 10px; margin-bottom: 12px; }
+        .report-print-kicker { margin: 0; color: #c1121f; font-size: 11px; font-weight: 900; letter-spacing: 0.06em; text-transform: uppercase; }
+        .report-print-title { margin: 3px 0 4px; color: #0b1f3a; font-size: 18px; font-weight: 900; }
+        .report-print-period { margin: 2px 0 0; color: #172033; font-size: 12px; font-weight: 700; }
+        .report-print-generated { margin: 3px 0 0; color: #526078; font-size: 11px; }
+        .report-metrics-grid { margin: 12px 0; }
+        .report-orders-wrap { margin-top: 12px; }
+        .report-orders-title { margin: 0 0 8px; color: #0b1f3a; font-size: 13px; font-weight: 900; text-transform: uppercase; letter-spacing: 0.03em; }
+        .report-print-table { width: 100%; border-collapse: collapse; font-size: 12px; background: #fff; }
+        .report-print-table th, .report-print-table td { border: 1px solid #d8dee9; padding: 6px 8px; text-align: left; }
+        .report-print-table thead th { background: #0b1f3a; color: #fff; font-weight: 900; }
+        .report-print-table tbody tr:nth-child(even) { background: #f8fafc; }
+        .report-print-table .num { text-align: right; }
+        .report-print-table .strong { font-weight: 800; }
+
+        /* Custom Taham Official Invoice / Cash Memo Pad */
+        .invoice-pad {
+            position: relative;
+            overflow: hidden;
+            background: #ffffff;
+            color: #172033;
+            border: 1px solid #d8dee9;
+            border-radius: 14px;
+            padding: 18px;
+            font-size: 12px;
+            line-height: 1.45;
+            box-shadow: 0 10px 28px rgba(11,31,58,0.10);
+        }
+
+        .invoice-pad * { position: relative; z-index: 1; }
+        .invoice-accent-stripe, .invoice-watermark { position: absolute; }
+
+        .invoice-accent-stripe {
+            top: 0;
+            left: 0;
+            right: 0;
+            height: 7px;
+            z-index: 3;
+            background: linear-gradient(90deg, #0b1f3a 0 33.333%, #c1121f 33.333% 66.666%, #d4af37 66.666% 100%);
+        }
+
+        .invoice-watermark {
+            top: 48%;
+            left: 50%;
+            z-index: 0;
+            transform: translate(-50%, -50%) rotate(-28deg) scale(1.25);
+            color: #0b1f3a;
+            opacity: 0.055;
+            font-size: 112px;
+            font-weight: 900;
+            letter-spacing: 0.08em;
+            white-space: nowrap;
+            pointer-events: none;
+            user-select: none;
+        }
+
+        .invoice-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: flex-start;
+            gap: 18px;
+            padding: 16px 2px 14px;
+            border-bottom: 2px solid #0b1f3a;
+            position: relative;
+            z-index: 2;
+        }
+
+        .invoice-brand { display: flex; align-items: center; gap: 12px; min-width: 0; }
+        .invoice-logo { width: 48px; height: 48px; object-fit: cover; border-radius: 10px; border: 1px solid #d8dee9; background: #fff; }
+        .invoice-title { margin: 0; color: #0b1f3a; font-size: 25px; line-height: 1; font-weight: 900; letter-spacing: 0.04em; }
+        .invoice-subtitle { margin: 4px 0 0; color: #c1121f; font-size: 11px; font-weight: 800; }
+        .invoice-address { margin: 4px 0 0; color: #526078; font-size: 11px; }
+
+        .invoice-order-heading { text-align: right; min-width: 180px; }
+        .invoice-badge { display: inline-block; padding: 7px 10px; background: #0b1f3a; color: #fff; border-radius: 7px; border: 1px solid #d4af37; font-size: 10px; font-weight: 900; letter-spacing: 0.09em; text-transform: uppercase; }
+        .invoice-helpline { margin: 7px 0 0; color: #526078; font-size: 10px; font-weight: 700; }
+
+        .invoice-info-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin: 14px 0; }
+        .invoice-box { background: #f8fafc; border: 1px solid #d8dee9; border-radius: 10px; padding: 11px; min-width: 0; }
+        .invoice-box-title { margin: 0 0 8px; padding-bottom: 6px; border-bottom: 1px solid #e2e8f0; color: #0b1f3a; font-size: 11px; font-weight: 900; letter-spacing: 0.04em; text-transform: uppercase; }
+        .invoice-label { margin: 7px 0 2px; color: #718096; font-size: 9px; font-weight: 800; text-transform: uppercase; letter-spacing: 0.04em; }
+        .invoice-value { margin: 0; color: #172033; font-size: 11px; font-weight: 700; overflow-wrap: anywhere; }
+        .invoice-address-value { white-space: pre-line; }
+        .invoice-order-row { display: flex; justify-content: space-between; gap: 10px; padding: 5px 0; border-bottom: 1px dashed #e2e8f0; }
+        .invoice-order-row:last-of-type { border-bottom: 0; }
+        .invoice-status { padding: 2px 7px; border-radius: 999px; background: #ecfdf5; color: #047857; border: 1px solid #a7f3d0; font-size: 9px; font-weight: 900; text-transform: uppercase; }
+
+        .invoice-table { width: 100%; border-collapse: collapse; margin: 14px 0; font-size: 10px; background: #fff; }
+        .invoice-table th, .invoice-table td { border: 1px solid #d8dee9; padding: 7px 6px; vertical-align: top; }
+        .invoice-table thead th { background: #0b1f3a; color: #fff; font-weight: 900; text-align: left; letter-spacing: 0.03em; text-transform: uppercase; }
+        .invoice-table tbody tr:nth-child(even) { background: #f8fafc; }
+        .invoice-sl { width: 34px; text-align: center; font-weight: 900; }
+        .invoice-center { text-align: center; }
+        .invoice-right { text-align: right; }
+        .invoice-item-meta { margin-top: 3px; color: #718096; font-size: 9px; font-weight: 600; }
+        .invoice-custom-note { margin-top: 5px; padding: 5px 6px; border-left: 3px solid #c1121f; background: #fff7f7; color: #172033; font-size: 9px; white-space: pre-line; }
+        .invoice-custom-note span { display: block; color: #c1121f; font-weight: 900; }
+        .invoice-original-price { color: #94a3b8; text-decoration: line-through; font-size: 9px; }
+
+        .invoice-summary-grid { display: grid; grid-template-columns: 1.1fr 0.9fr; gap: 12px; margin: 12px 0; align-items: start; }
+        .invoice-policy-box { border: 1px solid #d8dee9; background: #f8fafc; border-radius: 10px; padding: 10px; font-size: 10px; }
+        .invoice-policy-box ul { margin: 0; padding-left: 15px; }
+        .invoice-policy-box li { margin: 4px 0; }
+        .invoice-totals { border: 1px solid #d8dee9; border-radius: 10px; padding: 8px; background: #fff; }
+        .invoice-total-row { display: flex; justify-content: space-between; gap: 10px; padding: 5px 4px; border-bottom: 1px dashed #e2e8f0; }
+        .invoice-total-row:last-child { border-bottom: 0; }
+        .invoice-grand-total { background: #0b1f3a; color: #fff; border: 1px solid #d4af37; border-radius: 7px; margin-top: 6px; padding: 7px; font-weight: 900; }
+        .invoice-due-total { background: #fff7ed; color: #9a3412; border: 1px solid #fed7aa; border-radius: 7px; margin-top: 6px; padding: 7px; font-weight: 900; }
+
+        .invoice-payment-box { border: 1px solid #d8dee9; background: #f8fafc; border-radius: 10px; padding: 10px; margin: 12px 0; }
+        .invoice-payment-methods { display: flex; flex-wrap: wrap; gap: 7px; margin-top: 8px; }
+        .invoice-payment-option { display: inline-flex; align-items: center; gap: 6px; padding: 6px 9px; border: 1px solid #d8dee9; border-radius: 8px; background: #fff; color: #526078; font-size: 10px; font-weight: 800; opacity: 0.55; }
+        .invoice-check { display: inline-flex; width: 13px; height: 13px; align-items: center; justify-content: center; border: 1px solid #94a3b8; border-radius: 50%; background: #fff; color: transparent; font-size: 9px; font-weight: 900; }
+        .invoice-payment-option.active { opacity: 1; border-color: #c1121f; background: #fff1f2; color: #9f1239; box-shadow: 0 3px 10px rgba(193,18,31,0.12); }
+        .invoice-payment-option.active .invoice-check { background: #c1121f; border-color: #c1121f; color: #fff; }
+        .invoice-payment-note { margin: 5px 0 0; color: #526078; font-size: 9px; font-weight: 700; }
+
+        .invoice-signatures-footer { margin-top: 18px; }
+        .invoice-signatures { display: grid; grid-template-columns: 1fr 1fr; gap: 24px; padding: 20px 8px 10px; }
+        .invoice-signature { text-align: center; }
+        .invoice-signature-line { display: block; height: 34px; border-bottom: 1px solid #0b1f3a; margin-bottom: 6px; }
+        .invoice-signature p { margin: 0; color: #172033; font-size: 10px; font-weight: 800; }
+        .invoice-footer-bar { padding: 10px 12px; background: #0b1f3a; color: #fff; border-radius: 8px; border-top: 2px solid #c1121f; text-align: center; font-size: 10px; font-weight: 800; letter-spacing: 0.02em; }
+
+        @media print {
+            @page { size: A4; margin: 0; background-image: url("/official-pad-background.jpg"); background-size: cover; background-position: center; background-repeat: no-repeat; print-color-adjust: exact; -webkit-print-color-adjust: exact; }
+            body * { visibility: hidden !important; }
+            #invoice-print-area, #invoice-print-area *, .print-pad, .print-pad *, #report-print-area, #report-print-area * { visibility: visible !important; }
+            #invoice-print-area {
+                position: fixed !important;
+                inset: 0 !important;
+                z-index: 9999 !important;
+                width: 100% !important;
+                max-height: none !important;
+                overflow: visible !important;
+                margin: 0 !important;
+                padding: 14px !important;
+                border-radius: 0 !important;
+                box-shadow: none !important;
+                background: #fff !important;
+                color: #172033 !important;
+            }
+            #invoice-modal { position: static !important; max-height: none !important; overflow: visible !important; background: #fff !important; }
+            .no-print { display: none !important; }
+            .invoice-pad { -webkit-print-color-adjust: exact !important; print-color-adjust: exact !important; }
+            .invoice-accent-stripe, .invoice-badge, .invoice-table thead th, .invoice-grand-total, .invoice-footer-bar, .invoice-payment-option.active { -webkit-print-color-adjust: exact !important; print-color-adjust: exact !important; }
+            .invoice-watermark { opacity: 0.05 !important; }
+            html, body { background-image: url("/official-pad-background.jpg") !important; background-size: cover !important; background-position: center !important; background-repeat: no-repeat !important; -webkit-print-color-adjust: exact !important; print-color-adjust: exact !important; }
+            .invoice-accent-stripe { display: none !important; }
+            .print-pad, #invoice-print-area, #report-print-area {
+                position: relative !important;
+                z-index: 9999 !important;
+                width: 210mm !important;
+                max-width: 210mm !important;
+                min-height: 297mm !important;
+                max-height: none !important;
+                margin: 0 auto !important;
+                padding: 58mm 18mm 48mm !important;
+                box-sizing: border-box !important;
+                border: 0 !important;
+                border-radius: 0 !important;
+                box-shadow: none !important;
+                overflow: visible !important;
+                background-color: transparent !important;
+                background-image: url("/official-pad-background.jpg") !important;
+                background-size: cover !important;
+                background-position: center !important;
+                background-repeat: no-repeat !important;
+                background-origin: border-box !important;
+                background-clip: border-box !important;
+                -webkit-print-color-adjust: exact !important;
+                print-color-adjust: exact !important;
+            }
+            #invoice-print-area { padding: 58mm 18mm 48mm !important; }
+            #report-print-area { padding: 56mm 18mm 48mm !important; }
+            .no-print { display: none !important; }
+        }
+
+        /* Dynamic TAHAM pad sizing, safe margins, and multi-page printing */
+        @media print {
+            @page {
+                size: A4;
+                margin: 0;
+                width: 210mm;
+                height: 297mm;
+                background-image: url("/official-pad-background.jpg");
+                background-size: cover;
+                background-position: center;
+                background-repeat: no-repeat;
+                print-color-adjust: exact;
+                -webkit-print-color-adjust: exact;
+            }
+
+            html, body { width: 210mm; margin: 0 !important; padding: 0 !important; }
+
+            .print-pad {
+                position: relative !important;
+                width: 210mm !important;
+                height: 297mm !important;
+                max-width: 210mm !important;
+                max-height: none !important;
+                min-height: 297mm !important;
+                margin: 0 !important;
+                padding: var(--invoice-margin-top, 58mm) var(--invoice-margin-right, 18mm) var(--invoice-margin-bottom, 48mm) var(--invoice-margin-left, 18mm) !important;
+                box-sizing: border-box !important;
+                overflow: visible !important;
+                border: 0 !important;
+                border-radius: 0 !important;
+                box-shadow: none !important;
+                background-color: transparent !important;
+                background-image: var(--invoice-pad-image, url("/official-pad-background.jpg")) !important;
+                background-size: cover !important;
+                background-position: center !important;
+                background-repeat: no-repeat !important;
+                page-break-inside: auto !important;
+                break-inside: auto !important;
+                -webkit-print-color-adjust: exact !important;
+                print-color-adjust: exact !important;
+            }
+
+            #invoice-print-area, #report-print-area {
+                padding: var(--invoice-margin-top, 58mm) var(--invoice-margin-right, 18mm) var(--invoice-margin-bottom, 48mm) var(--invoice-margin-left, 18mm) !important;
+            }
+
+            .print-pad-background {
+                position: absolute !important;
+                top: 0 !important;
+                right: 0 !important;
+                bottom: 0 !important;
+                left: 0 !important;
+                width: 100% !important;
+                height: 100% !important;
+                max-width: none !important;
+                min-width: 0 !important;
+                object-fit: cover !important;
+                object-position: center center !important;
+                z-index: 0 !important;
+                visibility: visible !important;
+                pointer-events: none !important;
+                -webkit-print-color-adjust: exact !important;
+                print-color-adjust: exact !important;
+            }
+
+            .print-pad > :not(.print-pad-background) { position: relative; z-index: 1; }
+
+            .invoice-table, .report-print-table, table { page-break-inside: auto !important; break-inside: auto !important; }
+            .invoice-table thead, .report-print-table thead { display: table-header-group !important; }
+            .invoice-table tfoot, .report-print-table tfoot { display: table-footer-group !important; }
+            .invoice-table tbody tr, .report-print-table tbody tr, table tbody tr {
+                page-break-inside: avoid !important;
+                break-inside: avoid !important;
+                page-break-after: auto !important;
+                break-after: auto !important;
+            }
+            .invoice-totals, .invoice-payment-box, .invoice-signatures-footer, .report-print-header { page-break-inside: avoid !important; break-inside: avoid !important; }
+            .no-print { display: none !important; }
+        }
+
+        /* Invoice Setup live preview */
+        .invoice-pad-live-preview {
+            position: relative;
+            width: 100%;
+            max-width: 420px;
+            aspect-ratio: 210 / 297;
+            overflow: hidden;
+            border: 1px solid #d8dee9;
+            border-radius: 12px;
+            background: #fff;
+            margin-top: 12px;
+        }
+        .invoice-pad-live-bg { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
+        .invoice-pad-live-safe {
+            position: absolute;
+            top: 58mm;
+            bottom: 48mm;
+            left: 18mm;
+            right: 18mm;
+            border: 1px dashed #c1121f;
+            background: rgba(255,255,255,0.35);
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            gap: 4px;
+            color: #0b1f3a;
+            font-size: 11px;
+            text-align: center;
+        }
+        /* Floating 3D storefront footer */
+        .footer-3d {
+            position: relative;
+            z-index: 10;
+            max-width: 72rem;
+            margin: 2rem auto 1.5rem;
+            border-radius: 1.5rem;
+            border: 1px solid rgba(148, 163, 184, 0.22);
+            background: linear-gradient(145deg, #111827 0%, #0b1220 48%, #030712 100%);
+            color: #cbd5e1;
+            box-shadow:
+                0 28px 70px rgba(2, 6, 23, 0.45),
+                0 10px 24px rgba(15, 23, 42, 0.35),
+                inset 0 1px 0 rgba(255, 255, 255, 0.16),
+                inset 0 -1px 0 rgba(255, 255, 255, 0.04);
+            transform-style: preserve-3d;
+            overflow: hidden;
+        }
+
+        .footer-3d::before {
+            content: "";
+            position: absolute;
+            top: 0;
+            left: 1.5rem;
+            right: 1.5rem;
+            height: 1px;
+            background: linear-gradient(90deg, transparent, rgba(255,255,255,0.55), transparent);
+            pointer-events: none;
+        }
+
+        .footer-3d::after {
+            content: "";
+            position: absolute;
+            inset: auto -10% -45% -10%;
+            height: 8rem;
+            background: radial-gradient(ellipse at center, rgba(255,255,255,0.10), transparent 68%);
+            pointer-events: none;
+        }
+
+        .footer-title {
+            text-shadow: 0 1px 0 rgba(255,255,255,0.12), 0 8px 22px rgba(0,0,0,0.35);
+            letter-spacing: -0.02em;
+        }
+
+        .footer-address {
+            color: #94a3b8;
+            line-height: 1.45;
+            text-shadow: 0 1px 1px rgba(0,0,0,0.35);
+        }
+
+        .footer-phone-pill {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.55rem;
+            padding: 0.75rem 1.05rem;
+            border-radius: 999px;
+            border: 1px solid rgba(255,255,255,0.16);
+            background: linear-gradient(145deg, rgba(255,255,255,0.12), rgba(255,255,255,0.04));
+            color: #ffffff;
+            font-weight: 800;
+            font-size: 0.8rem;
+            letter-spacing: 0.01em;
+            box-shadow: 0 10px 24px rgba(0,0,0,0.28), inset 0 1px 0 rgba(255,255,255,0.22), inset 0 -1px 0 rgba(0,0,0,0.25);
+            backdrop-filter: blur(10px);
+            transition: transform 180ms cubic-bezier(0.22, 1.18, 0.36, 1), box-shadow 180ms ease, border-color 180ms ease, background 180ms ease;
+            text-decoration: none;
+        }
+
+        .footer-phone-pill:hover {
+            transform: translateY(-3px) scale(1.02);
+            border-color: rgba(255,255,255,0.34);
+            background: linear-gradient(145deg, rgba(255,255,255,0.18), rgba(255,255,255,0.07));
+            box-shadow: 0 16px 34px rgba(0,0,0,0.34), 0 0 0 3px rgba(255,255,255,0.06), inset 0 1px 0 rgba(255,255,255,0.28);
+        }
+
+        .footer-phone-pill:active { transform: translateY(1px) scale(0.98); }
+
+        @media (prefers-reduced-motion: reduce) {
+            html { scroll-behavior: auto; }
+            *, *::before, *::after {
+                animation-duration: 0.001ms !important;
+                animation-iteration-count: 1 !important;
+                transition-duration: 0.001ms !important;
+                scroll-behavior: auto !important;
+            }
+            .reveal { opacity: 1; transform: none; }
+            .tilt-3d, .product-card, .size-selector, .action-button, .footer-phone-pill { transform: none !important; }
+        }
+
+        .bg-slate-50 { background-color: var(--app-bg) !important; }
+        .bg-white { background-color: var(--app-surface) !important; }
+
+        .admin-sidebar,
+        .admin-subtab-panel.bg-white,
+        .settings-section {
+            box-shadow: var(--app-shadow);
+        }
+
+        .admin-sidebar {
+            position: sticky;
+            top: 1rem;
+            max-height: calc(100vh - 2rem);
+            overflow-y: auto;
+        }
+
+        .admin-sub-btn { text-align: left; }
+        .settings-submenu-btn { text-align: left; }
+        .theme-option { cursor: pointer; }
+
+        .product-image-zoom { cursor: zoom-in; }
+        .zoomable-image {
+            transform-origin: center center;
+            transition: transform 180ms ease-out;
+            will-change: transform, transform-origin;
+        }
+        .discount-badge {
+            display: inline-grid;
+            place-items: center;
+            z-index: 15;
+            width: 5.5rem;
+            min-height: 4.25rem;
+            padding: 0;
+            border: 0;
+            background: transparent;
+            color: #ffffff;
+            font-weight: 900;
+            text-transform: uppercase;
+            transform: rotate(5deg);
+            transform-style: preserve-3d;
+            isolation: isolate;
+            filter: drop-shadow(0 12px 16px rgba(15,23,42,0.32));
+            pointer-events: none;
+        }
+
+        .discount-badge::before {
+            content: "";
+            position: absolute;
+            inset: 0.45rem -0.25rem -0.45rem 0.45rem;
+            z-index: -2;
+            background: linear-gradient(135deg, #fbbf24 0%, #f59e0b 55%, #d97706 100%);
+            clip-path: polygon(10% 0, 90% 0, 100% 18%, 100% 100%, 0 100%, 0 18%);
+        }
+
+        .discount-badge::after {
+            content: "";
+            position: absolute;
+            right: -0.35rem;
+            bottom: -0.3rem;
+            width: 0.95rem;
+            height: 0.95rem;
+            z-index: -1;
+            background: #f59e0b;
+            transform: rotate(45deg);
+            box-shadow: inset 0 1px 0 rgba(255,255,255,0.35);
+        }
+
+        .discount-badge-shadow {
+            position: absolute;
+            inset: 0.55rem -0.5rem -0.55rem 0.55rem;
+            z-index: -3;
+            background: linear-gradient(135deg, #b45309 0%, #92400e 100%);
+            clip-path: polygon(10% 0, 90% 0, 100% 18%, 100% 100%, 0 100%, 0 18%);
+        }
+
+        .discount-badge-layer {
+            position: absolute;
+            inset: 0.25rem -0.3rem -0.25rem 0.25rem;
+            z-index: -1;
+            background: linear-gradient(135deg, #ff6b4a 0%, #f43f5e 55%, #e11d48 100%);
+            clip-path: polygon(10% 0, 90% 0, 100% 18%, 100% 100%, 0 100%, 0 18%);
+            box-shadow: inset 0 1px 0 rgba(255,255,255,0.30);
+        }
+
+        .discount-badge-navy {
+            position: relative;
+            z-index: 2;
+            width: 100%;
+            padding: 0.48rem 0.35rem 0.42rem;
+            background: linear-gradient(135deg, #0f172a 0%, #172554 100%);
+            border: 1px solid rgba(255,255,255,0.24);
+            border-bottom: 0;
+            clip-path: polygon(12% 0, 88% 0, 100% 18%, 100% 100%, 0 100%, 0 18%);
+            color: #ffffff;
+            font-size: 0.98rem;
+            line-height: 1;
+            font-weight: 900;
+            letter-spacing: -0.01em;
+            text-align: center;
+            transform: translateY(-2px);
+            box-shadow: inset 0 1px 0 rgba(255,255,255,0.22), 0 2px 0 rgba(15,23,42,0.45);
+        }
+
+        .discount-badge-ribbon {
+            position: relative;
+            z-index: 3;
+            width: 116%;
+            margin-top: -0.35rem;
+            padding: 0.25rem 0.25rem;
+            background: linear-gradient(135deg, #ff6b4a 0%, #e11d48 100%);
+            border: 1px solid rgba(255,255,255,0.30);
+            border-radius: 0.2rem;
+            color: #ffffff;
+            font-size: 0.58rem;
+            line-height: 1;
+            font-weight: 900;
+            letter-spacing: 0.13em;
+            text-align: center;
+            transform: rotate(-2deg);
+            box-shadow: 0 4px 0 #9f1239, 0 7px 12px rgba(15,23,42,0.22), inset 0 1px 0 rgba(255,255,255,0.28);
+        }
+
+        .discount-badge-accent {
+            position: absolute;
+            z-index: 4;
+            width: 0.48rem;
+            height: 0.48rem;
+            background: #fbbf24;
+            box-shadow: inset 0 1px 0 rgba(255,255,255,0.35), 0 2px 3px rgba(15,23,42,0.25);
+        }
+
+        .discount-badge-accent-one { top: -0.28rem; left: -0.28rem; transform: rotate(45deg); background: #fde68a; }
+        .discount-badge-accent-two { bottom: -0.22rem; left: 0.32rem; border-radius: 50%; background: #ef4444; }
+        .discount-badge-accent-three { top: 0.48rem; right: -0.28rem; transform: rotate(45deg); background: #f59e0b; }
+
+        .stock-switch input:checked + span { background-color: var(--brand-600); }
+        .stock-switch input:checked + span > span { transform: translateX(1.25rem); }
+
+        .bg-brand-50 { background-color: var(--brand-50) !important; }
+        .bg-brand-100 { background-color: var(--brand-100) !important; }
+        .bg-brand-300 { background-color: var(--brand-300) !important; }
+        .bg-brand-500 { background-color: var(--brand-500) !important; }
+        .bg-brand-600 { background-color: var(--brand-600) !important; }
+        .bg-brand-700 { background-color: var(--brand-700) !important; }
+        .bg-brand-900 { background-color: var(--brand-900) !important; }
+
+        .text-brand-500 { color: var(--brand-500) !important; }
+        .text-brand-600 { color: var(--brand-600) !important; }
+        .text-brand-700 { color: var(--brand-700) !important; }
+        .text-brand-900 { color: var(--brand-900) !important; }
+
+        .border-brand-300 { border-color: var(--brand-300) !important; }
+        .border-brand-500 { border-color: var(--brand-500) !important; }
+        .border-brand-600 { border-color: var(--brand-600) !important; }
+        .border-brand-700 { border-color: var(--brand-700) !important; }
+
+        .hover\:bg-brand-50:hover { background-color: var(--brand-50) !important; }
+        .hover\:bg-brand-600:hover { background-color: var(--brand-600) !important; }
+        .hover\:bg-brand-700:hover { background-color: var(--brand-700) !important; }
+        .hover\:border-brand-300:hover { border-color: var(--brand-300) !important; }
+        .hover\:border-brand-600:hover { border-color: var(--brand-600) !important; }
+        .ring-brand-500 { --tw-ring-color: var(--brand-500) !important; }
+        .selection\:bg-brand-500::selection { background-color: var(--brand-500) !important; }
+
+        @media print {
+            body * { visibility: hidden !important; }
+            #invoice-print-area, #invoice-print-area *, .print-pad, .print-pad *, #report-print-area, #report-print-area * { visibility: visible !important; }
+            #invoice-print-area {
+                position: fixed !important;
+                left: 0 !important;
+                top: 0 !important;
+                width: 100% !important;
+                background: white !important;
+                padding: 20px !important;
+                box-shadow: none !important;
+            }
+            .no-print { display: none !important; }
+        }
+            /* Single letterhead pad layer (screen + print). */
+        .print-pad-background { display: block; }
+
+        @media print {
+            @page {
+                size: A4 portrait;
+                margin: 0;
+                width: 210mm;
+                height: 297mm;
+                background-image: url("/official-pad-background.jpg");
+                background-size: 100% 100%;
+                background-position: 0 0;
+                background-repeat: no-repeat;
+                print-color-adjust: exact;
+                -webkit-print-color-adjust: exact;
+            }
+
+            html, body {
+                width: 210mm !important;
+                min-height: 297mm !important;
+                margin: 0 !important;
+                padding: 0 !important;
+                background: transparent !important;
+            }
+
+            body * { visibility: hidden !important; }
+
+            #report-print-area,
+            #report-print-area *,
+            #invoice-print-area,
+            #invoice-print-area *,
+            .print-pad,
+            .print-pad *,
+            .print-pad-background {
+                visibility: visible !important;
+            }
+
+            .print-pad {
+                display: block !important;
+                position: relative !important;
+                z-index: 1 !important;
+                width: 210mm !important;
+                height: 297mm !important;
+                min-height: 297mm !important;
+                max-width: 210mm !important;
+                max-height: none !important;
+                margin: 0 !important;
+                padding: var(--invoice-margin-top, 58mm) var(--invoice-margin-right, 18mm) var(--invoice-margin-bottom, 48mm) var(--invoice-margin-left, 18mm) !important;
+                box-sizing: border-box !important;
+                overflow: visible !important;
+                border: 0 !important;
+                border-radius: 0 !important;
+                box-shadow: none !important;
+                color: #172033 !important;
+                background-color: transparent !important;
+                background-image: var(--invoice-pad-image, url("/official-pad-background.jpg")) !important;
+                background-size: 100% 100% !important;
+                background-position: 0 0 !important;
+                background-repeat: no-repeat !important;
+                -webkit-print-color-adjust: exact !important;
+                print-color-adjust: exact !important;
+            }
+
+            #report-print-area.print-pad,
+            #invoice-print-area.print-pad {
+                position: relative !important;
+                inset: auto !important;
+                padding: var(--invoice-margin-top, 58mm) var(--invoice-margin-right, 18mm) var(--invoice-margin-bottom, 48mm) var(--invoice-margin-left, 18mm) !important;
+            }
+
+            .print-pad-background {
+                display: block !important;
+                position: absolute !important;
+                top: 0 !important;
+                right: 0 !important;
+                bottom: 0 !important;
+                left: 0 !important;
+                width: 100% !important;
+                height: 100% !important;
+                max-width: none !important;
+                max-height: none !important;
+                min-width: 0 !important;
+                min-height: 0 !important;
+                margin: 0 !important;
+                padding: 0 !important;
+                border: 0 !important;
+                transform: none !important;
+                object-fit: cover !important;
+                object-position: center center !important;
+                background-size: 100% 100% !important;
+                z-index: 0 !important;
+                visibility: visible !important;
+                opacity: 1 !important;
+                pointer-events: none !important;
+                -webkit-print-color-adjust: exact !important;
+                print-color-adjust: exact !important;
+            }
+
+            .print-pad > :not(.print-pad-background) {
+                position: relative;
+                z-index: 2 !important;
+                visibility: visible !important;
+            }
+
+            .report-print-header,
+            .report-metrics-grid,
+            .report-orders-wrap,
+            .report-print-table,
+            .report-print-table *,
+            .invoice-table,
+            .invoice-table * {
+                visibility: visible !important;
+                opacity: 1 !important;
+            }
+
+            .no-print { display: none !important; }
+        }
+</style>
+</head>
+<body class="bg-slate-50 text-slate-800 font-sans antialiased selection:bg-brand-500 selection:text-white">
+
+    <!-- Toast Notification Container -->
+    <div id="toast-container" class="fixed bottom-5 right-5 z-50 flex flex-col gap-2 pointer-events-none no-print"></div>
+
+    <!-- Top Navigation Bar -->
+    <header class="sticky top-0 z-40 bg-white/95 backdrop-blur-md border-b border-slate-200 shadow-sm no-print">
+        <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+            <div class="flex justify-between items-center h-16 sm:h-20">
+                <!-- Brand Logo -->
+                <div class="flex items-center gap-3 cursor-pointer" onclick="switchView('store')">
+                    <div class="w-11 h-11 sm:w-12 sm:h-12 rounded-xl overflow-hidden bg-black shadow-md shrink-0">
+                        <img id="site-logo" src="/logo.png?v=2" alt="Taham" class="w-full h-full object-cover">
+                    </div>
+                    <div>
+                        <h1 id="header-shop-name" class="text-lg sm:text-2xl font-bold bg-gradient-to-r from-brand-700 to-slate-900 bg-clip-text text-transparent leading-tight">
+                            Taham
+                        </h1>
+                        <div class="flex items-center gap-1.5">
+                            <span id="cloud-status-dot" class="w-2 h-2 rounded-full bg-amber-400 animate-pulse"></span>
+                            <p id="cloud-status-text" class="text-[10px] sm:text-xs text-slate-500 font-medium">Syncing...</p>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Navigation / Mode Switcher -->
+                <div class="flex items-center gap-2 sm:gap-3">
+                    <!-- Language switch -->
+                    <div class="flex items-center rounded-xl border border-slate-200 bg-white p-0.5 text-xs font-bold" data-notranslate role="group">
+                        <button id="lang-en" onclick="setLanguage('en')" class="px-2.5 py-1.5 rounded-lg bg-slate-900 text-white">English</button>
+                        <button id="lang-bn" onclick="setLanguage('bn')" class="px-2.5 py-1.5 rounded-lg text-slate-600 hover:bg-slate-100">বাংলা</button>
+                    </div>
+
+                    <!-- Storefront Button -->
+                    <button id="nav-store-btn" onclick="switchView('store')" class="px-3 sm:px-4 py-2 rounded-xl text-xs sm:text-sm font-semibold transition-all bg-brand-50 text-brand-700 border border-brand-200 flex items-center gap-1.5">
+                        <i data-lucide="store" class="w-4 h-4"></i>
+                        <span class="hidden sm:inline">Store</span>
+                    </button>
+
+                    <!-- Super Admin Button -->
+                    <button id="nav-admin-btn" onclick="handleAdminNavClick()" class="px-3 sm:px-4 py-2 rounded-xl text-xs sm:text-sm font-semibold transition-all bg-slate-900 text-white hover:bg-slate-800 shadow-sm flex items-center gap-1.5">
+                        <i data-lucide="shield-check" class="w-4 h-4 text-pink-400"></i>
+                        <span>Super Admin</span>
+                        <span id="pending-orders-badge" class="hidden bg-rose-600 text-white text-[10px] px-1.5 py-0.5 rounded-full font-bold">0</span>
+                    </button>
+
+                    <!-- Logout Button (Only shown when logged in) -->
+                    <button id="admin-logout-btn" onclick="logoutAdmin()" class="hidden p-2 sm:px-3 sm:py-2 rounded-xl bg-rose-50 text-rose-600 hover:bg-rose-100 border border-rose-200 text-xs font-bold flex items-center gap-1" title="Log out">
+                        <i data-lucide="log-out" class="w-4 h-4"></i>
+                        <span class="hidden md:inline">Logout</span>
+                    </button>
+
+                    <!-- Cart Button (Visible in Store Mode) -->
+                    <button id="header-cart-btn" onclick="toggleCart(true)" class="relative p-2.5 sm:p-3 rounded-xl bg-brand-600 text-white hover:bg-brand-700 transition-colors shadow-sm">
+                        <i data-lucide="shopping-cart" class="w-5 h-5"></i>
+                        <span id="cart-count" class="absolute -top-1.5 -right-1.5 bg-slate-900 text-white text-xs font-bold w-5 h-5 rounded-full flex items-center justify-center border-2 border-white">
+                            0
+                        </span>
+                    </button>
+                </div>
+            </div>
+        </div>
+    </header>
+
+    <!-- ========================================== -->
+    <!-- 1. CUSTOMER STOREFRONT VIEW                -->
+    <!-- ========================================== -->
+    <main id="store-view" class="pb-16 no-print">
+        <!-- Hero Banner (picture) -->
+        <section class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 pt-6 sm:pt-8">
+            <a href="#products-section" class="block rounded-3xl overflow-hidden shadow-xl border border-slate-200 bg-sky-100">
+                <img src="/hero.jpg?v=1" alt="Taham oversized hoodie collection" class="w-full h-auto block">
+            </a>
+            <div class="grid grid-cols-1 sm:grid-cols-2 gap-4 mt-5">
+                <div class="bg-white p-4 sm:p-5 rounded-2xl border border-slate-200 shadow-sm flex items-start gap-3.5">
+                    <div class="w-11 h-11 rounded-xl bg-brand-50 text-brand-600 flex items-center justify-center shrink-0">
+                        <i data-lucide="truck" class="w-5 h-5"></i>
+                    </div>
+                    <div>
+                        <h3 class="font-bold text-slate-900">Fast Home Delivery</h3>
+                        <p class="text-xs text-slate-500 mt-0.5">Delivery charge is only ৳60 inside Dhaka and ৳120 across Bangladesh.</p>
+                    </div>
+                </div>
+                <div class="bg-white p-4 sm:p-5 rounded-2xl border border-slate-200 shadow-sm flex items-start gap-3.5">
+                    <div class="w-11 h-11 rounded-xl bg-emerald-50 text-emerald-600 flex items-center justify-center shrink-0">
+                        <i data-lucide="shield-check" class="w-5 h-5"></i>
+                    </div>
+                    <div>
+                        <h3 class="font-bold text-slate-900">100% Colour Guarantee</h3>
+                        <p class="text-xs text-slate-500 mt-0.5">Inspect the product on delivery and pay after you receive it.</p>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- Shop by Collection -->
+        <section id="collections-section" class="hidden max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 pt-10 sm:pt-14">
+            <h3 class="text-xl sm:text-2xl font-bold text-slate-800 mb-5">Shop by Collection</h3>
+            <div id="collections-grid" class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-4"></div>
+        </section>
+
+        <!-- Search & Category Filter Bar -->
+        <section id="products-section" class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 pt-8 sm:pt-12">
+            <div class="bg-white p-4 sm:p-5 rounded-2xl shadow-sm border border-slate-200">
+                <div class="flex flex-col md:flex-row justify-between items-stretch md:items-center gap-4">
+                    <!-- Category Pills -->
+                    <div id="category-filters" class="flex items-center gap-2 overflow-x-auto pb-2 md:pb-0"></div>
+
+                    <!-- Search Input -->
+                    <div class="relative w-full md:w-72">
+                        <i data-lucide="search" class="w-4 h-4 text-slate-400 absolute left-3.5 top-1/2 -translate-y-1/2"></i>
+                        <input type="text" id="search-input" oninput="renderProducts()" placeholder="Search clothes by name..." class="w-full pl-10 pr-4 py-2.5 rounded-xl border border-slate-200 bg-slate-50 focus:bg-white focus:outline-none focus:ring-2 focus:ring-brand-500 text-sm">
+                    </div>
+                </div>
+            </div>
+
+            <!-- Products Grid -->
+            <div class="mt-8">
+                <div class="flex justify-between items-center mb-6">
+                    <h3 class="text-xl sm:text-2xl font-bold text-slate-800" id="current-category-title">All Collections</h3>
+                    <span id="product-count-label" class="text-sm text-slate-500 font-medium">Loading...</span>
+                </div>
+
+                <div id="products-grid" class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-6">
+                    <!-- Products dynamically rendered here -->
+                </div>
+            </div>
+        </section>
+    </main>
+
+    <!-- ========================================== -->
+    <!-- 2. SUPER ADMIN ERP DASHBOARD VIEW          -->
+    <!-- ========================================== -->
+    <main id="admin-view" class="hidden max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8 pb-20 no-print">
+        <!-- Business Analytics Overview Cards -->
+        <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-4 mb-8">
+            <button type="button" onclick="openAdminSummary('orders')" class="bg-white p-5 rounded-2xl border border-slate-200 shadow-sm text-left w-full hover:border-brand-300 hover:shadow-md transition-all">
+                <div class="flex items-center justify-between">
+                    <p class="text-xs font-semibold text-slate-500">Total Sales</p>
+                    <div class="w-9 h-9 rounded-xl bg-blue-50 text-blue-600 flex items-center justify-center">
+                        <i data-lucide="banknote" class="w-5 h-5"></i>
+                    </div>
+                </div>
+                <p id="stat-revenue" class="text-2xl font-bold text-slate-900 mt-2">৳ 0</p>
+                <p class="text-[11px] text-slate-400 mt-1">Total sales including delivery charge</p>
+            </button>
+
+            <button type="button" onclick="openAdminSummary('orders')" class="bg-white p-5 rounded-2xl border border-emerald-200 shadow-sm bg-gradient-to-br from-white to-emerald-50/40 text-left w-full hover:border-emerald-400 hover:shadow-md transition-all">
+                <div class="flex items-center justify-between">
+                    <p class="text-xs font-semibold text-emerald-700">Net Profit</p>
+                    <div class="w-9 h-9 rounded-xl bg-emerald-100 text-emerald-700 flex items-center justify-center">
+                        <i data-lucide="trending-up" class="w-5 h-5"></i>
+                    </div>
+                </div>
+                <p id="stat-profit" class="text-2xl font-bold text-emerald-700 mt-2">৳ 0</p>
+                <p class="text-[11px] text-emerald-600/80 mt-1">Net profit after purchase cost and expenses</p>
+            </button>
+
+            <button type="button" onclick="openAdminSummary('expenses')" class="bg-white p-5 rounded-2xl border border-slate-200 shadow-sm text-left w-full hover:border-rose-300 hover:shadow-md transition-all">
+                <div class="flex items-center justify-between">
+                    <p class="text-xs font-semibold text-slate-500">Total Expenses</p>
+                    <div class="w-9 h-9 rounded-xl bg-rose-50 text-rose-600 flex items-center justify-center">
+                        <i data-lucide="receipt" class="w-5 h-5"></i>
+                    </div>
+                </div>
+                <p id="stat-expenses" class="text-2xl font-bold text-rose-600 mt-2">৳ 0</p>
+                <p class="text-[11px] text-slate-400 mt-1">Shop & other expenses</p>
+            </button>
+
+            <button type="button" onclick="openAdminSummary('orders', 'Pending')" class="bg-white p-5 rounded-2xl border border-slate-200 shadow-sm text-left w-full hover:border-amber-300 hover:shadow-md transition-all">
+                <div class="flex items-center justify-between">
+                    <p class="text-xs font-semibold text-slate-500">Pending Orders</p>
+                    <div class="w-9 h-9 rounded-xl bg-amber-50 text-amber-600 flex items-center justify-center">
+                        <i data-lucide="clock" class="w-5 h-5"></i>
+                    </div>
+                </div>
+                <p id="stat-pending" class="text-2xl font-bold text-amber-600 mt-2">0</p>
+                <p id="stat-total-orders" class="text-[11px] text-slate-400 mt-1">Total Orders: 0</p>
+            </button>
+
+            <button type="button" onclick="openAdminSummary('inventory')" class="bg-white p-5 rounded-2xl border border-slate-200 shadow-sm text-left w-full hover:border-purple-300 hover:shadow-md transition-all">
+                <div class="flex items-center justify-between">
+                    <p class="text-xs font-semibold text-slate-500">Low Stock Alert</p>
+                    <div class="w-9 h-9 rounded-xl bg-purple-50 text-purple-600 flex items-center justify-center">
+                        <i data-lucide="alert-triangle" class="w-5 h-5"></i>
+                    </div>
+                </div>
+                <p id="stat-low-stock" class="text-2xl font-bold text-purple-700 mt-2">0</p>
+                <p id="stat-total-products" class="text-[11px] text-slate-400 mt-1">Total Items: 0</p>
+            </button>
+        </div>
+
+        <!-- Admin Sub-Navigation Tabs -->
+        <div class="admin-layout flex flex-col lg:flex-row gap-6 items-start">
+            <nav id="admin-sidebar" class="admin-sidebar w-full lg:w-64 lg:flex-shrink-0 bg-white rounded-2xl border border-slate-200 shadow-sm p-3 space-y-1" aria-label="Admin navigation">
+                <button type="button" onclick="switchAdminSubTab('orders')" data-subtab="orders" class="admin-sub-btn w-full px-4 py-2.5 rounded-xl text-sm font-bold bg-brand-600 text-white shadow-sm flex items-center justify-start gap-2">
+                    <i data-lucide="package-check" class="w-4 h-4"></i>
+                    <span>Orders & Invoices</span>
+                </button>
+                <button type="button" onclick="switchAdminSubTab('inventory')" data-subtab="inventory" class="admin-sub-btn w-full px-4 py-2.5 rounded-xl text-sm font-bold bg-white text-slate-700 hover:bg-slate-100 border border-slate-200 flex items-center justify-start gap-2">
+                    <i data-lucide="shirt" class="w-4 h-4"></i>
+                    <span>Products & Stock (Inventory)</span>
+                </button>
+                <button type="button" onclick="switchAdminSubTab('collections')" data-subtab="collections" class="admin-sub-btn w-full px-4 py-2.5 rounded-xl text-sm font-bold bg-white text-slate-700 hover:bg-slate-100 border border-slate-200 flex items-center justify-start gap-2">
+                    <i data-lucide="layout-grid" class="w-4 h-4"></i>
+                    <span>Collections</span>
+                </button>
+                <button type="button" onclick="switchAdminSubTab('expenses')" data-subtab="expenses" class="admin-sub-btn w-full px-4 py-2.5 rounded-xl text-sm font-bold bg-white text-slate-700 hover:bg-slate-100 border border-slate-200 flex items-center justify-start gap-2">
+                    <i data-lucide="wallet" class="w-4 h-4"></i>
+                    <span>Daily Expenses</span>
+                </button>
+                <button type="button" onclick="switchAdminSubTab('settings')" data-subtab="settings" class="admin-sub-btn w-full px-4 py-2.5 rounded-xl text-sm font-bold bg-white text-slate-700 hover:bg-slate-100 border border-slate-200 flex items-center justify-start gap-2">
+                    <i data-lucide="settings" class="w-4 h-4"></i>
+                    <span>Settings</span>
+                </button>
+                <button type="button" onclick="switchAdminSubTab('reports')" data-subtab="reports" class="admin-sub-btn w-full px-4 py-2.5 rounded-xl text-sm font-bold bg-white text-slate-700 hover:bg-slate-100 border border-slate-200 flex items-center justify-start gap-2">
+                    <i data-lucide="bar-chart-3" class="w-4 h-4"></i>
+                    <span>Reports</span>
+                </button>
+            </nav>
+
+            <div class="admin-content flex-1 min-w-0 w-full space-y-6">
+        <!-- SUB-TAB 1: ORDERS & INVOICE PRINTING -->
+        <div id="subtab-orders" class="admin-subtab-panel space-y-6">
+            <div class="bg-white p-6 rounded-2xl border border-slate-200 shadow-sm">
+                <div class="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4 mb-6 pb-4 border-b border-slate-100">
+                    <div>
+                        <h3 class="text-lg font-bold text-slate-900">All Customer Orders</h3>
+                        <p class="text-xs text-slate-500">Changing the order status updates stock automatically, and you can print the receipt.</p>
+                    </div>
+                    <select id="admin-order-filter" onchange="renderAdminOrders()" class="px-3.5 py-2 rounded-xl border border-slate-200 text-sm font-semibold bg-slate-50">
+                        <option value="All">All Orders</option>
+                        <option value="Pending">Pending</option>
+                        <option value="Processing">Processing</option>
+                        <option value="Delivered">Delivered</option>
+                        <option value="Cancelled">Cancelled</option>
+                    </select>
+                </div>
+
+                <div id="admin-orders-list" class="space-y-4">
+                    <!-- Orders injected here -->
+                </div>
+            </div>
+        </div>
+
+        <!-- SUB-TAB 2: PRODUCT & INVENTORY MANAGEMENT -->
+        <div id="subtab-inventory" class="admin-subtab-panel hidden grid grid-cols-1 lg:grid-cols-3 gap-8">
+            <!-- Add / Edit Product Form -->
+            <div class="lg:col-span-1">
+                <div class="bg-white p-6 rounded-2xl border border-slate-200 shadow-sm sticky top-24">
+                    <div class="flex items-center justify-between mb-5 pb-3 border-b border-slate-100">
+                        <div class="flex items-center gap-2">
+                            <i data-lucide="plus-circle" class="w-5 h-5 text-brand-600"></i>
+                            <h3 id="product-form-title" class="text-lg font-bold text-slate-900">Add New Product</h3>
+                        </div>
+                        <button id="cancel-edit-btn" onclick="resetProductForm()" class="hidden text-xs text-rose-600 font-bold hover:underline">Cancel</button>
+                    </div>
+
+                    <form id="product-form" onsubmit="handleSaveProduct(event)" class="space-y-4">
+                        <input type="hidden" id="edit-prod-id">
+                        
+                        <div>
+                            <label class="block text-xs font-bold text-slate-700 mb-1">Product Name *</label>
+                            <input type="text" id="prod-name" required placeholder="e.g. Premium Cotton Panjabi" class="w-full px-3.5 py-2.5 rounded-xl border border-slate-200 focus:outline-none focus:ring-2 focus:ring-brand-500 text-sm">
+                        </div>
+
+                        <div class="grid grid-cols-2 gap-3">
+                            <div>
+                                <label class="block text-xs font-bold text-slate-700 mb-1">Collection *</label>
+                                <select id="prod-category" class="w-full px-3 py-2.5 rounded-xl border border-slate-200 focus:outline-none focus:ring-2 focus:ring-brand-500 text-sm bg-white"></select>
+                            </div>
+                            <div>
+                                <label class="block text-xs font-bold text-slate-700 mb-1">Stock (Pcs) *</label>
+                                <input type="number" id="prod-stock" required min="0" value="20" class="w-full px-3.5 py-2.5 rounded-xl border border-slate-200 focus:outline-none focus:ring-2 focus:ring-brand-500 text-sm">
+                            </div>
+                        </div>
+
+                        <div class="grid grid-cols-2 gap-3">
+                            <div>
+                                <label class="block text-xs font-bold text-slate-700 mb-1">Buying Price (৳) *</label>
+                                <input type="number" id="prod-buying-price" required oninput="updateDiscountPreview()" min="1" placeholder="850" class="w-full px-3.5 py-2.5 rounded-xl border border-slate-200 focus:outline-none focus:ring-2 focus:ring-brand-500 text-sm bg-amber-50/30">
+                            </div>
+                            <div>
+                                <label class="block text-xs font-bold text-slate-700 mb-1">Selling Price (৳) *</label>
+                                <input type="number" id="prod-price" required oninput="updateDiscountPreview()" min="1" placeholder="1450" class="w-full px-3.5 py-2.5 rounded-xl border border-slate-200 focus:outline-none focus:ring-2 focus:ring-brand-500 text-sm bg-emerald-50/30">
+                            </div>
+                        </div>
+
+                        <!-- Discount -->
+                        <div class="p-3.5 rounded-xl border border-amber-200 bg-amber-50/50 space-y-2">
+                            <label class="block text-xs font-bold text-amber-900">Discount (optional)</label>
+                            <div class="grid grid-cols-2 gap-3">
+                                <select id="prod-discount-type" onchange="updateDiscountPreview()" class="w-full px-3 py-2.5 rounded-xl border border-slate-200 text-sm bg-white focus:outline-none focus:ring-2 focus:ring-brand-500">
+                                    <option value="none">No discount</option>
+                                    <option value="percent">Percentage (%)</option>
+                                    <option value="amount">Fixed amount (৳)</option>
+                                </select>
+                                <input type="number" id="prod-discount-value" min="0" step="1" value="0" oninput="updateDiscountPreview()" placeholder="Value" class="w-full px-3.5 py-2.5 rounded-xl border border-slate-200 text-sm focus:outline-none focus:ring-2 focus:ring-brand-500">
+                            </div>
+                            <p id="discount-preview" class="hidden text-xs font-semibold text-amber-900"></p>
+                        </div>
+
+                        <!-- Colours -->
+                        <div class="p-3.5 rounded-xl border border-slate-200 bg-slate-50/60 space-y-2.5">
+                            <label class="block text-xs font-bold text-slate-800">Colours (optional)</label>
+                            <p class="text-[11px] text-slate-500">Pick from the list or add your own colour:</p>
+                            <div id="color-presets" class="flex flex-wrap gap-1.5"></div>
+                            <div class="flex items-center gap-2">
+                                <input type="color" id="prod-color-hex" value="#7f1d1d" class="w-10 h-9 p-0.5 rounded-lg border border-slate-200 bg-white cursor-pointer shrink-0">
+                                <input type="text" id="prod-color-name" maxlength="30" placeholder="Colour name, e.g. Wine Red" onkeydown="if(event.key==='Enter'){event.preventDefault();addCustomColor();}" class="flex-1 min-w-0 px-3 py-2 rounded-lg border border-slate-200 text-xs bg-white focus:outline-none focus:ring-2 focus:ring-brand-500">
+                                <button type="button" onclick="addCustomColor()" class="px-3 py-2 rounded-lg bg-slate-900 text-white text-xs font-bold hover:bg-slate-800 shrink-0">Add</button>
+                            </div>
+                            <div>
+                                <p class="text-[11px] font-semibold text-slate-600 mb-1">Selected colours:</p>
+                                <div id="color-selected" class="flex flex-wrap gap-1.5"></div>
+                            </div>
+                        </div>
+
+                        <!-- Product photos -->
+                        <div class="p-3.5 rounded-xl border border-dashed border-brand-300 bg-brand-50/30 space-y-2.5">
+                            <label class="block text-xs font-bold text-brand-900">Product photos</label>
+                            <p class="text-[11px] text-slate-500">Upload several photos at once (up to 8). The first photo is the main one.</p>
+                            <input type="file" id="prod-image-file" accept="image/*" multiple onchange="handleImageFileUpload(event)" class="w-full text-xs text-slate-600 file:mr-3 file:py-1.5 file:px-3 file:rounded-lg file:border-0 file:text-xs file:font-semibold file:bg-brand-600 file:text-white hover:file:bg-brand-700 cursor-pointer">
+                            <p class="text-[11px] text-slate-500">Set a colour under each photo so customers can recognise it.</p>
+                            <div id="prod-gallery" class="grid grid-cols-2 gap-2"></div>
+                            <div class="flex items-center gap-2">
+                                <input type="text" id="prod-image" placeholder="Or add an image link (URL)..." onkeydown="if(event.key==='Enter'){event.preventDefault();addImageLink();}" class="flex-1 min-w-0 px-3 py-2 rounded-lg border border-slate-200 bg-white text-xs">
+                                <button type="button" onclick="addImageLink()" class="px-3 py-2 rounded-lg bg-slate-900 text-white text-xs font-bold hover:bg-slate-800 shrink-0">Add link</button>
+                            </div>
+                        </div>
+
+                        <div>
+                            <label class="block text-xs font-bold text-slate-700 mb-1">Description</label>
+                            <textarea id="prod-desc" rows="2" placeholder="Write about fabric quality, colour or size..." class="w-full px-3.5 py-2 rounded-xl border border-slate-200 focus:outline-none focus:ring-2 focus:ring-brand-500 text-sm"></textarea>
+                        </div>
+
+                        <button type="submit" id="save-product-submit-btn" class="w-full py-3 rounded-xl bg-brand-600 hover:bg-brand-700 text-white font-semibold shadow-md transition-all flex items-center justify-center gap-2">
+                            <i data-lucide="save" class="w-4 h-4"></i>
+                            <span>Save Product</span>
+                        </button>
+                    </form>
+                </div>
+            </div>
+
+            <!-- Inventory Table -->
+            <div class="lg:col-span-2">
+                <div class="bg-white p-6 rounded-2xl border border-slate-200 shadow-sm">
+                    <div class="flex justify-between items-center mb-5 pb-3 border-b border-slate-100">
+                        <h3 class="text-lg font-bold text-slate-900">Stock & Profit/Loss List</h3>
+                        <span class="text-xs text-slate-500">Only you can see the buying price</span>
+                    </div>
+
+                    <div id="admin-products-list" class="divide-y divide-slate-100">
+                        <!-- Inventory items injected here -->
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- SUB-TAB: COLLECTIONS (photo + name) -->
+        <div id="subtab-collections" class="admin-subtab-panel hidden">
+            <div class="bg-white p-6 rounded-2xl border border-slate-200 shadow-sm">
+                <div class="flex items-center justify-between gap-4 mb-5 pb-3 border-b border-slate-100">
+                    <div>
+                        <h3 class="text-lg font-bold text-slate-900">Your Collections</h3>
+                        <p class="text-xs text-slate-500 mt-1">These photos appear on the storefront. Customers tap a collection to see its clothes.</p>
+                    </div>
+                    <button type="button" onclick="openCollectionModal()" class="px-4 py-2.5 rounded-xl bg-brand-600 hover:bg-brand-700 text-white text-sm font-bold shadow-sm flex items-center gap-2 whitespace-nowrap">
+                        <i data-lucide="plus" class="w-4 h-4"></i>
+                        <span>Add New Collection</span>
+                    </button>
+                </div>
+                <div id="admin-collections-list" class="divide-y divide-slate-100"></div>
+            </div>
+        </div>
+
+        <!-- Collection Modal -->
+        <div id="collection-modal" class="fixed inset-0 z-50 hidden flex items-center justify-center p-4 no-print">
+            <div onclick="closeCollectionModal()" class="fixed inset-0 bg-slate-900/75 backdrop-blur-sm"></div>
+            <div class="bg-white rounded-2xl max-w-2xl w-full p-6 sm:p-8 relative z-10 shadow-2xl max-h-[90vh] overflow-y-auto">
+                <div class="flex justify-between items-start gap-4 pb-4 border-b border-slate-100 mb-5">
+                    <div class="flex items-center gap-2">
+                        <i data-lucide="layout-grid" class="w-5 h-5 text-brand-600"></i>
+                        <h3 id="col-form-title" class="text-lg font-bold text-slate-900">Add New Collection</h3>
+                    </div>
+                    <div class="flex items-center gap-2">
+                        <button id="col-cancel-btn" onclick="closeCollectionModal()" class="hidden text-xs text-rose-600 font-bold hover:underline">Cancel</button>
+                        <button type="button" onclick="closeCollectionModal()" class="p-2 rounded-xl text-slate-400 hover:bg-slate-100"><i data-lucide="x" class="w-4 h-4"></i></button>
+                    </div>
+                </div>
+                <form id="collection-form" onsubmit="handleSaveCollection(event)" class="space-y-4">
+                    <input type="hidden" id="edit-col-id">
+                    <div>
+                        <label class="block text-xs font-bold text-slate-700 mb-1">Collection Name *</label>
+                        <input type="text" id="col-name" required maxlength="40" placeholder="e.g. Winter Wear" class="w-full px-3.5 py-2.5 rounded-xl border border-slate-200 focus:outline-none focus:ring-2 focus:ring-brand-500 text-sm" oninput="renderCollectionProductSelector()">
+                    </div>
+                    <div class="p-3.5 rounded-xl border border-dashed border-brand-300 bg-brand-50/30 space-y-2">
+                        <label class="block text-xs font-bold text-brand-900">Cover Photo (upload or URL)</label>
+                        <input type="file" id="col-image-file" accept="image/*" onchange="handleCollectionImageUpload(event)" class="w-full text-xs text-slate-600 file:mr-3 file:py-1.5 file:px-3 file:rounded-lg file:border-0 file:text-xs file:font-semibold file:bg-brand-600 file:text-white hover:file:bg-brand-700 cursor-pointer">
+                        <div id="col-image-preview-box" class="hidden pt-2">
+                            <img id="col-image-preview-img" src="" class="h-28 w-24 object-cover rounded-lg border border-slate-200 shadow-sm">
+                        </div>
+                        <input type="text" id="col-image-url" placeholder="Or paste an image link (URL)..." class="w-full px-3 py-2 rounded-lg border border-slate-200 bg-white text-xs mt-1">
+                    </div>
+                    <div>
+                        <label class="block text-xs font-bold text-slate-700 mb-1">Assign Products to Collection</label>
+                        <div id="col-product-selector" class="max-h-48 overflow-y-auto rounded-xl border border-slate-200 divide-y divide-slate-100 bg-white"></div>
+                        <p class="text-[11px] text-slate-400 mt-1">Select products to assign. Products removed here will be unassigned from this collection.</p>
+                    </div>
+                    <button type="submit" class="w-full py-3 rounded-xl bg-brand-600 hover:bg-brand-700 text-white font-semibold shadow-md transition-all flex items-center justify-center gap-2">
+                        <i data-lucide="save" class="w-4 h-4"></i>
+                        <span>Save Collection</span>
+                    </button>
+                </form>
+            </div>
+        </div>
+
+        <!-- SUB-TAB 3: DAILY EXPENSE TRACKER -->
+        <div id="subtab-expenses" class="admin-subtab-panel hidden">
+            <div class="bg-white p-6 rounded-2xl border border-slate-200 shadow-sm">
+                <div class="flex items-center justify-between gap-4 mb-5 pb-3 border-b border-slate-100">
+                    <div>
+                        <h3 class="text-lg font-bold text-slate-900">Daily Expense List</h3>
+                    </div>
+                    <button type="button" onclick="openExpenseModal()" class="px-4 py-2.5 rounded-xl bg-brand-600 hover:bg-brand-700 text-white text-sm font-bold shadow-sm flex items-center gap-2 whitespace-nowrap">
+                        <i data-lucide="plus" class="w-4 h-4"></i>
+                        <span>Add New Expense</span>
+                    </button>
+                </div>
+                <div id="admin-expenses-list" class="divide-y divide-slate-100">
+                    <!-- Expenses injected here -->
+                </div>
+            </div>
+        </div>
+
+        <!-- Expense Modal -->
+        <div id="expense-modal" class="fixed inset-0 z-50 hidden flex items-center justify-center p-4 no-print">
+            <div onclick="closeExpenseModal()" class="fixed inset-0 bg-slate-900/75 backdrop-blur-sm"></div>
+            <div class="bg-white rounded-2xl max-w-lg w-full p-6 sm:p-8 relative z-10 shadow-2xl max-h-[90vh] overflow-y-auto">
+                <div class="flex justify-between items-center pb-4 border-b border-slate-100 mb-5">
+                    <h3 class="text-lg font-bold text-slate-900">Add New Expense</h3>
+                    <button type="button" onclick="closeExpenseModal()" class="p-2 rounded-xl text-slate-400 hover:bg-slate-100"><i data-lucide="x" class="w-4 h-4"></i></button>
+                </div>
+                <form onsubmit="handleAddExpense(event)" class="space-y-4">
+                    <div>
+                        <label class="block text-xs font-bold text-slate-700 mb-1">Expense Description *</label>
+                        <input type="text" id="exp-title" required placeholder="e.g. Shop rent / Packaging bags" class="w-full px-3.5 py-2.5 rounded-xl border border-slate-200 text-sm">
+                    </div>
+                    <div>
+                        <label class="block text-xs font-bold text-slate-700 mb-1">Expense Category *</label>
+                        <select id="exp-category" class="w-full px-3.5 py-2.5 rounded-xl border border-slate-200 text-sm bg-white">
+                            <option value="Shop rent & bills">Shop rent & electricity bill</option>
+                            <option value="Packaging & delivery">Packaging & courier cost</option>
+                            <option value="Marketing & boosting">Facebook boosting / marketing</option>
+                            <option value="Staff & hospitality">Staff salary & hospitality</option>
+                            <option value="Other">Other expenses</option>
+                        </select>
+                    </div>
+                    <div>
+                        <label class="block text-xs font-bold text-slate-700 mb-1">Amount (৳) *</label>
+                        <input type="number" id="exp-amount" required min="1" placeholder="500" class="w-full px-3.5 py-2.5 rounded-xl border border-slate-200 text-sm">
+                    </div>
+                    <button type="submit" class="w-full py-3 rounded-xl bg-rose-600 hover:bg-rose-700 text-white font-semibold shadow-sm transition-all">
+                        Add Expense
+                    </button>
+                </form>
+            </div>
+        </div>
+
+        <!-- SUB-TAB 4: SETTINGS -->
+        <div id="subtab-settings" class="admin-subtab-panel hidden w-full">
+            <div class="settings-layout grid grid-cols-1 lg:grid-cols-[220px_1fr] gap-6 items-start">
+                <nav class="settings-submenu bg-white rounded-2xl border border-slate-200 shadow-sm p-3 space-y-1" aria-label="Settings sections">
+                    <button type="button" onclick="switchSettingsSection('user-management')" data-settings-section="user-management" class="settings-submenu-btn w-full px-4 py-2.5 rounded-xl text-sm font-bold bg-brand-600 text-white flex items-center justify-start gap-2">
+                        <i data-lucide="users" class="w-4 h-4"></i>
+                        <span>User Management</span>
+                    </button>
+                    <button type="button" onclick="switchSettingsSection('access-control')" data-settings-section="access-control" class="settings-submenu-btn w-full px-4 py-2.5 rounded-xl text-sm font-bold bg-white text-slate-700 hover:bg-slate-100 border border-slate-200 flex items-center justify-start gap-2">
+                        <i data-lucide="shield-check" class="w-4 h-4"></i>
+                        <span>Access Control</span>
+                    </button>
+                    <button type="button" onclick="switchSettingsSection('page-setup')" data-settings-section="page-setup" class="settings-submenu-btn w-full px-4 py-2.5 rounded-xl text-sm font-bold bg-white text-slate-700 hover:bg-slate-100 border border-slate-200 flex items-center justify-start gap-2">
+                        <i data-lucide="file-cog" class="w-4 h-4"></i>
+                        <span>Page Setup</span>
+                    </button>
+                    <button type="button" onclick="switchSettingsSection('theme')" data-settings-section="theme" class="settings-submenu-btn w-full px-4 py-2.5 rounded-xl text-sm font-bold bg-white text-slate-700 hover:bg-slate-100 border border-slate-200 flex items-center justify-start gap-2">
+                        <i data-lucide="palette" class="w-4 h-4"></i>
+                        <span>Theme</span>
+                    </button>
+                    <button type="button" onclick="switchSettingsSection('invoice-setup')" data-settings-section="invoice-setup" class="settings-submenu-btn w-full px-4 py-2.5 rounded-xl text-sm font-bold bg-white text-slate-700 hover:bg-slate-100 border border-slate-200 flex items-center justify-start gap-2">
+                        <i data-lucide="file-text" class="w-4 h-4"></i>
+                        <span>Invoice Setup</span>
+                    </button>
+                </nav>
+
+                <div class="settings-content min-w-0 space-y-6">
+                    <section id="settings-user-management" class="settings-section bg-white p-6 sm:p-8 rounded-2xl border border-slate-200 shadow-sm">
+                        <div class="flex items-start justify-between gap-4 mb-6 pb-4 border-b border-slate-100">
+                            <div>
+                                <h3 class="text-xl font-bold text-slate-900 mb-2">User Management</h3>
+                                <p class="text-xs text-slate-500">Manage users, roles, and the primary Super Admin account.</p>
+                            </div>
+                            <button type="button" onclick="openUserModal()" class="px-4 py-2.5 rounded-xl bg-brand-600 hover:bg-brand-700 text-white text-sm font-bold shadow-sm flex items-center gap-2 whitespace-nowrap">
+                                <i data-lucide="user-plus" class="w-4 h-4"></i>
+                                <span>Add New User</span>
+                            </button>
+                        </div>
+
+                        <form onsubmit="handleSaveSettings(event)" class="space-y-4 mb-8">
+                            <h4 class="text-sm font-bold text-slate-900">Super Admin Account</h4>
+                            <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                                <div>
+                                    <label class="block text-xs font-bold text-slate-700 mb-1">Admin Username</label>
+                                    <input type="text" id="set-admin-user" required class="w-full px-4 py-2.5 rounded-xl border border-slate-200 text-sm">
+                                </div>
+                                <div>
+                                    <label class="block text-xs font-bold text-slate-700 mb-1">New Password</label>
+                                    <input type="password" id="set-admin-pass" autocomplete="new-password" placeholder="Leave empty to keep the current password" class="w-full px-4 py-2.5 rounded-xl border border-slate-200 text-sm">
+                                </div>
+                            </div>
+
+                            <button type="submit" class="w-full py-3 rounded-xl bg-slate-900 hover:bg-slate-800 text-white font-bold shadow-md transition-all mt-4">
+                                Save Super Admin
+                            </button>
+                        </form>
+
+                        <div id="users-list" class="divide-y divide-slate-100 rounded-xl border border-slate-200 overflow-hidden"></div>
+                    </section>
+
+                    <!-- Add New User Modal -->
+                    <div id="user-modal" class="fixed inset-0 z-50 hidden flex items-center justify-center p-4 no-print">
+                        <div onclick="closeUserModal()" class="fixed inset-0 bg-slate-900/75 backdrop-blur-sm"></div>
+                        <div class="bg-white rounded-2xl max-w-lg w-full p-6 sm:p-8 relative z-10 shadow-2xl max-h-[90vh] overflow-y-auto">
+                            <div class="flex justify-between items-center pb-4 border-b border-slate-100 mb-5">
+                                <h3 class="text-lg font-bold text-slate-900">Add New User</h3>
+                                <button type="button" onclick="closeUserModal()" class="p-2 rounded-xl text-slate-400 hover:bg-slate-100"><i data-lucide="x" class="w-4 h-4"></i></button>
+                            </div>
+                            <form id="add-user-form" onsubmit="handleAddUser(event)" class="space-y-4">
+                                <div>
+                                    <label class="block text-xs font-bold text-slate-700 mb-1">Full Name *</label>
+                                    <input type="text" id="user-full-name" required maxlength="120" autocomplete="name" class="w-full px-4 py-2.5 rounded-xl border border-slate-200 text-sm" placeholder="Full name">
+                                </div>
+                                <div>
+                                    <label class="block text-xs font-bold text-slate-700 mb-1">Role *</label>
+                                    <select id="user-role" required class="w-full px-4 py-2.5 rounded-xl border border-slate-200 text-sm bg-white">
+                                        <option value="Admin">Admin</option>
+                                        <option value="Manager">Manager</option>
+                                        <option value="Salesman">Salesman</option>
+                                        <option value="Marketing">Marketing</option>
+                                    </select>
+                                </div>
+                                <div>
+                                    <label class="block text-xs font-bold text-slate-700 mb-1">Email ID *</label>
+                                    <input type="email" id="user-email" required autocomplete="email" class="w-full px-4 py-2.5 rounded-xl border border-slate-200 text-sm" placeholder="name@example.com" pattern="^[A-Za-z0-9._%+\\-]+@[A-Za-z0-9.\\-]+\\.[A-Za-z]{2,}$">
+                                </div>
+                                <div>
+                                    <label class="block text-xs font-bold text-slate-700 mb-1">Password *</label>
+                                    <input type="password" id="user-password" required minlength="10" autocomplete="new-password" class="w-full px-4 py-2.5 rounded-xl border border-slate-200 text-sm" placeholder="At least 10 characters">
+                                    <p class="text-[11px] text-slate-400 mt-1">Must include uppercase, lowercase, number, and special character.</p>
+                                </div>
+                                <button type="submit" class="w-full py-3 rounded-xl bg-brand-600 hover:bg-brand-700 text-white font-bold shadow-md transition-all">
+                                    Add New User
+                                </button>
+                            </form>
+                        </div>
+                    </div>
+
+                    <section id="settings-access-control" class="settings-section hidden bg-white p-6 sm:p-8 rounded-2xl border border-slate-200 shadow-sm">
+                        <h3 class="text-xl font-bold text-slate-900 mb-2">Access Control</h3>
+                        <p class="text-xs text-slate-500 mb-6 pb-4 border-b border-slate-100">Customize exact permissions individually for each user. Super Admin always has full access and cannot be removed.</p>
+
+                        <div class="rounded-xl border border-slate-200 bg-slate-50 p-4 mb-5">
+                            <p class="text-xs font-bold uppercase tracking-wider text-slate-500">Super Admin</p>
+                            <p id="access-admin-user" class="text-sm font-bold text-slate-900 mt-1">—</p>
+                            <p class="text-xs text-slate-500 mt-1">Full access. Only Super Admin can delete user accounts.</p>
+                        </div>
+
+                        <div class="grid grid-cols-1 lg:grid-cols-[240px_1fr] gap-5">
+                            <div>
+                                <label class="block text-xs font-bold text-slate-700 mb-1">Select User</label>
+                                <select id="access-user-id" onchange="renderAccessMatrix()" class="w-full px-3.5 py-2.5 rounded-xl border border-slate-200 text-sm bg-white"></select>
+                                <p class="text-[11px] text-slate-400 mt-2">Choose a specific user to view and edit their permission matrix.</p>
+                            </div>
+                            <div id="access-permissions-matrix" class="space-y-2"></div>
+                        </div>
+                    </section>
+
+                    <section id="settings-page-setup" class="settings-section hidden bg-white p-6 sm:p-8 rounded-2xl border border-slate-200 shadow-sm">
+                        <h3 class="text-xl font-bold text-slate-900 mb-2">Page Setup</h3>
+                        <p class="text-xs text-slate-500 mb-6 pb-4 border-b border-slate-100">Customize the panel title, shop details, logo, and dashboard theme.</p>
+
+                        <form onsubmit="handleSaveSettings(event)" class="space-y-4">
+                            <div>
+                                <label class="block text-xs font-bold text-slate-700 mb-1">Page Name</label>
+                                <input type="text" id="page-name" required class="w-full px-4 py-2.5 rounded-xl border border-slate-200 text-sm" placeholder="Website / panel title">
+                            </div>
+
+                            <div>
+                                <label class="block text-xs font-bold text-slate-700 mb-1">Shop Name</label>
+                                <input type="text" id="set-shop-name" required class="w-full px-4 py-2.5 rounded-xl border border-slate-200 text-sm">
+                            </div>
+                            <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                                <div>
+                                    <label class="block text-xs font-bold text-slate-700 mb-1">Shop Mobile Number</label>
+                                    <input type="text" id="set-shop-phone" required class="w-full px-4 py-2.5 rounded-xl border border-slate-200 text-sm">
+                                </div>
+                                <div>
+                                    <label class="block text-xs font-bold text-slate-700 mb-1">bKash / Nagad Payment Number</label>
+                                    <input type="text" id="set-payment-number" required class="w-full px-4 py-2.5 rounded-xl border border-slate-200 text-sm">
+                                </div>
+                            </div>
+                            <div>
+                                <label class="block text-xs font-bold text-slate-700 mb-1">Shop Address (shown on invoice)</label>
+                                <input type="text" id="set-shop-address" required class="w-full px-4 py-2.5 rounded-xl border border-slate-200 text-sm">
+                            </div>
+
+                            <div class="pt-4 border-t border-slate-100">
+                                <h4 class="text-sm font-bold text-slate-900 mb-3">Logo Upload</h4>
+                                <div class="flex flex-col sm:flex-row items-start sm:items-center gap-4">
+                                    <img id="settings-logo-preview" src="/logo.png?v=2" alt="Current site logo" class="w-16 h-16 rounded-xl object-cover border border-slate-200 bg-white">
+                                    <div class="space-y-2 w-full">
+                                        <input type="file" id="logo-upload" accept="image/*" class="block w-full text-sm text-slate-500 file:mr-3 file:py-2 file:px-4 file:rounded-xl file:border-0 file:text-sm file:font-bold file:bg-slate-900 file:text-white hover:file:bg-slate-800">
+                                        <button type="button" onclick="uploadSiteLogo()" class="px-4 py-2.5 rounded-xl bg-brand-600 hover:bg-brand-700 text-white text-sm font-bold">
+                                            Upload Logo
+                                        </button>
+                                    </div>
+                                </div>
+                            </div>
+
+                            
+                            <div class="pt-4 border-t border-slate-100">
+                                <label class="flex items-center justify-between gap-4 rounded-xl border border-slate-200 bg-slate-50 p-4 cursor-pointer">
+                                    <span>
+                                        <span class="block text-sm font-bold text-slate-900">Show Stock Count to Customers</span>
+                                        <span class="block text-xs text-slate-500 mt-1">Show or hide `Stock: XX` on public storefront product cards.</span>
+                                    </span>
+                                    <span class="stock-switch relative inline-flex h-7 w-12 shrink-0 items-center rounded-full bg-slate-300 transition-colors">
+                                        <input type="checkbox" id="set-show-stock" checked onchange="renderProducts()" role="switch" aria-label="Show Stock Count to Customers" class="peer sr-only">
+                                        <span class="absolute left-1 h-5 w-5 rounded-full bg-white shadow transition-transform"></span>
+                                    </span>
+                                </label>
+                            </div>
+
+                            <button type="submit" class="w-full py-3 rounded-xl bg-slate-900 hover:bg-slate-800 text-white font-bold shadow-md transition-all mt-4">
+                                Save Page Setup
+                            </button>
+                        </form>
+                    </section>
+<section id="settings-theme" class="settings-section hidden bg-white p-6 sm:p-8 rounded-2xl border border-slate-200 shadow-sm">
+    <h3 class="text-lg font-bold text-slate-900 mb-1">Theme</h3>
+    <p class="text-xs text-slate-500 mb-6 pb-4 border-b border-slate-100">Choose from 24 professional UI themes. Selecting a theme applies it to the dashboard immediately.</p>
+    <div id="theme-selector" class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3" data-selected="classic-pink"></div>
+</section>
+
+<section id="settings-invoice-setup" class="settings-section hidden bg-white p-6 sm:p-8 rounded-2xl border border-slate-200 shadow-sm">
+    <h3 class="text-lg font-bold text-slate-900 mb-1">Invoice Setup</h3>
+    <p class="text-xs text-slate-500 mb-6 pb-4 border-b border-slate-100">Custom TAHAM Official Pad template and printable safe-zone margins.</p>
+
+    <div class="space-y-6">
+        <div>
+            <h4 class="text-sm font-bold text-slate-900 mb-3">Custom Pad Upload &amp; Live Sync</h4>
+            <p class="text-xs text-slate-500 mb-3">Upload or replace the official pad template. Applies to invoices, delivery slips, Daily Report, Monthly Report, and every generated print page.</p>
+            <div class="flex flex-col sm:flex-row gap-4 items-start">
+                <img id="invoice-pad-preview" src="/official-pad-background.jpg" alt="Invoice pad preview" class="w-40 h-auto rounded-xl border border-slate-200 bg-white">
+                <div class="flex-1 space-y-3">
+                    <input type="file" id="invoice-pad-upload" accept="image/*" class="block w-full text-sm text-slate-500 file:mr-3 file:py-2 file:px-4 file:rounded-xl file:border-0 file:text-sm file:font-bold file:bg-slate-900 file:text-white hover:file:bg-slate-800">
+                    <button type="button" onclick="uploadInvoicePad()" class="px-4 py-2.5 rounded-xl bg-brand-600 hover:bg-brand-700 text-white text-sm font-bold">Upload Pad Template</button>
+                    <p id="invoice-pad-url" class="text-[11px] text-slate-500"></p>
+                </div>
+            </div>
+        </div>
+
+        <div class="pt-4 border-t border-slate-100">
+            <h4 class="text-sm font-bold text-slate-900 mb-3">Configurable Print Margins</h4>
+            <p class="text-xs text-slate-500 mb-3">Safe zone in millimetres. Content stays clear of the pad header and bottom signature/footer.</p>
+            <div class="grid grid-cols-2 sm:grid-cols-4 gap-3">
+                <label class="block text-xs font-bold text-slate-700">Top Margin<input type="number" id="invoice-margin-top" min="0" step="1" value="58" oninput="updateInvoicePadPreview(); saveInvoiceSetup();" class="mt-1 w-full px-3 py-2 rounded-xl border border-slate-200 text-sm"></label>
+                <label class="block text-xs font-bold text-slate-700">Bottom Margin<input type="number" id="invoice-margin-bottom" min="0" step="1" value="48" oninput="updateInvoicePadPreview(); saveInvoiceSetup();" class="mt-1 w-full px-3 py-2 rounded-xl border border-slate-200 text-sm"></label>
+                <label class="block text-xs font-bold text-slate-700">Left Margin<input type="number" id="invoice-margin-left" min="0" step="1" value="18" oninput="updateInvoicePadPreview(); saveInvoiceSetup();" class="mt-1 w-full px-3 py-2 rounded-xl border border-slate-200 text-sm"></label>
+                <label class="block text-xs font-bold text-slate-700">Right Margin<input type="number" id="invoice-margin-right" min="0" step="1" value="18" oninput="updateInvoicePadPreview(); saveInvoiceSetup();" class="mt-1 w-full px-3 py-2 rounded-xl border border-slate-200 text-sm"></label>
+            </div>
+            <p class="text-[11px] text-slate-500 mt-2">Units: mm. <button type="button" onclick="saveInvoiceSetup()" class="ml-2 px-3 py-1 rounded-lg bg-slate-900 text-white font-bold">Save Invoice Setup</button></p>
+        </div>
+
+        <div id="invoice-pad-live-preview" class="invoice-pad-live-preview" aria-label="Invoice pad live preview">
+            <img class="invoice-pad-live-bg" src="/official-pad-background.jpg" alt="">
+            <div id="invoice-pad-live-safe" class="invoice-pad-live-safe">
+                <strong>TAHAM Official Pad</strong>
+                <span>Safe printable area</span>
+                <span id="invoice-pad-live-dims">58mm / 48mm / 18mm / 18mm</span>
+            </div>
+        </div>
+    </div>
+</section>
+
+                </div>
+            </div>
+        </div>
+
+        <!-- SUB-TAB: REPORTS -->
+        <div id="subtab-reports" class="admin-subtab-panel hidden w-full">
+            <div class="bg-white p-6 rounded-2xl border border-slate-200 shadow-sm space-y-6">
+                <div class="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4 pb-4 border-b border-slate-100">
+                    <div>
+                        <h3 class="text-xl font-bold text-slate-900">Reports</h3>
+                        <p class="text-xs text-slate-500 mt-1">Financial summaries, order summaries, and calendar filtering.</p>
+                    </div>
+                    <div class="flex gap-2" role="tablist">
+                        <button type="button" onclick="switchReportView('daily')" data-report-tab="daily" class="report-tab px-4 py-2 rounded-xl text-sm font-bold bg-brand-600 text-white">Daily Report</button>
+                        <button type="button" onclick="switchReportView('monthly')" data-report-tab="monthly" class="report-tab px-4 py-2 rounded-xl text-sm font-bold bg-white text-slate-700 border border-slate-200">Monthly Report</button>
+                        <button type="button" onclick="printReport()" class="report-print-btn no-print px-4 py-2 rounded-xl text-sm font-bold bg-slate-900 text-white hover:bg-slate-800">Print Report</button>
+                    </div>
+                </div>
+
+                <div id="report-daily" class="report-view space-y-4">
+                    <div class="rounded-xl border border-slate-200 bg-slate-50 p-4">
+                        <h4 class="text-sm font-bold text-slate-900 mb-3">Calendar Date Filter</h4>
+                        <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
+                            <div>
+                                <label class="block text-xs font-bold text-slate-700 mb-1">Specific Date</label>
+                                <input type="date" id="daily-report-date" onchange="renderReports()" class="w-full px-3 py-2 rounded-xl border border-slate-200 bg-white text-sm">
+                            </div>
+                            <div>
+                                <label class="block text-xs font-bold text-slate-700 mb-1">From Date</label>
+                                <input type="date" id="daily-report-from" onchange="renderReports()" class="w-full px-3 py-2 rounded-xl border border-slate-200 bg-white text-sm">
+                            </div>
+                            <div>
+                                <label class="block text-xs font-bold text-slate-700 mb-1">To Date</label>
+                                <input type="date" id="daily-report-to" onchange="renderReports()" class="w-full px-3 py-2 rounded-xl border border-slate-200 bg-white text-sm">
+                            </div>
+                            <div class="flex items-end">
+                                <button type="button" onclick="clearReportFilters('daily')" class="w-full px-3 py-2 rounded-xl bg-white text-slate-700 border border-slate-200 text-sm font-bold hover:bg-slate-100">Clear Filters</button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <div id="report-monthly" class="report-view hidden space-y-4">
+                    <div class="rounded-xl border border-slate-200 bg-slate-50 p-4">
+                        <h4 class="text-sm font-bold text-slate-900 mb-3">Calendar Month Filter</h4>
+                        <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
+                            <div>
+                                <label class="block text-xs font-bold text-slate-700 mb-1">Month</label>
+                                <input type="month" id="monthly-report-month" onchange="renderReports()" class="w-full px-3 py-2 rounded-xl border border-slate-200 bg-white text-sm">
+                            </div>
+                            <div>
+                                <label class="block text-xs font-bold text-slate-700 mb-1">From Date</label>
+                                <input type="date" id="monthly-report-from" onchange="renderReports()" class="w-full px-3 py-2 rounded-xl border border-slate-200 bg-white text-sm">
+                            </div>
+                            <div>
+                                <label class="block text-xs font-bold text-slate-700 mb-1">To Date</label>
+                                <input type="date" id="monthly-report-to" onchange="renderReports()" class="w-full px-3 py-2 rounded-xl border border-slate-200 bg-white text-sm">
+                            </div>
+                            <div class="flex items-end">
+                                <button type="button" onclick="clearReportFilters('monthly')" class="w-full px-3 py-2 rounded-xl bg-white text-slate-700 border border-slate-200 text-sm font-bold hover:bg-slate-100">Clear Filters</button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <div id="report-print-area" class="print-pad report-print-area">
+                    <div class="report-print-header">
+                        <p id="report-type" class="report-print-kicker">Daily Report</p>
+                        <h4 class="report-print-title">Financial Summary &amp; Breakdown</h4>
+                        <p id="report-period" class="report-print-period"></p>
+                        <p id="report-generated-by" class="report-print-generated"></p>
+                    </div>
+
+                    <div id="report-metrics" class="report-metrics-grid grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4"></div>
+
+                    <div class="report-orders-wrap">
+                        <h4 class="report-orders-title">Order Summaries / Itemized Records</h4>
+                        <div id="report-orders" class="report-orders"></div>
+                    </div>
+                </div>
+            </div>
+        </div>
+            </div>
+        </div>
+    </main>
+
+    <!-- ========================================== -->
+    <!-- 3. SUPER ADMIN LOGIN MODAL                 -->
+    <!-- ========================================== -->
+    <div id="admin-login-modal" class="fixed inset-0 z-50 hidden flex items-center justify-center p-4 no-print">
+        <div onclick="closeAdminLoginModal()" class="fixed inset-0 bg-slate-900/75 backdrop-blur-sm"></div>
+        <div class="bg-white rounded-2xl max-w-md w-full p-6 sm:p-8 relative z-10 shadow-2xl">
+            <div class="flex justify-between items-center pb-4 border-b border-slate-100 mb-5">
+                <div class="flex items-center gap-2.5">
+                    <div class="w-10 h-10 rounded-xl bg-slate-900 text-pink-400 flex items-center justify-center">
+                        <i data-lucide="shield-check" class="w-5 h-5"></i>
+                    </div>
+                    <div>
+                        <h3 class="text-lg font-bold text-slate-900">Super Admin Login</h3>
+                        <p class="text-xs text-slate-500">Reserved for the shop owner only</p>
+                    </div>
+                </div>
+                <button onclick="closeAdminLoginModal()" class="p-2 rounded-xl text-slate-400 hover:bg-slate-100">
+                    <i data-lucide="x" class="w-5 h-5"></i>
+                </button>
+            </div>
+
+            <form onsubmit="handleAdminLogin(event)" class="space-y-4" autocomplete="on" name="admin-login">
+                <div>
+                    <label class="block text-xs font-bold text-slate-700 mb-1">Username</label>
+                    <input type="text" id="login-username" name="username" required autocomplete="username" autocapitalize="none" autocorrect="off" spellcheck="false" placeholder="Enter username" class="w-full px-4 py-2.5 rounded-xl border border-slate-200 focus:outline-none focus:ring-2 focus:ring-brand-500 text-sm">
+                </div>
+                <div>
+                    <label class="block text-xs font-bold text-slate-700 mb-1">Password</label>
+                    <input type="password" id="login-password" name="password" required autocomplete="current-password" spellcheck="false" placeholder="••••" class="w-full px-4 py-2.5 rounded-xl border border-slate-200 focus:outline-none focus:ring-2 focus:ring-brand-500 text-sm">
+                </div>
+
+                <button type="submit" class="w-full py-3 rounded-xl bg-slate-900 hover:bg-slate-800 text-white font-bold shadow-lg transition-all">
+                    Enter Dashboard
+                </button>
+            </form>
+        </div>
+    </div>
+
+    <!-- ========================================== -->
+    <!-- 4. SLIDE-OVER SHOPPING CART DRAWER         -->
+    <!-- ========================================== -->
+    <div id="cart-drawer" class="fixed inset-0 z-50 hidden no-print">
+        <div onclick="toggleCart(false)" class="fixed inset-0 bg-slate-900/60 backdrop-blur-sm"></div>
+        <div class="fixed inset-y-0 right-0 max-w-md w-full bg-white shadow-2xl flex flex-col z-10">
+            <div class="px-6 py-4 border-b border-slate-200 flex justify-between items-center bg-slate-50">
+                <div class="flex items-center gap-2">
+                    <i data-lucide="shopping-bag" class="w-5 h-5 text-brand-600"></i>
+                    <h3 class="text-lg font-bold text-slate-900">Your Shopping Bag</h3>
+                </div>
+                <button onclick="toggleCart(false)" class="p-2 rounded-xl text-slate-500 hover:bg-slate-200">
+                    <i data-lucide="x" class="w-5 h-5"></i>
+                </button>
+            </div>
+
+            <div id="cart-items-container" class="flex-1 overflow-y-auto p-6 space-y-4">
+                <!-- Cart items rendered dynamically -->
+            </div>
+
+            <div id="cart-footer" class="p-6 border-t border-slate-200 bg-slate-50 space-y-4">
+                <!-- Delivery Zone Selector -->
+                <div>
+                    <label class="block text-xs font-bold text-slate-700 mb-1.5">Choose delivery area:</label>
+                    <div class="grid grid-cols-2 gap-2">
+                        <label class="cursor-pointer">
+                            <input type="radio" name="delivery_zone" value="60" checked onchange="updateCartUI()" class="peer sr-only">
+                            <div class="p-2 rounded-xl border border-slate-200 peer-checked:border-brand-600 peer-checked:bg-brand-50 text-center text-xs font-bold">
+                                Inside Dhaka (৳ 60)
+                            </div>
+                        </label>
+                        <label class="cursor-pointer">
+                            <input type="radio" name="delivery_zone" value="120" onchange="updateCartUI()" class="peer sr-only">
+                            <div class="p-2 rounded-xl border border-slate-200 peer-checked:border-brand-600 peer-checked:bg-brand-50 text-center text-xs font-bold">
+                                Outside Dhaka (৳ 120)
+                            </div>
+                        </label>
+                    </div>
+                </div>
+
+                <div class="space-y-1 text-sm">
+                    <div class="flex justify-between text-slate-600">
+                        <span>Subtotal:</span>
+                        <span id="cart-subtotal" class="font-semibold">৳ 0</span>
+                    </div>
+                    <div class="flex justify-between text-slate-600">
+                        <span>Delivery Charge:</span>
+                        <span id="cart-delivery-display" class="font-semibold text-emerald-600">৳ 60</span>
+                    </div>
+                    <div class="flex justify-between text-base font-bold text-slate-900 pt-2 border-t border-slate-200">
+                        <span>Grand Total:</span>
+                        <span id="cart-total" class="text-brand-700 text-lg">৳ 0</span>
+                    </div>
+                </div>
+
+                <button onclick="openCheckoutModal()" class="w-full py-3.5 rounded-xl bg-brand-600 hover:bg-brand-700 text-white font-bold shadow-lg transition-all flex items-center justify-center gap-2">
+                    <span>Confirm Order</span>
+                    <i data-lucide="arrow-right" class="w-5 h-5"></i>
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <!-- ========================================== -->
+    <!-- 5. CHECKOUT MODAL (COD / bKash / Nagad)    -->
+    <!-- ========================================== -->
+    <div id="checkout-modal" class="fixed inset-0 z-50 hidden flex items-center justify-center p-4 no-print">
+        <div onclick="closeCheckoutModal()" class="fixed inset-0 bg-slate-900/70 backdrop-blur-sm"></div>
+        <div class="bg-white rounded-2xl max-w-lg w-full p-6 sm:p-8 relative z-10 shadow-2xl max-h-[90vh] overflow-y-auto">
+            <div class="flex justify-between items-center pb-4 border-b border-slate-100 mb-5">
+                <div>
+                    <h3 class="text-xl font-bold text-slate-900">Delivery & Payment Details</h3>
+                    <p class="text-xs text-slate-500">You will get a receipt as soon as the order is complete</p>
+                </div>
+                <button onclick="closeCheckoutModal()" class="p-2 rounded-xl text-slate-400 hover:bg-slate-100">
+                    <i data-lucide="x" class="w-5 h-5"></i>
+                </button>
+            </div>
+
+            <form id="checkout-form" onsubmit="submitCustomerOrder(event)" class="space-y-4">
+                <div>
+                    <label class="block text-xs font-bold text-slate-700 mb-1">Full Name *</label>
+                    <input type="text" id="cust-name" required placeholder="e.g. Tanvir Ahmed" class="w-full px-4 py-2.5 rounded-xl border border-slate-200 text-sm">
+                </div>
+
+                <div>
+                    <label class="block text-xs font-bold text-slate-700 mb-1">Phone Number *</label>
+                    <input type="tel" id="cust-phone" required placeholder="017XXXXXXXX" class="w-full px-4 py-2.5 rounded-xl border border-slate-200 text-sm">
+                </div>
+
+                <div>
+                    <label class="block text-xs font-bold text-slate-700 mb-1">Delivery Address *</label>
+                    <textarea id="cust-address" rows="2" required placeholder="House no, road, area, thana and district..." class="w-full px-4 py-2.5 rounded-xl border border-slate-200 text-sm"></textarea>
+                </div>
+
+                <!-- Optional Custom Design Instructions -->
+                <div id="custom-design-section" class="rounded-2xl border border-slate-200 bg-slate-50 p-4 space-y-3">
+                    <div class="flex items-center justify-between gap-3">
+                        <div>
+                            <h4 class="text-sm font-bold text-slate-900">Custom Design Instructions</h4>
+                            <p class="text-[11px] text-slate-500">Optional. Add print placement, text, color changes, sizing notes, or attach a mockup.</p>
+                        </div>
+                        <span class="text-[10px] font-bold uppercase tracking-wider text-slate-400 bg-white px-2 py-1 rounded-lg border border-slate-200">Optional</span>
+                    </div>
+                    <div>
+                        <label class="block text-xs font-bold text-slate-700 mb-1">Custom Design Notes</label>
+                        <textarea id="custom-design-notes" rows="3" maxlength="2000" placeholder="e.g. Place logo on left chest, use black thread, change sleeve color, custom text..." class="w-full px-3.5 py-2.5 rounded-xl border border-slate-200 bg-white text-sm"></textarea>
+                    </div>
+                    <div>
+                        <label class="block text-xs font-bold text-slate-700 mb-1">Reference Image / Mockup</label>
+                        <input type="file" id="custom-design-reference" accept="image/*" onchange="handleCustomDesignReferenceUpload(event)" class="block w-full text-sm text-slate-500 file:mr-3 file:py-2 file:px-4 file:rounded-xl file:border-0 file:text-sm file:font-bold file:bg-slate-900 file:text-white hover:file:bg-slate-800">
+                        <div id="custom-design-reference-preview" class="hidden pt-2">
+                            <img id="custom-design-reference-img" src="" alt="Custom design reference" class="h-28 w-28 object-cover rounded-xl border border-slate-200 bg-white">
+                            <button type="button" onclick="clearCustomDesignReference()" class="mt-2 text-xs text-rose-600 font-bold hover:underline">Remove reference image</button>
+                        </div>
+                    </div>
+                </div>
+
+                <div>
+                    <label class="block text-xs font-bold text-slate-700 mb-2">Choose payment method *</label>
+                    <div class="grid grid-cols-3 gap-2.5">
+                        <label class="cursor-pointer">
+                            <input type="radio" name="payment_method" value="Cash on Delivery" checked onchange="toggleTrxField(false)" class="peer sr-only">
+                            <div class="p-3 rounded-xl border-2 border-slate-200 peer-checked:border-brand-600 peer-checked:bg-brand-50 text-center">
+                                <p class="font-bold text-xs text-slate-800">Cash on Delivery</p>
+                                <p class="text-[10px] text-slate-500">Pay when you receive</p>
+                            </div>
+                        </label>
+                        <label class="cursor-pointer">
+                            <input type="radio" name="payment_method" value="bKash" onchange="toggleTrxField(true)" class="peer sr-only">
+                            <div class="p-3 rounded-xl border-2 border-slate-200 peer-checked:border-pink-600 peer-checked:bg-pink-50 text-center">
+                                <p class="font-bold text-xs text-pink-600">bKash</p>
+                                <p class="text-[10px] text-slate-500">Send Money</p>
+                            </div>
+                        </label>
+                        <label class="cursor-pointer">
+                            <input type="radio" name="payment_method" value="Nagad" onchange="toggleTrxField(true)" class="peer sr-only">
+                            <div class="p-3 rounded-xl border-2 border-slate-200 peer-checked:border-orange-500 peer-checked:bg-orange-50 text-center">
+                                <p class="font-bold text-xs text-orange-600">Nagad</p>
+                                <p class="text-[10px] text-slate-500">Send Money</p>
+                            </div>
+                        </label>
+                    </div>
+                </div>
+
+                <!-- Optional Transaction ID for bKash / Nagad -->
+                <div id="trx-id-box" class="hidden bg-pink-50/70 p-3.5 rounded-xl border border-pink-200 space-y-2">
+                    <p class="text-xs text-pink-900">Our merchant/personal number: <strong id="checkout-merchant-num">01700-000000</strong></p>
+                    <input type="text" id="cust-trx-id" placeholder="Enter TrxID (optional)" class="w-full px-3 py-2 rounded-lg border border-pink-200 bg-white text-xs">
+                </div>
+
+                <div class="bg-slate-50 p-3.5 rounded-xl border border-slate-200 flex justify-between items-center">
+                    <span class="text-sm font-semibold text-slate-700">Total payable:</span>
+                    <span id="modal-order-total" class="text-lg font-bold text-brand-700">৳ 0</span>
+                </div>
+
+                <button type="submit" id="place-order-btn" class="w-full py-3.5 rounded-xl bg-brand-600 hover:bg-brand-700 text-white font-bold shadow-lg transition-all">
+                    Place Order
+                </button>
+            </form>
+        </div>
+    </div>
+
+    <!-- ========================================== -->
+    <!-- 6. PRINTABLE INVOICE / CASH MEMO MODAL     -->
+    <!-- ========================================== -->
+    <div id="invoice-modal" class="fixed inset-0 z-50 hidden flex items-center justify-center p-4">
+        <div onclick="closeInvoiceModal()" class="fixed inset-0 bg-slate-900/75 backdrop-blur-sm no-print"></div>
+        <div class="bg-white rounded-2xl max-w-4xl w-full p-6 sm:p-8 relative z-10 shadow-2xl max-h-[92vh] overflow-y-auto">
+            <!-- Printable Area -->
+            <div id="invoice-print-area" class="space-y-5 text-slate-800 print-pad">
+                <div class="invoice-watermark" aria-hidden="true">TAHAM</div>
+                <div class="flex justify-between items-start border-b-2 border-slate-900 pb-4">
+                    <div>
+                        <div class="flex items-center gap-2.5"><img src="/logo.png?v=2" alt="" class="w-10 h-10 rounded-lg"><h2 id="inv-shop-name" class="text-2xl font-bold text-slate-900">TAHAM</h2><p class="text-[11px] text-rose-600 font-bold">Premium &amp; Custom Fashion Wear</p></div>
+                        <p id="inv-shop-address" class="text-xs text-slate-500 mt-0.5">Dhaka, Bangladesh</p>
+                        <p id="inv-shop-phone" class="text-xs text-slate-600 font-semibold">Mobile: 01700-000000</p>
+                    </div>
+                    <div class="text-right">
+                        <span class="px-3 py-1 bg-slate-900 text-white text-xs font-bold uppercase tracking-wider rounded">CASH MEMO</span>
+                        <p id="inv-order-id" class="text-sm font-bold mt-2 text-slate-900">#ORD-000000</p>
+                        <p id="inv-order-date" class="text-[11px] text-slate-500"></p>
+                    </div>
+                </div>
+
+                <div class="grid grid-cols-2 gap-4 bg-slate-50 p-3.5 rounded-xl border border-slate-200 text-xs">
+                    <div>
+                        <p class="text-slate-400 font-semibold uppercase">Bill To:</p>
+                        <p id="inv-cust-name" class="font-bold text-sm text-slate-900 mt-0.5"></p>
+                        <p id="inv-cust-phone" class="text-slate-700 font-medium"></p>
+                        <p id="inv-cust-address" class="text-slate-600 mt-0.5"></p>
+                    </div>
+                    <div class="text-right">
+                        <p class="text-slate-400 font-semibold uppercase">Payment & Status:</p>
+                        <p id="inv-payment" class="font-bold text-slate-900 mt-0.5"></p>
+                        <p id="inv-trx" class="text-slate-500"></p>
+                        <span id="inv-status" class="inline-block mt-1 px-2 py-0.5 rounded bg-emerald-100 text-emerald-800 font-bold"></span>
+                    </div>
+                </div>
+
+                <!-- Items Table -->
+                <table class="w-full text-left border-collapse text-xs">
+                    <thead>
+                        <tr class="border-b border-slate-300 text-slate-600">
+                            <th class="py-2">Item Description</th>
+                            <th class="py-2 text-center">Size</th>
+                            <th class="py-2 text-center">Qty</th>
+                            <th class="py-2 text-right">Rate</th>
+                            <th class="py-2 text-right">Total</th>
+                        </tr>
+                    </thead>
+                    <tbody id="inv-items-tbody" class="divide-y divide-slate-200">
+                    </tbody>
+                </table>
+
+                <!-- Totals -->
+                <div class="border-t-2 border-slate-900 pt-3 flex justify-end">
+                    <div class="w-56 space-y-1 text-xs">
+                        <div class="flex justify-between">
+                            <span class="text-slate-600">Subtotal:</span>
+                            <span id="inv-subtotal" class="font-semibold">৳ 0</span>
+                        </div>
+                        <div class="flex justify-between">
+                            <span class="text-slate-600">Delivery Charge:</span>
+                            <span id="inv-delivery" class="font-semibold">৳ 0</span>
+                        </div>
+                        <div class="flex justify-between text-base font-bold text-slate-900 pt-1.5 border-t border-slate-200">
+                            <span>Total Bill:</span>
+                            <span id="inv-total">৳ 0</span>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="grid grid-cols-2 gap-6 pt-8 pb-3 text-center text-[11px] text-slate-700"><div><div class="border-b border-slate-400 h-8"></div>Customer Signature</div><div><div class="border-b border-slate-400 h-8"></div>Authorized Signature</div></div>
+                <div class="text-center text-[11px] text-slate-400 pt-2 border-t border-dashed border-slate-200">Powered by TAHAM</div>
+            </div>
+
+            <!-- Modal Action Buttons -->
+            <div class="flex gap-3 mt-6 pt-4 border-t border-slate-100 no-print">
+                <button onclick="preparePrintPagination('#invoice-print-area'); window.print()" class="flex-1 py-3 rounded-xl bg-slate-900 hover:bg-slate-800 text-white font-bold flex items-center justify-center gap-2 shadow-md">
+                    <i data-lucide="printer" class="w-4 h-4"></i>
+                    <span>Print Invoice</span>
+                </button>
+                <button onclick="closeInvoiceModal()" class="px-5 py-3 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-700 font-bold">
+                    Close
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Footer -->
+    <footer class="footer-3d no-print">
+        <div class="max-w-7xl mx-auto px-5 sm:px-7 lg:px-9 py-7 flex flex-col sm:flex-row justify-between items-center gap-5">
+            <div class="footer-brand text-center sm:text-left">
+                <h4 id="footer-shop-name" class="footer-title text-white font-extrabold text-xl">Taham</h4>
+                <p id="footer-shop-address" class="footer-address text-sm mt-2 text-slate-300">Rayerbag, Dhaka, Bangladesh.</p>
+            </div>
+            <div class="flex items-center gap-4 text-xs">
+                <a id="footer-shop-phone" class="footer-phone-pill" href="tel:01400570014" title="Call / WhatsApp Helpline" aria-label="Call or WhatsApp helpline">
+                    <i data-lucide="phone" class="w-4 h-4"></i>
+                    <span id="footer-shop-phone-text">Helpline: 01400-570014</span>
+                </a>
+            </div>
+        </div>
+    </footer>
+
+    <!-- ========================================== -->
+    <!-- FLASK SERVER-CONNECTED ERP LOGIC            -->
+    <!-- ========================================== -->
+    <script type="module">
+        let doc, setDoc, addDoc, updateDoc, deleteDoc, onSnapshot, collection, getDocs;
+
+        // ==========================================
+        // SERVER API (Flask) helpers - data lives in taham.db on the server
+        // ==========================================
+        const esc = (v) => String(v ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+
+
+        // ==========================================
+        // LANGUAGE SWITCH (English <-> Bangla)
+        // ==========================================
+        const BN_DICT = {
+         "Syncing...": "ক্লাউড সিঙ্ক হচ্ছে...",
+         "Store": "দোকান (Store)",
+         "Super Admin": "সুপার অ্যাডমিন",
+         "Log out": "লগআউট করুন",
+         "Logout": "লগআউট",
+         "Exclusive Fashion Collection • Home delivery all over Bangladesh": "এক্সক্লুসিভ ফ্যাশন কালেকশন • সারা দেশে হোম ডেলিভারি",
+         "The finest quality": "সেরা মানের",
+         "clothing": "জামা-কাপড়",
+         "now directly online": "এখন সরাসরি অনলাইনে",
+         "Order premium Panjabi, Jamdani sarees, three-piece sets, T-shirts and kids wear from home. Cash on Delivery, bKash and Nagad are available": "প্রিমিয়াম পাঞ্জাবি, জামদানি শাড়ি, থ্রি-পিস, টি-শার্ট এবং বাচ্চাদের পোশাক অর্ডার করুন ঘরে বসেই। ক্যাশ অন ডেলিভারি, বিকাশ ও নগদ সুবিধা রয়েছে",
+         "Browse Collections": "কালেকশন দেখুন",
+         "Fast Home Delivery": "দ্রুত হোম ডেলিভারি",
+         "Delivery charge is only ৳60 inside Dhaka and ৳120 across Bangladesh": "ঢাকার ভেতরে ৳৬০ এবং সারা বাংলাদেশে মাত্র ৳১২০ ডেলিভারি চার্জ",
+         "100% Colour Guarantee": "১০০% কালার গ্যারান্টি",
+         "Inspect the product on delivery and pay after you receive it": "পণ্য হাতে পেয়ে যাচাই করে মূল্য পরিশোধ করার সুবিধা",
+         "Search clothes by name...": "পোশাকের নাম খুঁজুন...",
+         "All Collections": "সকল কালেকশন",
+         "Loading...": "লোড হচ্ছে...",
+         "View Store": "দোকান দেখুন",
+         "Lock / Logout": "লক / লগআউট",
+         "Total Sales (Revenue)": "মোট বিক্রি (Revenue)",
+         "Total sales including delivery charge": "ডেলিভারি চার্জসহ মোট সেল",
+         "Net Profit": "নিট লাভ (Net Profit)",
+         "Net profit after purchase cost and expenses": "কেনা দাম ও খরচ বাদে নিট লাভ",
+         "Total Expenses": "মোট খরচ (Expenses)",
+         "Shop & other expenses": "দোকান ও অন্যান্য খরচ",
+         "Pending Orders": "পেন্ডিং অর্ডার",
+         "Total Orders: 0": "মোট অর্ডার: ০টি",
+         "Low Stock Alert (<5)": "লো স্টক এলার্ট (<৫)",
+         "Total Items: 0": "মোট আইটেম: ০টি",
+         "Orders & Invoices": "অর্ডার ও ইনভয়েস (Orders)",
+         "Products & Stock (Inventory)": "পণ্য ও স্টক ম্যানেজমেন্ট (Inventory)",
+         "Daily Expenses": "দৈনিক খরচের হিসাব (Expenses)",
+         "All Customer Orders": "সকল কাস্টমার অর্ডার তালিকা",
+         "Changing the order status updates stock automatically, and you can print the receipt": "অর্ডার স্ট্যাটাস পরিবর্তন করলে স্টক অটোমেটিক আপডেট হবে এবং রসিদ প্রিন্ট করা যাবে",
+         "All Orders": "সব অর্ডার (All Orders)",
+         "Pending": "পেন্ডিং (Pending)",
+         "Processing": "প্রসেসিং (Processing)",
+         "Delivered": "ডেলিভারড (Delivered)",
+         "Cancelled": "বাতিল (Cancelled)",
+         "Add New Product": "নতুন পোশাক যোগ করুন",
+         "Cancel": "বাতিল",
+         "Product Name *": "পোশাকের নাম *",
+         "e.g. Premium Cotton Panjabi": "যেমন: প্রিমিয়াম কটন পাঞ্জাবি",
+         "Collection *": "ক্যাটাগরি *",
+         "Stock (Pcs) *": "স্টক সংখ্যা (Pcs) *",
+         "Buying Price (৳) *": "কেনা দাম (Buying ৳) *",
+         "Selling Price (৳) *": "বিক্রয় মূল্য (Selling ৳) *",
+         "Upload a photo from your gallery/computer:": "গ্যালারি/কম্পিউটার থেকে ছবি আপলোড করুন:",
+         "Or paste an image link (URL)...": "অথবা ছবির ইন্টারনেট লিংক (URL) দিন...",
+         "Description": "বিবরণ (Description)",
+         "Write about fabric quality, colour or size...": "কাপড়ের মান, রঙ বা সাইজ সম্পর্কে লিখুন...",
+         "Save Product": "পণ্য সেভ করুন",
+         "Stock & Profit/Loss List": "দোকানের স্টক ও লাভ-ক্ষতি তালিকা",
+         "Only you can see the buying price": "কেনা দাম শুধু আপনি দেখতে পাবেন",
+         "Add New Expense": "নতুন খরচ যোগ করুন",
+         "Expense Description *": "খরচের বিবরণ *",
+         "e.g. Shop rent / Packaging bags": "যেমন: দোকান ভাড়া / প্যাকেজিং ব্যাগ",
+         "Expense Category *": "খরচের খাত *",
+         "Shop rent & bills": "দোকান ভাড়া ও বিল",
+         "Shop rent & electricity bill": "দোকান ভাড়া ও বিদ্যুৎ বিল",
+         "Packaging & delivery": "প্যাকেজিং ও ডেলিভারি",
+         "Packaging & courier cost": "প্যাকেজিং ও কুরিয়ার খরচ",
+         "Marketing & boosting": "মার্কেটিং ও বুস্টিং",
+         "Facebook boosting / marketing": "ফেসবুক বুস্টিং / মার্কেটিং",
+         "Staff & hospitality": "কর্মচারী ও আপ্যায়ন",
+         "Staff salary & hospitality": "কর্মচারী বেতন ও আপ্যায়ন",
+         "Other": "অন্যান্য",
+         "Other expenses": "অন্যান্য খরচ",
+         "Amount (৳) *": "টাকার পরিমাণ (৳) *",
+         "Add Expense": "খরচ যুক্ত করুন",
+         "Daily Expense List": "দৈনিক খরচের তালিকা",
+         "Shop Information & Super Admin Security": "দোকানের তথ্য ও সুপার অ্যাডমিন সিকিউরিটি",
+         "Change the shop name, bKash/Nagad number and admin password from here": "এখান থেকে দোকানের নাম, বিকাশ/নগদ নম্বর এবং অ্যাডমিন পাসওয়ার্ড পরিবর্তন করতে পারবেন",
+         "Shop Name": "দোকানের নাম (Shop Name)",
+         "Shop Mobile Number": "দোকানের মোবাইল নম্বর",
+         "bKash / Nagad Payment Number": "বিকাশ / নগদ পেমেন্ট নম্বর",
+         "Shop Address (shown on invoice)": "দোকানের ঠিকানা (ইনভয়েসে দেখাবে)",
+         "Change Super Admin Login Details": "সুপার অ্যাডমিন লগইন তথ্য পরিবর্তন",
+         "Admin Username": "অ্যাডমিন ইউজারনেম (Username)",
+         "New Password": "নতুন পাসওয়ার্ড (Password)",
+         "Leave empty to keep the current password": "খালি রাখলে আগের পাসওয়ার্ডই থাকবে",
+         "Save Settings": "সেটিংস সেভ করুন",
+         "Super Admin Login": "সুপার অ্যাডমিন লগইন",
+         "Reserved for the shop owner only": "শুধুমাত্র দোকানের মালিকের জন্য সংরক্ষিত",
+         "Username": "ইউজারনেম (Username)",
+         "Enter username": "ইউজারনেম লিখুন",
+         "Password": "পাসওয়ার্ড (Password)",
+         "Enter Dashboard": "ড্যাশবোর্ডে প্রবেশ করুন",
+         "Your Shopping Bag": "আপনার শপিং ব্যাগ",
+         "Choose delivery area:": "ডেলিভারি এলাকা বেছে নিন:",
+         "Inside Dhaka (৳ 60)": "ঢাকার ভেতরে (৳ ৬০)",
+         "Outside Dhaka (৳ 120)": "ঢাকার বাইরে (৳ ১২০)",
+         "Subtotal:": "সাবটোটাল:",
+         "Delivery Charge:": "ডেলিভারি চার্জ:",
+         "Grand Total:": "সর্বমোট:",
+         "Confirm Order": "অর্ডার কনফার্ম করুন",
+         "Delivery & Payment Details": "ডেলিভারি ও পেমেন্ট তথ্য",
+         "You will get a receipt as soon as the order is complete": "অর্ডার সম্পন্ন হলে সাথে সাথে রসিদ পাবেন",
+         "Full Name *": "আপনার নাম (Full Name) *",
+         "e.g. Tanvir Ahmed": "যেমন: তানভীর আহমেদ",
+         "Phone Number *": "মোবাইল নম্বর (Phone Number) *",
+         "Delivery Address *": "সম্পূর্ণ ঠিকানা (Delivery Address) *",
+         "House no, road, area, thana and district...": "বাসা নং, রোড, এলাকা, থানা ও জেলা...",
+         "Choose payment method *": "পেমেন্ট মাধ্যম বেছে নিন *",
+         "Cash on Delivery": "ক্যাশ অন ডেলিভারি",
+         "Pay when you receive": "হাতে পেয়ে টাকা",
+         "bKash": "বিকাশ (bKash)",
+         "Nagad": "নগদ (Nagad)",
+         "Our merchant/personal number:": "আমাদের মার্চেন্ট/পার্সোনাল নম্বর:",
+         "Total payable:": "সর্বমোট পরিশোধযোগ্য:",
+         "Place Order": "অর্ডার প্লেস করুন (Place Order)",
+         "Dhaka, Bangladesh": "ঢাকা, বাংলাদেশ",
+         "Mobile:": "মোবাইল:",
+         "Bill To:": "কাস্টমারের তথ্য (Bill To):",
+         "Payment & Status:": "পেমেন্ট ও স্ট্যাটাস:",
+         "Item Description": "পোশাকের বিবরণ",
+         "Size": "সাইজ",
+         "Qty": "পরিমাণ",
+         "Rate": "দর",
+         "Total": "মোট",
+         "Total Bill:": "সর্বমোট বিল:",
+         "Thank you for shopping with us! To exchange a product, contact us with the receipt within 3 days": "আমাদের সাথে কেনাকাটা করার জন্য আন্তরিক ধন্যবাদ! পণ্য পরিবর্তনের জন্য ৩ দিনের মধ্যে রসিদসহ যোগাযোগ করুন",
+         "Print Invoice": "রসিদ প্রিন্ট করুন (Print Invoice)",
+         "Close": "বন্ধ করুন",
+         "We deliver the best quality clothing all over Bangladesh with trust": "বিশ্বস্ততার সাথে সেরা মানের পোশাক পৌঁছে দিচ্ছি সারা বাংলাদেশে",
+         "Helpline:": "হেল্পলাইন:",
+         "Something went wrong on the server": "সার্ভারে সমস্যা হয়েছে",
+         "Session expired, please log in again": "সেশন শেষ হয়ে গেছে, আবার লগইন করুন",
+         "New Market, Dhaka, Bangladesh": "নিউ মার্কেট, ঢাকা, বাংলাদেশ",
+         "Connected to server": "সার্ভার সংযুক্ত",
+         "Cannot connect to server": "সার্ভারের সাথে সংযোগ নেই",
+         "Welcome to the Super Admin panel!": "সুপার অ্যাডমিন প্যানেলে স্বাগতম!",
+         "Wrong username or password!": "ভুল ইউজারনেম বা পাসওয়ার্ড!",
+         "Logged out successfully": "সফলভাবে লগআউট হয়েছে",
+         "Premium quality fabric and flawless finishing": "প্রিমিয়াম কোয়ালিটি ফ্যাব্রিক ও নিখুঁত ফিনিশিং",
+         "Size:": "সাইজ (Size):",
+         "Price": "মূল্য",
+         "Add to Bag": "ব্যাগে যোগ করুন",
+         "You cannot add more than the available stock": "স্টকের চেয়ে বেশি যোগ করা যাবে না",
+         "Your shopping bag is empty": "আপনার শপিং ব্যাগ খালি",
+         "Add your favourite clothes to the bag and order easily": "পছন্দের জামা-কাপড় ব্যাগে যোগ করে সহজেই অর্ডার করুন",
+         "Processing order...": "অর্ডার প্রসেস হচ্ছে...",
+         "Could not place the order, please try again": "অর্ডার প্লেস করতে সমস্যা হয়েছে, আবার চেষ্টা করুন",
+         "No orders in this category": "এই ক্যাটাগরিতে কোনো অর্ডার নেই",
+         "Print Receipt": "রসিদ প্রিন্ট",
+         "Delete order": "অর্ডার ডিলিট",
+         "Customer:": "কাস্টমার:",
+         "Address:": "ঠিকানা:",
+         "Could not change the status": "স্ট্যাটাস পরিবর্তন ব্যর্থ হয়েছে",
+         "Permanently delete this order?": "এই অর্ডারটি স্থায়ীভাবে মুছে ফেলবেন?",
+         "Order deleted": "অর্ডারটি মুছে ফেলা হয়েছে",
+         "Could not delete the order": "অর্ডার মুছতে সমস্যা হয়েছে",
+         "Image is ready!": "ছবি প্রস্তুত হয়েছে!",
+         "Could not read the image, please choose another": "ছবিটি পড়া যায়নি, অন্য ছবি দিন",
+         "Enter the product name": "পোশাকের নাম দিন",
+         "Enter valid numbers for stock, buying price and selling price": "স্টক, কেনা দাম ও বিক্রয় মূল্য সঠিক সংখ্যায় দিন",
+         "Product updated!": "পোশাকের তথ্য আপডেট হয়েছে!",
+         "New product added to the shop!": "নতুন পোশাক দোকানে যুক্ত হয়েছে!",
+         "Could not save the product": "পণ্য সেভ করতে সমস্যা হয়েছে",
+         "Edit Product": "পোশাক এডিট করুন",
+         "Could not update the stock": "স্টক আপডেট করা যায়নি",
+         "Permanently delete this product?": "এই পোশাকটি স্থায়ীভাবে ডিলিট করবেন?",
+         "Product deleted": "পণ্যটি ডিলিট করা হয়েছে",
+         "Could not delete": "মুছে ফেলা যায়নি",
+         "pcs": "পিস",
+         "Edit": "এডিট",
+         "Delete": "ডিলিট",
+         "Enter the expense description and a valid amount": "খরচের বিবরণ ও সঠিক পরিমাণ দিন",
+         "Expense recorded!": "খরচ হিসাবভুক্ত হয়েছে!",
+         "Could not add the expense": "খরচ যোগ করা যায়নি",
+         "Expense deleted": "খরচটি মুছে ফেলা হয়েছে",
+         "No expenses added yet": "এখনো কোনো খরচ যোগ করা হয়নি",
+         "Shop settings and password updated successfully!": "দোকানের সেটিংস ও পাসওয়ার্ড সফলভাবে আপডেট হয়েছে!",
+         "Could not save the settings": "সেটিংস সেভ করা যায়নি",
+         "Admin login required": "অ্যাডমিন লগইন প্রয়োজন",
+         "is not a valid number": "সঠিক সংখ্যা নয়",
+         "cannot be negative": "ঋণাত্মক হতে পারে না",
+         "Too many wrong attempts, please try again in 5 minutes": "অনেকবার ভুল হয়েছে, ৫ মিনিট পরে আবার চেষ্টা করুন",
+         "Stock": "স্টক",
+         "Buying price": "কেনা দাম",
+         "Selling price": "বিক্রয় মূল্য",
+         "Image is too large, please use a smaller one": "ছবির সাইজ অনেক বড়, ছোট ছবি দিন",
+         "Enter the product name and price": "পণ্যের নাম ও দাম দিন",
+         "Product not found": "পণ্য পাওয়া যায়নি",
+         "Please enter name, phone number and address": "নাম, মোবাইল নম্বর ও ঠিকানা দিন",
+         "Invalid payment method": "পেমেন্ট মেথড সঠিক নয়",
+         "Invalid cart data": "কার্টের তথ্য সঠিক নয়",
+         "Invalid quantity": "পরিমাণ সঠিক নয়",
+         "Your cart is empty": "আপনার কার্ট খালি",
+         "A product is no longer available": "একটি পণ্য আর পাওয়া যাচ্ছে না",
+         "Invalid status": "স্ট্যাটাস সঠিক নয়",
+         "Order not found": "অর্ডার পাওয়া যায়নি",
+         "Enter the expense description": "খরচের বিবরণ দিন",
+         "Expense amount": "খরচের পরিমাণ",
+         "Please fill in all the shop details": "দোকানের সব তথ্য পূরণ করুন",
+         "Password must be at least 4 characters": "পাসওয়ার্ড কমপক্ষে ৪ অক্ষরের দিন",
+         "Not found": "পাওয়া যায়নি",
+         "All Items": "সব পোশাক",
+         "Panjabi": "পাঞ্জাবি",
+         "Saree": "শাড়ি",
+         "Salwar Kameez": "থ্রি-পিস",
+         "T-Shirt": "টি-শার্ট ও শার্ট",
+         "Kids": "বাচ্চাদের পোশাক",
+         "No clothes found": "কোনো পোশাক পাওয়া যায়নি",
+         "Try searching with another name or collection": "অন্য কোনো নাম বা কালেকশন দিয়ে খুঁজে দেখুন",
+         "Out of Stock": "স্টক শেষ",
+         "Out of stock": "স্টক নেই",
+         "{n} items found": "{n}টি পোশাক পাওয়া গেছে",
+         "{n} items": "{n}টি পোশাক",
+         "Stock: {n}": "স্টক: {n}টি",
+         "Helpline: {p}": "হেল্পলাইন: {p}",
+         "Total Orders: {n}": "মোট অর্ডার: {n}টি",
+         "Total Items: {n}": "মোট আইটেম: {n}টি",
+         "Sorry! Only {n} left in stock for this item.": "দুঃখিত! এই পোশাকটির স্টক মাত্র {n}টি আছে।",
+         "\"{name}\" ({size}) added to bag!": "\"{name}\" ({size}) ব্যাগে যোগ হয়েছে!",
+         "Thank you {name}! Your order ({num}) is complete.": "ধন্যবাদ {name}! আপনার অর্ডার ({num}) সম্পন্ন হয়েছে।",
+         "Order status updated to \"{s}\".": "অর্ডার স্ট্যাটাস \"{s}\" আপডেট হয়েছে।",
+         "Payment:": "পেমেন্ট:",
+         "Delivery:": "ডেলিভারি:",
+         "Total:": "মোট:",
+         "Buy:": "কেনা:",
+         "Price:": "মূল্য:",
+         "Profit/pc:": "লাভ/পিস:",
+         "Enter TrxID (optional)": "TrxID লিখুন (ঐচ্ছিক)",
+         "Shop by Collection": "কালেকশন অনুযায়ী কিনুন",
+         "Collections": "কালেকশন",
+         "Add New Collection": "নতুন কালেকশন যোগ করুন",
+         "Edit Collection": "কালেকশন এডিট করুন",
+         "Collection Name *": "কালেকশনের নাম *",
+         "e.g. Winter Wear": "যেমন: শীতের পোশাক",
+         "Upload a cover photo from your gallery/computer:": "গ্যালারি/কম্পিউটার থেকে কভার ছবি আপলোড করুন:",
+         "Save Collection": "কালেকশন সেভ করুন",
+         "Your Collections": "আপনার কালেকশনসমূহ",
+         "These photos appear on the storefront. Customers tap a collection to see its clothes.": "এই ছবিগুলো দোকানের পেজে দেখাবে। কাস্টমার কালেকশনে ট্যাপ করে পোশাক দেখতে পারবে।",
+         "No collections yet.": "এখনো কোনো কালেকশন নেই।",
+         "Collection added!": "নতুন কালেকশন যোগ হয়েছে!",
+         "Collection updated!": "কালেকশন আপডেট হয়েছে!",
+         "Collection deleted": "কালেকশন ডিলিট হয়েছে",
+         "Delete this collection?": "এই কালেকশনটি ডিলিট করবেন?",
+         "Enter the collection name": "কালেকশনের নাম দিন",
+         "Could not save the collection": "কালেকশন সেভ করা যায়নি",
+         "Could not delete the collection": "কালেকশন ডিলিট করা যায়নি",
+         "Select a collection. Add one in the Collections tab first.": "একটি কালেকশন বেছে নিন। আগে Collections ট্যাব থেকে কালেকশন যোগ করুন।",
+         "Discount (optional)": "ছাড় (ঐচ্ছিক)",
+         "No discount": "কোনো ছাড় নেই",
+         "Percentage (%)": "শতকরা (%)",
+         "Fixed amount (৳)": "নির্দিষ্ট টাকা (৳)",
+         "Value": "পরিমাণ",
+         "Customers pay ৳ {final} instead of ৳ {price} ({pct}% off)": "কাস্টমার ৳ {price} এর বদলে ৳ {final} দেবে ({pct}% ছাড়)",
+         "Warning: the sale price is below your buying price.": "সতর্কতা: বিক্রয় মূল্য আপনার কেনা দামের চেয়ে কম।",
+         "{pct}% OFF": "{pct}% ছাড়",
+         "Discount": "ছাড়",
+         "Sale price": "ছাড়ের পর মূল্য",
+         "Discount must be a whole number": "ছাড়ের পরিমাণ পূর্ণ সংখ্যায় দিন",
+         "Collection name is required": "কালেকশনের নাম দিন",
+         "A collection with this name already exists": "এই নামে একটি কালেকশন আগে থেকেই আছে",
+         "Collection not found": "কালেকশন পাওয়া যায়নি",
+         "This collection still has products. Move or delete them first": "এই কালেকশনে এখনো পণ্য আছে। আগে সেগুলো সরান বা ডিলিট করুন",
+         "Please choose a valid collection": "সঠিক কালেকশন বেছে নিন",
+         "Percentage discount must be between 1 and 95": "শতকরা ছাড় ১ থেকে ৯৫ এর মধ্যে হতে হবে",
+         "Discount amount must be less than the selling price": "ছাড়ের টাকা বিক্রয় মূল্যের চেয়ে কম হতে হবে",
+         "Discount type is not valid": "ছাড়ের ধরন সঠিক নয়",
+         "Discount value": "ছাড়ের পরিমাণ",
+         "CASH MEMO": "ক্যাশ মেমো",
+         "Send Money": "সেন্ড মানি",
+         "Real-Time Cloud Sync Active": "রিয়েল-টাইম সিঙ্ক চালু আছে",
+         "Colours (optional)": "রঙ (ঐচ্ছিক)",
+         "Pick from the list or add your own colour:": "তালিকা থেকে বেছে নিন বা নিজের রঙ যোগ করুন:",
+         "Colour name, e.g. Wine Red": "রঙের নাম, যেমন: ওয়াইন রেড",
+         "Add": "যোগ করুন",
+         "Selected colours:": "নির্বাচিত রঙ:",
+         "No colours selected": "কোনো রঙ বাছাই করা হয়নি",
+         "Colour:": "রঙ:",
+         "Enter a colour name": "রঙের নাম লিখুন",
+         "Please choose a colour": "একটি রঙ বেছে নিন",
+         "This colour is not available": "এই রঙটি পাওয়া যাচ্ছে না",
+         "Remove": "সরান",
+         "Black": "কালো",
+         "White": "সাদা",
+         "Grey": "ধূসর",
+         "Red": "লাল",
+         "Maroon": "মেরুন",
+         "Pink": "গোলাপি",
+         "Orange": "কমলা",
+         "Yellow": "হলুদ",
+         "Mustard": "সরিষা",
+         "Green": "সবুজ",
+         "Olive": "অলিভ",
+         "Teal": "টিল",
+         "Sky Blue": "আকাশি",
+         "Blue": "নীল",
+         "Navy Blue": "নেভি ব্লু",
+         "Purple": "বেগুনি",
+         "Brown": "বাদামি",
+         "Beige": "বেজ",
+         "Cream": "ক্রিম",
+         "Gold": "সোনালি",
+         "Product photos": "পণ্যের ছবি",
+         "Upload several photos at once (up to 8). The first photo is the main one.": "একসাথে একাধিক ছবি আপলোড করুন (সর্বোচ্চ ৮টি)। প্রথম ছবিটি মূল ছবি।",
+         "Set a colour under each photo so customers can recognise it.": "প্রতিটি ছবির নিচে রঙ ঠিক করে দিন, যাতে কাস্টমার সহজে চিনতে পারে।",
+         "Or add an image link (URL)...": "অথবা ছবির লিংক (URL) দিন...",
+         "Add link": "লিংক যোগ করুন",
+         "No photos yet": "এখনো কোনো ছবি নেই",
+         "Main": "মূল",
+         "Set main": "মূল করুন",
+         "General (no colour)": "সাধারণ (রঙ ছাড়া)",
+         "{n} photos added": "{n}টি ছবি যোগ হয়েছে",
+         "You can add up to 8 photos per product": "একটি পণ্যে সর্বোচ্চ ৮টি ছবি দেওয়া যাবে",
+         "Enter a valid image link": "সঠিক ছবির লিংক দিন",
+         "Too many photos (max 8)": "ছবি অনেক বেশি (সর্বোচ্চ ৮টি)",
+         "Photos": "ছবি"
+        };
+        const BN_PATTERNS = [
+            [/^Sorry! "(.*)" has only (\d+) in stock\.?$/, (m) => `দুঃখিত! "${m[1]}" এর স্টক মাত্র ${m[2]}টি আছে।`],
+            [/^(.+) is not a valid number\.?$/, (m) => `${BN_DICT[m[1]] || m[1]} সঠিক সংখ্যা নয়।`],
+            [/^(.+) cannot be negative\.?$/, (m) => `${BN_DICT[m[1]] || m[1]} ঋণাত্মক হতে পারে না।`]
+        ];
+        let LANG = 'en';
+        const T_ATTRS = ['placeholder', 'title', 'aria-label'];
+
+        function lookup(s) {
+            if (Object.prototype.hasOwnProperty.call(BN_DICT, s)) return BN_DICT[s];
+            const m = s.match(/^(.*?)([.!]+)$/);
+            if (m && Object.prototype.hasOwnProperty.call(BN_DICT, m[1])) return BN_DICT[m[1]] + (m[2] === '.' ? '।' : m[2]);
+            for (const [re, fn] of BN_PATTERNS) { const mm = s.match(re); if (mm) return fn(mm); }
+            return undefined;
+        }
+        function t(key, params) {
+            let s = key;
+            if (LANG === 'bn') { const b = lookup(key); if (b !== undefined) s = b; }
+            if (params) s = s.replace(/\{(\w+)\}/g, (_, k) => (params[k] !== undefined ? params[k] : '{' + k + '}'));
+            return s;
+        }
+        function fmtDate(ms, dateOnly) {
+            if (!ms) return '';
+            const opts = dateOnly ? { day: '2-digit', month: 'short', year: 'numeric' }
+                                  : { day: '2-digit', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit' };
+            return new Date(ms).toLocaleString(LANG === 'bn' ? 'bn-BD' : 'en-GB', opts);
+        }
+
+        const NODE_REC = new WeakMap();
+        function skipNode(n) {
+            const p = n.parentElement;
+            return !p || p.closest('script,style,textarea,[data-notranslate]');
+        }
+        function trNode(n) {
+            if (skipNode(n)) return;
+            const rec = NODE_REC.get(n);
+            if (rec && n.data === rec.bn) return;
+            const raw = n.data, core = raw.trim().replace(/\s+/g, ' ');
+            if (!core) return;
+            if (LANG === 'bn') {
+                const b = lookup(core);
+                if (b !== undefined) {
+                    const out = raw.match(/^\s*/)[0] + b + raw.match(/\s*$/)[0];
+                    NODE_REC.set(n, { en: raw, bn: out });
+                    n.data = out;
+                    return;
+                }
+            }
+            NODE_REC.delete(n);
+        }
+        function restoreNode(n) {
+            const rec = NODE_REC.get(n);
+            if (rec && n.data === rec.bn) n.data = rec.en;
+            NODE_REC.delete(n);
+        }
+        function trAttrs(el, restore) {
+            for (const a of T_ATTRS) {
+                if (!el.hasAttribute(a)) continue;
+                const v = el.getAttribute(a);
+                const rec = (el.__i18n = el.__i18n || {});
+                if (restore) { if (rec[a] && v === rec[a].bn) el.setAttribute(a, rec[a].en); delete rec[a]; continue; }
+                if (rec[a] && v === rec[a].bn) continue;
+                const b = LANG === 'bn' ? lookup(v.trim()) : undefined;
+                if (b !== undefined) { rec[a] = { en: v, bn: b }; el.setAttribute(a, b); } else delete rec[a];
+            }
+        }
+        function walk(root, restore) {
+            if (root.nodeType === 3) { restore ? restoreNode(root) : trNode(root); return; }
+            if (root.nodeType !== 1) return;
+            const tw = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+            const nodes = [];
+            while (tw.nextNode()) nodes.push(tw.currentNode);
+            nodes.forEach((n) => (restore ? restoreNode(n) : trNode(n)));
+            if (root.matches && root.matches('[placeholder],[title],[aria-label]')) trAttrs(root, restore);
+            root.querySelectorAll('[placeholder],[title],[aria-label]').forEach((el) => trAttrs(el, restore));
+        }
+        new MutationObserver((muts) => {
+            if (LANG !== 'bn') return;
+            for (const m of muts) {
+                if (m.type === 'childList') m.addedNodes.forEach((n) => walk(n, false));
+                else if (m.type === 'characterData') trNode(m.target);
+                else if (m.type === 'attributes') trAttrs(m.target, false);
+            }
+        }).observe(document.documentElement, { childList: true, subtree: true, characterData: true, attributes: true, attributeFilter: T_ATTRS });
+
+        window.setLanguage = function(lang) {
+            if (lang !== 'en' && lang !== 'bn') lang = 'en';
+            if (LANG === 'bn' && lang === 'en') walk(document.body, true);
+            LANG = lang;
+            try { localStorage.setItem('taham_lang', lang); } catch (e) { /* ignore */ }
+            document.documentElement.lang = lang;
+            const on = 'px-2.5 py-1.5 rounded-lg bg-slate-900 text-white', off = 'px-2.5 py-1.5 rounded-lg text-slate-600 hover:bg-slate-100';
+            document.getElementById('lang-en').className = lang === 'en' ? on : off;
+            document.getElementById('lang-bn').className = lang === 'bn' ? on : off;
+            // rebuild the dynamic parts so numbers/dates/templates use the new language
+            if (typeof applyStoreSettingsToUI === 'function' && db) {
+                applyStoreSettingsToUI();
+                renderCollections(); renderCategoryFilters(); updateCategoryTitle(); renderProducts(); updateCartUI();
+                updateDiscountPreview();
+                if (isAdminAuthenticated) updateAdminDashboard();
+                if (currentInvoice && !document.getElementById('invoice-modal').classList.contains('hidden')) openInvoiceModal(currentInvoice);
+            }
+            if (lang === 'bn') walk(document.body, false);
+        };
+
+
+        async function api(method, url, body) {
+            const res = await fetch(url, {
+                method,
+                headers: { 'Content-Type': 'application/json' },
+                credentials: 'same-origin',
+                body: body === undefined ? undefined : JSON.stringify(body)
+            });
+            let data = null;
+            try { data = await res.json(); } catch (e) { /* empty body */ }
+            if (!res.ok) {
+                if (res.status === 401 && isAdminAuthenticated && url !== '/api/login' && !window.__sessionExpiredSuppress) {
+                    const stillAdmin = await checkAdminSession();
+                    if (stillAdmin === false && !window.__sessionExpiredSuppress) sessionExpired();
+                }
+                const err = new Error((data && data.error) || 'Something went wrong on the server');
+                err.status = res.status;
+                throw err;
+            }
+            return data;
+        }
+
+        async function checkAdminSession() {
+            try {
+                const res = await fetch('/api/me', { credentials: 'same-origin', cache: 'no-store' });
+                if (!res.ok) return null;
+                const data = await res.json();
+                return typeof data.admin === 'boolean' ? data.admin : null;
+            } catch (e) {
+                return null;
+            }
+        }
+
+        function sessionExpired() {
+            if (window.__sessionExpiredSuppress || !isAdminAuthenticated) return;
+            isAdminAuthenticated = false;
+            document.getElementById('admin-logout-btn').classList.add('hidden');
+            showToast('Session expired, please log in again.', 'error');
+            switchView('store');
+            document.getElementById('admin-login-modal').classList.remove('hidden');
+        }
+
+        // Keeps the old Firestore-style helper names so the rest of the page works unchanged,
+        // but every call now goes to the Flask server.
+        function createApiBackend() {
+            const listeners = [];
+            const adminOnly = (c) => c === 'orders' || c === 'expenses';
+            const fetchList = async (c) => (adminOnly(c) && !isAdminAuthenticated) ? [] : await api('GET', `/api/${c}`);
+            const snapCol = (list) => ({
+                empty: list.length === 0,
+                docs: list.map((d) => ({ id: d.id, data: () => { const { id, ...rest } = d; return rest; } }))
+            });
+            const snapDoc = (list, id) => {
+                const d = list.find((x) => x.id === id);
+                return { id, exists: () => !!d, data: () => { if (!d) return undefined; const { id: _i, ...rest } = d; return rest; } };
+            };
+            async function run(l, force) {
+                try {
+                    const list = await fetchList(l.col);
+                    const sig = JSON.stringify(list);
+                    if (!force && sig === l.sig) return;
+                    l.sig = sig;
+                    l.cb(l.ref.kind === 'col' ? snapCol(list) : snapDoc(list, l.ref.id));
+                } catch (e) { if (l.err) l.err(e); }
+            }
+            const refreshCol = (c) => Promise.all(listeners.filter((l) => l.col === c).map((l) => run(l)));
+            const refreshAll = () => Promise.all(listeners.map((l) => run(l)));
+            return {
+                collection: (_db, ...segs) => ({ kind: 'col', col: segs[segs.length - 1] }),
+                doc: (_db, ...segs) => ({ kind: 'doc', col: segs[segs.length - 2], id: segs[segs.length - 1] }),
+                getDocs: async (ref) => snapCol(await fetchList(ref.col)),
+                addDoc: async (ref, payload) => { const r = await api('POST', `/api/${ref.col}`, payload); await refreshCol(ref.col); return r; },
+                setDoc: async (ref, payload) => { await api('PUT', `/api/${ref.col}/${ref.id}`, payload); await refreshAll(); },
+                updateDoc: async (ref, payload) => { await api('PATCH', `/api/${ref.col}/${ref.id}`, payload); await refreshCol(ref.col); },
+                deleteDoc: async (ref) => { await api('DELETE', `/api/${ref.col}/${ref.id}`); await refreshCol(ref.col); },
+                onSnapshot: (ref, cb, err) => {
+                    const l = { col: ref.col, ref, cb, err, sig: null };
+                    listeners.push(l);
+                    run(l, true);
+                    return () => { const i = listeners.indexOf(l); if (i >= 0) listeners.splice(i, 1); };
+                },
+                refreshAll,
+                startPolling: () => setInterval(() => { if (!document.hidden) refreshAll(); }, 8000)
+            };
+        }
+
+        // Environment Config
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'noor-fashion-erp-default';
+
+        let db = null;
+        let currentUser = null;
+
+        // Global Application State
+        let products = [];
+        let orders = [];
+        let expenses = [];
+        let storeSettings = {
+            shopName: 'Taham',
+            pageName: 'Taham',
+            theme: 'classic-pink',
+            shopPhone: '01700-000000',
+            paymentNumber: '01700-000000',
+            shopAddress: 'New Market, Dhaka, Bangladesh',
+        };
+
+        let cart = [];
+        let selectedCategory = 'All';
+        let selectedSizes = {};
+        let isAdminAuthenticated = false;
+        let isSuperAdmin = false;
+        let users = [];
+        let permissionDefs = [];
+        let currentAccessUserId = '';
+        let currentReportView = 'daily';
+        let customDesignReferenceImage = '';
+        let uploadedImageBase64 = '';
+        let uploadedCollectionImage = '';
+        let collections = [];
+        let currentInvoice = null;
+        let formColors = [];
+        let formImages = [];            // [{src, color}] photos of the product being edited
+        const MAX_PHOTOS = 8;
+        const selectedImages = {};      // productId -> index of the photo the customer clicked
+        const selectedColors = {};
+
+        // Start: connect to the Flask server and begin live listeners
+        async function initApp() {
+            const backend = createApiBackend();
+            ({ collection, doc, getDocs, addDoc, setDoc, updateDoc, deleteDoc, onSnapshot } = backend);
+            window.__refreshAll = backend.refreshAll;
+            db = { server: true };
+            currentUser = { uid: 'server' };
+            try {
+                const me = await api('GET', '/api/me');
+                if (me.admin) {
+                    isAdminAuthenticated = true;
+                    isSuperAdmin = !!me.isSuperAdmin || !!me.admin;
+                    document.getElementById('admin-logout-btn').classList.remove('hidden');
+                }
+                setCloudStatus('online', 'Connected to server');
+                setupRealtimeListeners();
+                await loadUsers();
+                backend.startPolling();
+            } catch (error) {
+                console.error('Server error:', error);
+                setCloudStatus('error', 'Cannot connect to server');
+            }
+        }
+
+        function setCloudStatus(status, text) {
+            const dot = document.getElementById('cloud-status-dot');
+            const label = document.getElementById('cloud-status-text');
+            label.innerText = text;
+            if (status === 'online') {
+                dot.className = 'w-2 h-2 rounded-full bg-emerald-500';
+            } else if (status === 'local') {
+                dot.className = 'w-2 h-2 rounded-full bg-sky-500';
+            } else if (status === 'error') {
+                dot.className = 'w-2 h-2 rounded-full bg-rose-500';
+            } else {
+                dot.className = 'w-2 h-2 rounded-full bg-amber-400';
+            }
+        }
+
+        // RULE 1 & 2: Public Data Paths + Simple collection() listeners
+        function setupRealtimeListeners() {
+            if (!currentUser || !db) return;
+
+            // 1. Listen to Products
+            const productsCol = collection(db, 'artifacts', appId, 'public', 'data', 'products');
+            onSnapshot(productsCol, (snapshot) => {
+                products = snapshot.docs.map(d => ({ id: d.id, ...d.data() }));
+                products.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+                renderProducts();
+                renderCollections();
+                if (isAdminAuthenticated) updateAdminDashboard();
+            }, (err) => console.error("Products snapshot error:", err));
+
+            // 2. Listen to Orders
+            const ordersCol = collection(db, 'artifacts', appId, 'public', 'data', 'orders');
+            onSnapshot(ordersCol, (snapshot) => {
+                orders = snapshot.docs.map(d => ({ id: d.id, ...d.data() }));
+                orders.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+                updatePendingBadge();
+                if (isAdminAuthenticated) updateAdminDashboard();
+            }, (err) => console.error("Orders snapshot error:", err));
+
+            // 3. Listen to Expenses
+            const expensesCol = collection(db, 'artifacts', appId, 'public', 'data', 'expenses');
+            onSnapshot(expensesCol, (snapshot) => {
+                expenses = snapshot.docs.map(d => ({ id: d.id, ...d.data() }));
+                expenses.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+                if (isAdminAuthenticated) updateAdminDashboard();
+            }, (err) => console.error("Expenses snapshot error:", err));
+
+            // 3b. Listen to Collections
+            const collectionsCol = collection(db, 'artifacts', appId, 'public', 'data', 'collections');
+            onSnapshot(collectionsCol, (snapshot) => {
+                collections = snapshot.docs.map(d => ({ id: d.id, ...d.data() }));
+                collections.sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0));
+                if (selectedCategory !== 'All' && !collections.some(c => c.name === selectedCategory)) selectedCategory = 'All';
+                renderCollections(); renderCategoryFilters(); updateCategoryTitle(); populateCategorySelect(); renderProducts();
+                if (isAdminAuthenticated) renderAdminCollections();
+            }, (err) => console.error("Collections snapshot error:", err));
+
+            // 4. Listen to Store Settings
+            const settingsDoc = doc(db, 'artifacts', appId, 'public', 'data', 'settings', 'store_config');
+            onSnapshot(settingsDoc, (docSnap) => {
+                if (docSnap.exists()) {
+                    storeSettings = { ...storeSettings, ...docSnap.data() };
+                    applyStoreSettingsToUI();
+                }
+            }, (err) => console.error("Settings snapshot error:", err));
+        }
+
+        const THEMES = [
+            { id: 'classic-pink', name: 'Classic Pink', description: 'Warm pink accent with clean enterprise contrast', brand50: '#fdf2f8', brand100: '#fce7f3', brand300: '#f9a8d4', brand500: '#e879a9', brand600: '#db2777', brand700: '#be185d', brand900: '#831843', appBg: '#f8fafc', appSurface: '#ffffff', appText: '#0f172a' },
+            { id: 'enterprise-indigo', name: 'Enterprise Indigo', description: 'Balanced indigo for a polished SaaS dashboard', brand50: '#eef2ff', brand100: '#e0e7ff', brand300: '#a5b4fc', brand500: '#6366f1', brand600: '#4f46e5', brand700: '#4338ca', brand900: '#312e81', appBg: '#f8fafc', appSurface: '#ffffff', appText: '#0f172a' },
+            { id: 'corporate-navy', name: 'Corporate Navy', description: 'Deep navy accents with crisp light surfaces', brand50: '#f1f5f9', brand100: '#e2e8f0', brand300: '#94a3b8', brand500: '#334155', brand600: '#1e3a5f', brand700: '#172a46', brand900: '#0b1726', appBg: '#f8fafc', appSurface: '#ffffff', appText: '#0f172a' },
+            { id: 'slate-emerald', name: 'Slate Emerald', description: 'Calm emerald accents with neutral contrast', brand50: '#ecfdf5', brand100: '#d1fae5', brand300: '#86efac', brand500: '#10b981', brand600: '#059669', brand700: '#047857', brand900: '#064e3b', appBg: '#f8fafc', appSurface: '#ffffff', appText: '#0f172a' },
+            { id: 'warm-sand', name: 'Warm Sand', description: 'Soft sand neutrals with restrained warmth', brand50: '#fefce8', brand100: '#fef9c3', brand300: '#fde68a', brand500: '#d97706', brand600: '#b45309', brand700: '#92400e', brand900: '#78350f', appBg: '#fafaf9', appSurface: '#ffffff', appText: '#1c1917' },
+            { id: 'graphite-slate', name: 'Graphite Slate', description: 'Neutral graphite for a minimal professional UI', brand50: '#f8fafc', brand100: '#f1f5f9', brand300: '#cbd5e1', brand500: '#64748b', brand600: '#475569', brand700: '#334155', brand900: '#1e293b', appBg: '#f8fafc', appSurface: '#ffffff', appText: '#0f172a' },
+            { id: 'deep-teal', name: 'Deep Teal', description: 'Sophisticated teal with cool clean backgrounds', brand50: '#f0fdfa', brand100: '#ccfbf1', brand300: '#5eead4', brand500: '#14b8a6', brand600: '#0f766e', brand700: '#115e59', brand900: '#134e4a', appBg: '#f8fafc', appSurface: '#ffffff', appText: '#0f172a' },
+            { id: 'royal-blue', name: 'Royal Blue', description: 'Refined blue accents with high readability', brand50: '#eff6ff', brand100: '#dbeafe', brand300: '#93c5fd', brand500: '#3b82f6', brand600: '#2563eb', brand700: '#1d4ed8', brand900: '#1e3a8a', appBg: '#f8fafc', appSurface: '#ffffff', appText: '#0f172a' },
+            { id: 'violet-indigo', name: 'Violet Indigo', description: 'Elegant violet harmonized with cool surfaces', brand50: '#f5f3ff', brand100: '#ede9fe', brand300: '#c4b5fd', brand500: '#8b5cf6', brand600: '#7c3aed', brand700: '#6d28d9', brand900: '#4c1d95', appBg: '#f8fafc', appSurface: '#ffffff', appText: '#0f172a' },
+            { id: 'crimson', name: 'Crimson', description: 'Confident crimson with clean neutral contrast', brand50: '#fef2f2', brand100: '#fee2e2', brand300: '#fca5a5', brand500: '#ef4444', brand600: '#dc2626', brand700: '#b91c1c', brand900: '#7f1d1d', appBg: '#f8fafc', appSurface: '#ffffff', appText: '#0f172a' },
+            { id: 'amber-gold', name: 'Amber Gold', description: 'Premium amber with restrained gold accents', brand50: '#fffbeb', brand100: '#fef3c7', brand300: '#fcd34d', brand500: '#f59e0b', brand600: '#d97706', brand700: '#b45309', brand900: '#78350f', appBg: '#fffbeb', appSurface: '#ffffff', appText: '#0f172a' },
+            { id: 'forest-green', name: 'Forest Green', description: 'Muted forest accent for a grounded feel', brand50: '#f0fdf4', brand100: '#dcfce7', brand300: '#86efac', brand500: '#22c55e', brand600: '#16a34a', brand700: '#15803d', brand900: '#14532d', appBg: '#f0fdf4', appSurface: '#ffffff', appText: '#0f172a' },
+            { id: 'ocean-blue', name: 'Ocean Blue', description: 'Clear blue accents with airy backgrounds', brand50: '#f0f9ff', brand100: '#e0f2fe', brand300: '#7dd3fc', brand500: '#0ea5e9', brand600: '#0284c7', brand700: '#0369a1', brand900: '#0c4a6e', appBg: '#f0f9ff', appSurface: '#ffffff', appText: '#0f172a' },
+            { id: 'rose-quartz', name: 'Rose Quartz', description: 'Soft rose accent with elegant contrast', brand50: '#fff1f2', brand100: '#ffe4e6', brand300: '#fda4af', brand500: '#f43f5e', brand600: '#e11d48', brand700: '#be123c', brand900: '#881337', appBg: '#fff1f2', appSurface: '#ffffff', appText: '#0f172a' },
+            { id: 'copper-warm', name: 'Copper Warm', description: 'Warm copper accent with soft neutral base', brand50: '#fff7ed', brand100: '#ffedd5', brand300: '#fdba74', brand500: '#f97316', brand600: '#c2410c', brand700: '#9a3412', brand900: '#7c2d12', appBg: '#fff7ed', appSurface: '#ffffff', appText: '#0f172a' },
+            { id: 'midnight', name: 'Midnight', description: 'Dark midnight accent with strong clean contrast', brand50: '#f1f5f9', brand100: '#e2e8f0', brand300: '#64748b', brand500: '#0f172a', brand600: '#020617', brand700: '#000000', brand900: '#000000', appBg: '#f8fafc', appSurface: '#ffffff', appText: '#0f172a' },
+            { id: 'lavender', name: 'Lavender', description: 'Soft lavender with calm cool backgrounds', brand50: '#f5f3ff', brand100: '#ede9fe', brand300: '#c4b5fd', brand500: '#a78bfa', brand600: '#8b5cf6', brand700: '#7c3aed', brand900: '#4c1d95', appBg: '#f5f3ff', appSurface: '#ffffff', appText: '#0f172a' },
+            { id: 'sky', name: 'Sky', description: 'Light sky accent with open spacing', brand50: '#f0f9ff', brand100: '#e0f2fe', brand300: '#bae6fd', brand500: '#38bdf8', brand600: '#0ea5e9', brand700: '#0284c7', brand900: '#0369a1', appBg: '#f0f9ff', appSurface: '#ffffff', appText: '#0f172a' },
+            { id: 'plum', name: 'Plum', description: 'Deep plum accent with refined contrast', brand50: '#fdf4ff', brand100: '#fae8ff', brand300: '#e9d5ff', brand500: '#a855f7', brand600: '#9333ea', brand700: '#7e22ce', brand900: '#581c87', appBg: '#fdf4ff', appSurface: '#ffffff', appText: '#0f172a' },
+            { id: 'carbon-gold', name: 'Carbon Gold', description: 'Carbon accent with restrained gold highlights', brand50: '#f8fafc', brand100: '#f1f5f9', brand300: '#cbd5e1', brand500: '#d4af37', brand600: '#b8962f', brand700: '#8a6d1f', brand900: '#1f2937', appBg: '#f8fafc', appSurface: '#ffffff', appText: '#0f172a' },
+            { id: 'aqua-mint', name: 'Aqua Mint', description: 'Cool aqua accent with fresh clean backgrounds', brand50: '#ecfeff', brand100: '#cffafe', brand300: '#a5f3fc', brand500: '#06b6d4', brand600: '#0891b2', brand700: '#0e7490', brand900: '#164e63', appBg: '#ecfeff', appSurface: '#ffffff', appText: '#0f172a' },
+            { id: 'coral', name: 'Coral', description: 'Warm coral accent with bright clean surfaces', brand50: '#fff1f2', brand100: '#ffe4e6', brand300: '#fecdd3', brand500: '#fb7185', brand600: '#f43f5e', brand700: '#e11d48', brand900: '#881337', appBg: '#fff1f2', appSurface: '#ffffff', appText: '#0f172a' },
+            { id: 'muted-sage', name: 'Muted Sage', description: 'Muted sage green for a calm enterprise palette', brand50: '#f0fdf4', brand100: '#dcfce7', brand300: '#bbf7d0', brand500: '#4d7c0f', brand600: '#3f6212', brand700: '#365314', brand900: '#1a2e05', appBg: '#f0fdf4', appSurface: '#ffffff', appText: '#0f172a' },
+            { id: 'ruby', name: 'Ruby', description: 'Rich ruby accent with polished neutral contrast', brand50: '#fef2f2', brand100: '#fee2e2', brand300: '#fecaca', brand500: '#ef4444', brand600: '#b91c1c', brand700: '#991b1b', brand900: '#7f1d1d', appBg: '#f8fafc', appSurface: '#ffffff', appText: '#0f172a' },
+        ];
+
+        window.applyTheme = function(themeId) {
+            const theme = THEMES.find(t => t.id === themeId) || THEMES[0];
+            const root = document.documentElement;
+            root.setAttribute('data-theme', theme.id);
+            root.style.setProperty('--brand-50', theme.brand50);
+            root.style.setProperty('--brand-100', theme.brand100);
+            root.style.setProperty('--brand-300', theme.brand300);
+            root.style.setProperty('--brand-500', theme.brand500);
+            root.style.setProperty('--brand-600', theme.brand600);
+            root.style.setProperty('--brand-700', theme.brand700);
+            root.style.setProperty('--brand-900', theme.brand900);
+            root.style.setProperty('--app-bg', theme.appBg);
+            root.style.setProperty('--app-surface', theme.appSurface);
+            root.style.setProperty('--app-text', theme.appText);
+            root.style.setProperty('--app-shadow', '0 1px 3px rgba(15, 23, 42, 0.06), 0 1px 2px rgba(15, 23, 42, 0.04)');
+            storeSettings.theme = theme.id;
+
+            const selector = document.getElementById('theme-selector');
+            if (selector) selector.dataset.selected = theme.id;
+            document.querySelectorAll('.theme-option').forEach(btn => {
+                const active = btn.dataset.theme === theme.id;
+                btn.setAttribute('aria-pressed', active ? 'true' : 'false');
+                btn.className = active
+                    ? 'theme-option rounded-xl border border-brand-600 bg-brand-50 p-3 text-left ring-2 ring-brand-500'
+                    : 'theme-option rounded-xl border border-slate-200 bg-white p-3 text-left hover:border-brand-300 hover:bg-slate-50';
+            });
+            if (window.lucide) lucide.createIcons();
+        };
+
+        window.renderThemeSelector = function() {
+            const container = document.getElementById('theme-selector');
+            if (!container) return;
+            const selected = storeSettings.theme || 'classic-pink';
+            container.dataset.selected = selected;
+            container.innerHTML = THEMES.map(theme => `
+                <button type="button" class="theme-option rounded-xl border border-slate-200 bg-white p-3 text-left hover:border-brand-300 hover:bg-slate-50"
+                    data-theme="${esc(theme.id)}" onclick="applyTheme('${esc(theme.id)}')" aria-pressed="${theme.id === selected ? 'true' : 'false'}">
+                    <span class="theme-swatch block h-8 rounded-lg mb-2" style="background: linear-gradient(135deg, ${esc(theme.brand500)} 0%, ${esc(theme.brand600)} 55%, ${esc(theme.brand700)} 100%);"></span>
+                    <span class="block text-sm font-bold text-slate-900">${esc(theme.name)}</span>
+                    <span class="block text-xs text-slate-500 mt-1">${esc(theme.description)}</span>
+                </button>
+            `).join('');
+            window.applyTheme(selected);
+        };
+
+        window.switchSettingsSection = function(sectionName) {
+            document.querySelectorAll('.settings-section').forEach(section => {
+                section.classList.toggle('hidden', section.id !== `settings-${sectionName}`);
+            });
+            document.querySelectorAll('.settings-submenu-btn').forEach(btn => {
+                const active = btn.dataset.settingsSection === sectionName;
+                btn.className = active
+                    ? 'settings-submenu-btn w-full px-4 py-2.5 rounded-xl text-sm font-bold bg-brand-600 text-white flex items-center justify-start gap-2'
+                    : 'settings-submenu-btn w-full px-4 py-2.5 rounded-xl text-sm font-bold bg-white text-slate-700 hover:bg-slate-100 border border-slate-200 flex items-center justify-start gap-2';
+            });
+            if (sectionName === 'access-control') renderAccessControl();
+            if (sectionName === 'user-management') loadUsers();
+            if (sectionName === 'theme') renderThemeSelector();
+            if (sectionName === 'invoice-setup') renderInvoicePadSettings();
+            if (window.lucide) lucide.createIcons();
+        };
+
+        const FALLBACK_PERMISSION_DEFS = [
+            { key: 'viewOrders', label: 'View Orders' },
+            { key: 'editOrders', label: 'Edit Orders' },
+            { key: 'manageProducts', label: 'Manage Products & Stock' },
+            { key: 'addCollections', label: 'Add Collections' },
+            { key: 'deleteCollections', label: 'Delete Collections' },
+            { key: 'manageExpenses', label: 'Manage Daily Expenses' },
+            { key: 'viewProfit', label: 'View Profit/Revenue Stats' },
+            { key: 'accessSettings', label: 'Access Settings' },
+            { key: 'userManagement', label: 'User Management' },
+        ];
+
+        function isValidEmail(email) {
+            return /^[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}$/.test(email);
+        }
+
+        function isStrongPassword(password) {
+            return password.length >= 10 && /[a-z]/.test(password) && /[A-Z]/.test(password) && /\d/.test(password) && /[^A-Za-z0-9]/.test(password);
+        }
+
+        window.openUserModal = function() {
+            document.getElementById('user-modal').classList.remove('hidden');
+            if (window.lucide) lucide.createIcons();
+        };
+
+        window.closeUserModal = function() {
+            document.getElementById('user-modal').classList.add('hidden');
+        };
+
+        window.handleAddUser = async function(e) {
+            e.preventDefault();
+            const fullName = document.getElementById('user-full-name').value.trim();
+            const role = document.getElementById('user-role').value;
+            const email = document.getElementById('user-email').value.trim();
+            const password = document.getElementById('user-password').value;
+
+            if (!fullName) { showToast('Full name is required.', 'error'); return; }
+            if (['Admin', 'Manager', 'Salesman', 'Marketing'].indexOf(role) < 0) { showToast('Invalid role. Super Admin is reserved for the primary owner.', 'error'); return; }
+            if (!isValidEmail(email)) { showToast('Please enter a strict valid email address.', 'error'); return; }
+            if (!isStrongPassword(password)) { showToast('Password must be at least 10 characters and include uppercase, lowercase, number, and special character.', 'error'); return; }
+
+            try {
+                await api('POST', '/api/users', { fullName, role, email, password });
+                e.target.reset();
+                closeUserModal();
+                await loadUsers();
+                showToast('User added successfully!');
+            } catch (err) {
+                showToast(err.message || 'Could not add user.', 'error');
+            }
+        };
+
+        window.deleteUser = async function(userId) {
+            if (!isSuperAdmin) { showToast('Only Super Admin can delete user accounts.', 'error'); return; }
+            if (!confirm('Delete this user account?')) return;
+            try {
+                await api('DELETE', `/api/users/${encodeURIComponent(userId)}`);
+                await loadUsers();
+                showToast('User deleted.');
+            } catch (err) {
+                showToast(err.message || 'Could not delete user.', 'error');
+            }
+        };
+
+        async function loadUsers() {
+            if (!isAdminAuthenticated) return;
+            try {
+                const data = await api('GET', '/api/users');
+                users = data.users || [];
+                permissionDefs = data.permissionDefs || FALLBACK_PERMISSION_DEFS;
+                renderUserManagement();
+                renderAccessControl();
+            } catch (err) {
+                console.error('Users error:', err);
+            }
+        }
+
+        window.renderUserManagement = function() {
+            const box = document.getElementById('users-list');
+            if (!box) return;
+            const superAdminHtml = `
+                <div class="p-4 flex items-center justify-between gap-3 bg-slate-50">
+                    <div class="min-w-0">
+                        <p class="text-sm font-bold text-slate-900 truncate">${esc(storeSettings.adminUser || 'Super Admin')}</p>
+                        <p class="text-xs text-slate-500">Super Admin</p>
+                    </div>
+                    <span class="text-xs font-bold text-emerald-700 bg-emerald-50 px-2 py-1 rounded-lg">Protected</span>
+                </div>`;
+            if (!users.length) {
+                box.innerHTML = superAdminHtml + `<p class="p-4 text-center text-xs text-slate-400">No additional users yet.</p>`;
+                if (window.lucide) lucide.createIcons();
+                return;
+            }
+            box.innerHTML = superAdminHtml + users.map(u => `
+                <div class="p-4 flex items-center justify-between gap-3">
+                    <div class="min-w-0">
+                        <p class="text-sm font-bold text-slate-900 truncate">${esc(u.fullName || u.email)}</p>
+                        <p class="text-xs text-slate-500 truncate">${esc(u.email)}</p>
+                    </div>
+                    <div class="flex items-center gap-2 shrink-0">
+                        <span class="text-xs font-bold text-slate-600 bg-slate-100 px-2 py-1 rounded-lg">${esc(u.role)}</span>
+                        ${isSuperAdmin ? `<button type="button" onclick="deleteUser('${esc(u.id)}')" class="p-2 rounded-xl text-rose-600 hover:bg-rose-50" title="Delete user"><i data-lucide="trash-2" class="w-4 h-4"></i></button>` : ''}
+                    </div>
+                </div>
+            `).join('');
+            if (window.lucide) lucide.createIcons();
+        };
+
+        window.renderAccessControl = function() {
+            const select = document.getElementById('access-user-id');
+            if (!select) return;
+            const defs = permissionDefs.length ? permissionDefs : FALLBACK_PERMISSION_DEFS;
+            permissionDefs = defs;
+            const superAdmin = { id: 'super-admin', fullName: storeSettings.adminUser || 'Super Admin', role: 'Super Admin', permissions: Object.fromEntries(defs.map(d => [d.key, true])), isSuperAdmin: true };
+            const allUsers = [superAdmin, ...users];
+            if (!currentAccessUserId || !allUsers.some(u => u.id === currentAccessUserId)) currentAccessUserId = superAdmin.id;
+            select.innerHTML = allUsers.map(u => `<option value="${esc(u.id)}">${esc(u.fullName || u.email || u.id)} (${esc(u.role)})</option>`).join('');
+            select.value = currentAccessUserId;
+            renderAccessMatrix();
+        };
+
+        window.renderAccessMatrix = function() {
+            const matrix = document.getElementById('access-permissions-matrix');
+            if (!matrix) return;
+            const select = document.getElementById('access-user-id');
+            if (select) currentAccessUserId = select.value;
+            const defs = permissionDefs.length ? permissionDefs : FALLBACK_PERMISSION_DEFS;
+            const superAdmin = { id: 'super-admin', fullName: storeSettings.adminUser || 'Super Admin', role: 'Super Admin', permissions: Object.fromEntries(defs.map(d => [d.key, true])), isSuperAdmin: true };
+            const allUsers = [superAdmin, ...users];
+            const user = allUsers.find(u => u.id === currentAccessUserId) || superAdmin;
+            const superAdminUser = user.id === 'super-admin';
+            matrix.innerHTML = defs.map(def => `
+                <label class="flex items-center justify-between gap-3 rounded-xl border border-slate-200 bg-white p-3 hover:bg-slate-50">
+                    <span class="text-sm text-slate-700">${esc(def.label)}</span>
+                    <input type="checkbox" class="w-4 h-4 rounded border-slate-300 text-brand-600" data-permission-key="${esc(def.key)}"
+                        ${superAdminUser || user.permissions[def.key] ? 'checked' : ''}
+                        ${superAdminUser || !isSuperAdmin ? 'disabled' : ''}
+                        onchange="togglePermission('${esc(user.id)}', '${esc(def.key)}', this.checked)">
+                </label>
+            `).join('');
+        };
+
+        window.togglePermission = async function(userId, key, checked) {
+            if (!isSuperAdmin) return;
+            const user = users.find(u => u.id === userId);
+            if (!user) return;
+            user.permissions = { ...(user.permissions || {}), [key]: checked };
+            try {
+                await api('PUT', `/api/users/${encodeURIComponent(userId)}/permissions`, { permissions: user.permissions });
+            } catch (err) {
+                showToast(err.message || 'Could not update permission.', 'error');
+            }
+            renderAccessMatrix();
+        };
+
+        function applyStoreSettingsToUI() {
+            const shopName = storeSettings.shopName || 'Taham';
+            const pageName = storeSettings.pageName || shopName || 'Taham';
+            const setValue = (id, value) => {
+                const el = document.getElementById(id);
+                if (el) el.value = value || '';
+            };
+            const setChecked = (id, checked) => {
+                const el = document.getElementById(id);
+                if (el) el.checked = checked;
+            };
+
+            document.title = pageName;
+            document.getElementById('header-shop-name').innerText = pageName;
+            document.getElementById('footer-shop-name').innerText = shopName;
+            document.getElementById('footer-shop-address').innerText = storeSettings.shopAddress || 'Rayerbag, Dhaka, Bangladesh.';
+
+            const footerPhoneNumber = storeSettings.shopPhone || '01400-570014';
+            const footerPhoneLink = document.getElementById('footer-shop-phone');
+            const footerPhoneText = document.getElementById('footer-shop-phone-text');
+            if (footerPhoneLink) {
+                const phoneDigits = footerPhoneNumber.replace(/[^\d+]/g, '');
+                footerPhoneLink.href = `tel:${phoneDigits}`;
+                footerPhoneLink.setAttribute('aria-label', `Call or WhatsApp helpline ${footerPhoneNumber}`);
+                footerPhoneLink.title = 'Call / WhatsApp Helpline';
+            }
+            if (footerPhoneText) footerPhoneText.innerText = t('Helpline: {p}', { p: footerPhoneNumber });
+
+            document.getElementById('checkout-merchant-num').innerText = storeSettings.paymentNumber || '';
+
+            // Populate settings form inputs
+            setValue('page-name', pageName);
+            setValue('set-shop-name', shopName);
+            setValue('set-shop-phone', storeSettings.shopPhone);
+            setValue('set-payment-number', storeSettings.paymentNumber);
+            setValue('set-shop-address', storeSettings.shopAddress);
+            setValue('set-admin-user', storeSettings.adminUser || '');
+            setValue('set-admin-pass', '');
+            setChecked('set-show-stock', storeSettings.showStockToCustomers !== false && storeSettings.showStockToCustomers !== 'false');
+
+            const accessAdmin = document.getElementById('access-admin-user');
+            if (accessAdmin) accessAdmin.innerText = storeSettings.adminUser || shopName;
+            renderUserManagement();
+            renderAccessControl();
+
+            const preview = document.getElementById('settings-logo-preview');
+            if (preview) preview.src = `/logo.png?v=${Date.now()}`;
+
+            applyTheme(storeSettings.theme || 'classic-pink');
+            renderThemeSelector();
+            renderInvoicePadSettings();
+            renderProducts();
+        }
+
+        window.getInvoicePadUrl = function() {
+            const url = (typeof storeSettings !== 'undefined' && storeSettings.invoicePadUrl) || '/official-pad-background.jpg';
+            return String(url || '/official-pad-background.jpg');
+        };
+
+        window.insertPrintPadBackground = function(root) {
+            if (!root) return;
+            const padUrl = window.getInvoicePadUrl();
+            let bg = root.querySelector(':scope > .print-pad-background');
+            if (!bg) {
+                bg = document.createElement('img');
+                bg.className = 'print-pad-background';
+                bg.alt = '';
+                bg.setAttribute('aria-hidden', 'true');
+                root.insertBefore(bg, root.firstChild);
+            }
+            bg.src = padUrl;
+            return bg;
+        };
+
+        window.applyInvoicePadSettings = function() {
+            const padUrl = window.getInvoicePadUrl();
+            const rootStyle = document.documentElement.style;
+            const ss = (typeof storeSettings !== 'undefined' && storeSettings) ? storeSettings : {};
+            const top = `${Number(ss.invoiceMarginTop || 58)}mm`;
+            const bottom = `${Number(ss.invoiceMarginBottom || 48)}mm`;
+            const left = `${Number(ss.invoiceMarginLeft || 18)}mm`;
+            const right = `${Number(ss.invoiceMarginRight || 18)}mm`;
+            rootStyle.setProperty('--invoice-pad-image', `url("${padUrl}")`);
+            rootStyle.setProperty('--invoice-margin-top', top);
+            rootStyle.setProperty('--invoice-margin-bottom', bottom);
+            rootStyle.setProperty('--invoice-margin-left', left);
+            rootStyle.setProperty('--invoice-margin-right', right);
+            let dynamicPadStyle = document.getElementById('taham-dynamic-pad-style');
+            if (!dynamicPadStyle) {
+                dynamicPadStyle = document.createElement('style');
+                dynamicPadStyle.id = 'taham-dynamic-pad-style';
+                document.head.appendChild(dynamicPadStyle);
+            }
+            // Escape characters that could break out of a CSS url("...") token.
+            const safePadUrl = String(padUrl).replace(/["'`\\()]/g, encodeURIComponent);
+            const PAD_VARS = `--invoice-margin-top:${top};--invoice-margin-right:${right};--invoice-margin-bottom:${bottom};--invoice-margin-left:${left}`;
+            // SINGLE letterhead pad layer. Only `.print-pad-background` carries the pad image;
+            // `.print-pad`, `@page`, html/body and watermarks must NOT also paint it (no double pad).
+            const SINGLE_PAD_RESET = `
+    ${PAD_VARS};
+    position: relative !important;
+    box-sizing: border-box !important;
+    width: 210mm !important; max-width: 210mm !important;
+    min-height: 297mm !important; max-height: none !important; height: auto !important;
+    margin: 0 auto !important; border: 0 !important; border-radius: 0 !important; box-shadow: none !important;
+    background-color: transparent !important; background-image: none !important; background: transparent !important;
+    padding: ${top} ${right} ${bottom} ${left} !important;
+    overflow: visible !important;
+    -webkit-print-color-adjust: exact !important; print-color-adjust: exact !important;
+`;
+            const SINGLE_PAD_BG = `
+    display: block !important; visibility: visible !important; opacity: 1 !important;
+    position: absolute !important; top: 0 !important; left: 0 !important; right: 0 !important; bottom: 0 !important;
+    inset: 0 !important; width: 100% !important; height: 100% !important; margin: 0 !important; padding: 0 !important; border: 0 !important;
+    background-image: none !important; background: none !important;
+    object-fit: cover !important; object-position: center center !important; z-index: 0 !important; pointer-events: none !important;
+    -webkit-print-color-adjust: exact !important; print-color-adjust: exact !important;
+`;
+            dynamicPadStyle.textContent = `
+@media print { @page { size: A4 portrait; margin: 0; background-image: none !important; background: none !important; } }
+@media screen {
+  .print-pad, .print-pad.print-pad, #invoice-print-area.print-pad, #report-print-area.print-pad, #invoice-print-area, #report-print-area { background-image: none !important; background: transparent !important; }
+  .print-pad-background { display: block !important; }
+}
+@media print {
+  html, body { margin: 0 !important; padding: 0 !important; background: transparent !important; background-image: none !important; -webkit-print-color-adjust: exact !important; print-color-adjust: exact !important; }
+  .print-pad, .print-pad.print-pad, #invoice-print-area.print-pad, #report-print-area.print-pad, #invoice-print-area, #report-print-area { ${SINGLE_PAD_RESET} }
+  #invoice-print-area, #report-print-area { padding: ${top} ${right} ${bottom} ${left} !important; background-image: none !important; background: transparent !important; }
+  .print-pad-background { ${SINGLE_PAD_BG} }
+  .print-pad > :not(.print-pad-background) { position: relative; z-index: 1; }
+  /* proper page breaks + spacing inside pad boundaries on A4 */
+  .print-pad { page-break-inside: auto !important; break-inside: auto !important; }
+  table { page-break-inside: auto !important; break-inside: auto !important; }
+  thead { display: table-header-group !important; }
+  tfoot { display: table-footer-group !important; }
+  tr, .report-metrics-grid > *, .report-print-table tbody tr { page-break-inside: avoid !important; break-inside: avoid !important; }
+  .report-print-header, .report-orders-wrap, .invoice-totals, .invoice-payment-box, .invoice-signatures-footer { page-break-inside: avoid !important; break-inside: avoid !important; }
+  /* don't clip monthly/ daily content inside the pad */
+  .print-pad, #report-print-area, #invoice-print-area { overflow: visible !important; max-height: none !important; }
+}`;
+            document.querySelectorAll('.print-pad').forEach(pad => {
+                pad.style.setProperty('--invoice-pad-image', `url("${padUrl}")`);
+                window.insertPrintPadBackground(pad);
+            });
+            return padUrl;
+        };
+
+        window.preparePrintPagination = function(selector) {
+            const root = document.querySelector(selector);
+            if (!root) return;
+            window.applyInvoicePadSettings();
+            window.insertPrintPadBackground(root);
+            root.querySelectorAll('.print-pad').forEach(pad => window.insertPrintPadBackground(pad));
+            root.querySelectorAll('table').forEach(table => {
+                table.style.breakInside = 'auto';
+                table.style.pageBreakInside = 'auto';
+            });
+            root.querySelectorAll('table tbody tr').forEach(tr => {
+                tr.style.breakInside = 'avoid';
+                tr.style.pageBreakInside = 'avoid';
+                tr.style.pageBreakAfter = 'auto';
+            });
+            root.querySelectorAll('table thead').forEach(thead => { thead.style.display = 'table-header-group'; });
+            root.querySelectorAll('table tfoot').forEach(tfoot => { tfoot.style.display = 'table-footer-group'; });
+            root.classList.add('print-pad-paginated');
+        };
+
+        window.updateInvoicePadPreview = function() {
+            const ss = (typeof storeSettings !== 'undefined' && storeSettings) ? storeSettings : {};
+            const read = (id, fallback) => {
+                const el = document.getElementById(id);
+                const n = parseFloat(el ? el.value : ss[id]);
+                return Number.isFinite(n) && n >= 0 ? n : fallback;
+            };
+            const top = read('invoice-margin-top', Number(ss.invoiceMarginTop || 58));
+            const bottom = read('invoice-margin-bottom', Number(ss.invoiceMarginBottom || 48));
+            const left = read('invoice-margin-left', Number(ss.invoiceMarginLeft || 18));
+            const right = read('invoice-margin-right', Number(ss.invoiceMarginRight || 18));
+            const padUrl = window.getInvoicePadUrl();
+            const unit = (ss.invoiceMarginUnit || 'mm');
+
+            ['document', 'invoice-pad-live-preview'].forEach(() => {});
+            const setVar = (name, value) => document.documentElement.style.setProperty(name, value);
+            setVar('--invoice-margin-top', `${top}${unit}`);
+            setVar('--invoice-margin-bottom', `${bottom}${unit}`);
+            setVar('--invoice-margin-left', `${left}${unit}`);
+            setVar('--invoice-margin-right', `${right}${unit}`);
+
+            const preview = document.getElementById('invoice-pad-live-preview');
+            const safe = document.getElementById('invoice-pad-live-safe');
+            const bg = document.querySelector('.invoice-pad-live-bg');
+            const dims = document.getElementById('invoice-pad-live-dims');
+            const padImg = document.getElementById('invoice-pad-preview');
+            const urlText = document.getElementById('invoice-pad-url');
+            if (preview) preview.style.setProperty('--invoice-pad-image', `url("${padUrl}")`);
+            if (safe) {
+                safe.style.top = `${top}${unit}`;
+                safe.style.bottom = `${bottom}${unit}`;
+                safe.style.left = `${left}${unit}`;
+                safe.style.right = `${right}${unit}`;
+            }
+            if (bg) bg.src = padUrl;
+            if (padImg) padImg.src = padUrl;
+            if (urlText) urlText.innerText = padUrl;
+            if (dims) dims.innerText = `${top}${unit} / ${bottom}${unit} / ${left}${unit} / ${right}${unit}`;
+            window.applyInvoicePadSettings();
+        };
+
+        window.renderInvoicePadSettings = function() {
+            const ss = (typeof storeSettings !== 'undefined' && storeSettings) ? storeSettings : {};
+            const setValue = (id, value) => { const el = document.getElementById(id); if (el) el.value = value == null ? '' : value; };
+            setValue('invoice-margin-top', ss.invoiceMarginTop != null ? ss.invoiceMarginTop : 58);
+            setValue('invoice-margin-bottom', ss.invoiceMarginBottom != null ? ss.invoiceMarginBottom : 48);
+            setValue('invoice-margin-left', ss.invoiceMarginLeft != null ? ss.invoiceMarginLeft : 18);
+            setValue('invoice-margin-right', ss.invoiceMarginRight != null ? ss.invoiceMarginRight : 18);
+            const padImg = document.getElementById('invoice-pad-preview');
+            const bg = document.querySelector('.invoice-pad-live-bg');
+            const urlText = document.getElementById('invoice-pad-url');
+            if (padImg) padImg.src = window.getInvoicePadUrl();
+            if (bg) bg.src = window.getInvoicePadUrl();
+            if (urlText) urlText.innerText = window.getInvoicePadUrl();
+            window.updateInvoicePadPreview();
+        };
+
+        window.saveInvoiceSetup = async function() {
+            const ss = (typeof storeSettings !== 'undefined' && storeSettings) ? storeSettings : {};
+            const num = (id, fallback) => {
+                const el = document.getElementById(id);
+                const n = parseFloat(el ? el.value : fallback);
+                return Number.isFinite(n) && n >= 0 ? String(Math.round(n * 100) / 100) : String(fallback);
+            };
+            const payload = Object.assign({}, ss, {
+                invoiceMarginTop: num('invoice-margin-top', ss.invoiceMarginTop || 58),
+                invoiceMarginBottom: num('invoice-margin-bottom', ss.invoiceMarginBottom || 48),
+                invoiceMarginLeft: num('invoice-margin-left', ss.invoiceMarginLeft || 18),
+                invoiceMarginRight: num('invoice-margin-right', ss.invoiceMarginRight || 18),
+                invoiceMarginUnit: ss.invoiceMarginUnit || 'mm'
+            });
+            if (typeof storeSettings !== 'undefined') Object.assign(storeSettings, payload);
+            try {
+                if (typeof api === 'function') await api('PUT', '/api/settings/store_config', payload);
+                window.applyInvoicePadSettings();
+                window.updateInvoicePadPreview();
+            } catch (err) {
+                if (typeof showToast === 'function') showToast(err.message || 'Could not save invoice setup.', 'error');
+            }
+        };
+
+        window.uploadInvoicePad = async function() {
+            const input = document.getElementById('invoice-pad-upload');
+            if (!input || !input.files || !input.files[0]) {
+                if (typeof showToast === 'function') showToast('Please choose an image file.', 'error');
+                return;
+            }
+            const file = input.files[0];
+            if (!file.type.startsWith('image/')) {
+                if (typeof showToast === 'function') showToast('Please choose an image file.', 'error');
+                return;
+            }
+            if (file.size > 8 * 1024 * 1024) {
+                if (typeof showToast === 'function') showToast('Image must be smaller than 8 MB.', 'error');
+                return;
+            }
+            const dataUrl = await new Promise((resolve, reject) => {
+                const reader = new FileReader();
+                reader.onload = () => resolve(reader.result);
+                reader.onerror = () => reject(new Error('Could not read the image file.'));
+                reader.readAsDataURL(file);
+            });
+            try {
+                const result = await api('POST', '/api/invoice-pad', { dataUrl, filename: file.name });
+                const padUrl = result.padUrl || result.invoicePadUrl || '/invoice-pad-background.jpg';
+                if (typeof storeSettings !== 'undefined') {
+                    storeSettings.invoicePadUrl = padUrl;
+                    storeSettings.invoicePadFilename = file.name;
+                }
+                await api('PUT', '/api/settings/store_config', Object.assign({}, storeSettings, { invoicePadUrl: padUrl, invoicePadFilename: file.name }));
+                window.applyInvoicePadSettings();
+                window.renderInvoicePadSettings();
+                if (typeof showToast === 'function') showToast('Invoice pad uploaded and applied.');
+            } catch (err) {
+                if (typeof showToast === 'function') showToast(err.message || 'Could not upload invoice pad.', 'error');
+            }
+        };
+        function updatePendingBadge() {
+            const pendingCount = orders.filter(o => o.status === 'Pending').length;
+            const badge = document.getElementById('pending-orders-badge');
+            if (pendingCount > 0) {
+                badge.innerText = pendingCount;
+                badge.classList.remove('hidden');
+            } else {
+                badge.classList.add('hidden');
+            }
+        }
+
+        // Toast Helper
+        window.showToast = function(message, type = 'success') {
+            const container = document.getElementById('toast-container');
+            const toast = document.createElement('div');
+            const bgColor = type === 'success' ? 'bg-slate-900 text-white' : 'bg-rose-600 text-white';
+            toast.className = `${bgColor} px-4 py-3 rounded-xl shadow-xl flex items-center gap-2.5 text-sm font-medium transition-all duration-300 translate-y-2 opacity-0`;
+            toast.innerHTML = `
+                <i data-lucide="${type === 'success' ? 'check-circle-2' : 'alert-circle'}" class="w-4 h-4 text-pink-400 shrink-0"></i>
+                <span>${esc(t(message))}</span>
+            `;
+            container.appendChild(toast);
+            lucide.createIcons();
+            requestAnimationFrame(() => toast.classList.remove('translate-y-2', 'opacity-0'));
+            setTimeout(() => {
+                toast.classList.add('opacity-0', 'translate-y-2');
+                setTimeout(() => toast.remove(), 300);
+            }, 3200);
+        };
+
+        // ==========================================
+        // NAVIGATION & SUPER ADMIN AUTHENTICATION
+        // ==========================================
+        window.switchView = function(view) {
+            const storeView = document.getElementById('store-view');
+            const adminView = document.getElementById('admin-view');
+            const cartBtn = document.getElementById('header-cart-btn');
+
+            if (view === 'store') {
+                storeView.classList.remove('hidden');
+                adminView.classList.add('hidden');
+                cartBtn.classList.remove('hidden');
+            } else if (view === 'admin') {
+                if (!isAdminAuthenticated) {
+                    document.getElementById('admin-login-modal').classList.remove('hidden');
+                    return;
+                }
+                storeView.classList.add('hidden');
+                adminView.classList.remove('hidden');
+                cartBtn.classList.add('hidden');
+                updateAdminDashboard();
+            }
+            window.scrollTo({ top: 0, behavior: 'smooth' });
+        };
+
+        window.handleAdminNavClick = function() {
+            if (isAdminAuthenticated) {
+                switchView('admin');
+            } else {
+                document.getElementById('admin-login-modal').classList.remove('hidden');
+            }
+        };
+
+        window.closeAdminLoginModal = function() {
+            document.getElementById('admin-login-modal').classList.add('hidden');
+        };
+
+        window.handleAdminLogin = async function(e) {
+            e.preventDefault();
+            e.stopPropagation();
+            const usernameEl = document.getElementById('login-username');
+            const passwordEl = document.getElementById('login-password');
+            const username = (usernameEl.value || '').trim();
+            const password = passwordEl.value || '';
+            const submitBtn = e.submitter || null;
+            if (!username || !password) {
+                showToast('Please enter username and password.', 'error');
+                return;
+            }
+            if (submitBtn) submitBtn.disabled = true;
+            try {
+                await api('POST', '/api/login', { username, password });
+                isAdminAuthenticated = true;
+                isSuperAdmin = true;
+                window.adminUsername = username;
+                document.getElementById('admin-logout-btn').classList.remove('hidden');
+                closeAdminLoginModal();
+                passwordEl.value = '';
+                window.__sessionExpiredSuppress = true;
+                try {
+                    await window.__refreshAll();
+                    await loadUsers();
+                } catch (refreshErr) {
+                    console.warn('Login succeeded, but dashboard refresh failed:', refreshErr);
+                } finally {
+                    window.__sessionExpiredSuppress = false;
+                }
+                showToast('Welcome to the Super Admin panel!');
+                switchView('admin');
+            } catch (err) {
+                isAdminAuthenticated = false;
+                isSuperAdmin = false;
+                showToast(err.message || 'Wrong username or password!', 'error');
+            } finally {
+                if (submitBtn) submitBtn.disabled = false;
+            }
+        };
+
+        window.logoutAdmin = async function() {
+            try { await api('POST', '/api/logout'); } catch (e) { /* ignore */ }
+            isAdminAuthenticated = false;
+            isSuperAdmin = false;
+            users = [];
+            currentAccessUserId = '';
+            document.getElementById('admin-logout-btn').classList.add('hidden');
+            await window.__refreshAll();
+            showToast('Logged out successfully.');
+            switchView('store');
+        };
+
+        window.switchAdminSubTab = function(tabName) {
+            document.querySelectorAll('.admin-subtab-panel').forEach(p => p.classList.add('hidden'));
+            document.getElementById(`subtab-${tabName}`).classList.remove('hidden');
+
+            document.querySelectorAll('.admin-sub-btn').forEach(btn => {
+                const active = btn.dataset.subtab === tabName;
+                btn.className = active
+                    ? "admin-sub-btn w-full px-4 py-2.5 rounded-xl text-sm font-bold bg-brand-600 text-white shadow-sm flex items-center justify-start gap-2"
+                    : "admin-sub-btn w-full px-4 py-2.5 rounded-xl text-sm font-bold bg-white text-slate-700 hover:bg-slate-100 border border-slate-200 flex items-center justify-start gap-2";
+            });
+            if (tabName === 'settings' && typeof window.switchSettingsSection === 'function') {
+                window.switchSettingsSection('user-management');
+            }
+            if (tabName === 'reports' && typeof window.renderReports === 'function') {
+                window.switchReportView(currentReportView || 'daily');
+            }
+            lucide.createIcons();
+        };
+
+        window.openAdminSummary = function(tabName, orderFilter) {
+            window.switchAdminSubTab(tabName);
+            if (tabName === 'orders') {
+                const filter = document.getElementById('admin-order-filter');
+                if (filter) {
+                    filter.value = orderFilter || 'All';
+                    window.renderAdminOrders();
+                }
+            } else if (tabName === 'inventory' && typeof window.renderAdminInventory === 'function') {
+                window.renderAdminInventory();
+            } else if (tabName === 'expenses' && typeof window.renderAdminExpenses === 'function') {
+                window.renderAdminExpenses();
+            }
+        };
+
+        // ==========================================
+        // STOREFRONT RENDERING & CART LOGIC
+        // ==========================================
+        window.updateCategoryTitle = function() {
+            document.getElementById('current-category-title').innerText =
+                selectedCategory === 'All' ? t('All Collections') : selectedCategory;
+        };
+
+        window.filterCategory = function(category) {
+            selectedCategory = category;
+            renderCategoryFilters();
+            updateCategoryTitle();
+            renderProducts();
+        };
+
+        window.selectCollection = function(name) {
+            filterCategory(name);
+            document.getElementById('products-section').scrollIntoView({ behavior: 'smooth' });
+        };
+
+        window.renderCategoryFilters = function() {
+            const box = document.getElementById('category-filters');
+            const names = ['All', ...collections.map(c => c.name)];
+            box.innerHTML = names.map(n => {
+                const cls = n === selectedCategory
+                    ? 'cat-btn active px-4 py-2 rounded-xl text-sm font-semibold whitespace-nowrap bg-brand-600 text-white shadow-sm transition-all'
+                    : 'cat-btn px-4 py-2 rounded-xl text-sm font-semibold whitespace-nowrap bg-slate-100 text-slate-700 hover:bg-slate-200 transition-all';
+                return `<button data-cat="${esc(n)}" onclick="filterCategory(this.dataset.cat)" class="${cls}">${n === 'All' ? 'All Items' : esc(n)}</button>`;
+            }).join('');
+        };
+
+        window.renderCollections = function() {
+            const section = document.getElementById('collections-section');
+            const grid = document.getElementById('collections-grid');
+            if (!collections.length) { section.classList.add('hidden'); return; }
+            section.classList.remove('hidden');
+            grid.innerHTML = collections.map(c => {
+                const assigned = Array.isArray(c.productIds) ? c.productIds : [];
+                const n = products.filter(p => assigned.includes(p.id) || p.category === c.name).length;
+                return `
+                    <button data-cat="${esc(c.name)}" onclick="selectCollection(this.dataset.cat)"
+                        class="group relative overflow-hidden rounded-2xl aspect-[4/5] bg-slate-200 shadow-sm hover:shadow-xl transition-all text-left">
+                        <img src="${esc(c.image)}" alt="${esc(c.name)}"
+                             onerror="this.onerror=null;this.src='/placeholder.svg?w=600&h=750&text=Taham'"
+                             class="w-full h-full object-cover group-hover:scale-105 transition-transform duration-500">
+                        <div class="absolute inset-0 bg-gradient-to-t from-slate-900/80 via-slate-900/10 to-transparent"></div>
+                        <div class="absolute bottom-0 left-0 right-0 p-4 text-white">
+                            <h4 class="font-bold text-lg leading-tight">${esc(c.name)}</h4>
+                            <p class="text-xs text-slate-200 mt-0.5">${esc(t('{n} items', { n }))}</p>
+                        </div>
+                    </button>`;
+            }).join('');
+        };
+
+        window.initTiltInteractions = function() {
+            if (window.__tiltInitialized) return;
+            window.__tiltInitialized = true;
+
+            document.addEventListener('mousemove', function(event) {
+                const el = event.target.closest && event.target.closest('.tilt-3d');
+                if (!el) return;
+                const rect = el.getBoundingClientRect();
+                if (!rect.width || !rect.height) return;
+                const x = Math.max(0, Math.min(1, (event.clientX - rect.left) / rect.width));
+                const y = Math.max(0, Math.min(1, (event.clientY - rect.top) / rect.height));
+                const maxTilt = el.classList.contains('size-selector') ? 4 : 7;
+                const rotateX = (0.5 - y) * maxTilt;
+                const rotateY = (x - 0.5) * maxTilt;
+                const lift = el.classList.contains('size-selector') ? 'translateY(-3px) scale(1.08)' : 'translateY(-8px) scale(1.018)';
+                el.style.transform = `perspective(900px) rotateX(${rotateX.toFixed(2)}deg) rotateY(${rotateY.toFixed(2)}deg) ${lift}`;
+            });
+
+            document.addEventListener('mouseout', function(event) {
+                const el = event.target.closest && event.target.closest('.tilt-3d');
+                if (!el) return;
+                if (event.relatedTarget && el.contains(event.relatedTarget)) return;
+                el.style.transform = '';
+            });
+        };
+
+        window.initScrollReveal = function(root) {
+            const scope = root && root.querySelectorAll ? root : document;
+            const items = scope.querySelectorAll ? scope.querySelectorAll('.reveal') : [];
+            if (!items.length) return;
+
+            const reduceMotion = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+            if (reduceMotion || !('IntersectionObserver' in window)) {
+                items.forEach(item => item.classList.add('reveal-visible'));
+                return;
+            }
+
+            if (!window.__revealObserver) {
+                window.__revealObserver = new IntersectionObserver((entries) => {
+                    entries.forEach(entry => {
+                        if (entry.isIntersecting) {
+                            entry.target.classList.add('reveal-visible');
+                            window.__revealObserver.unobserve(entry.target);
+                        }
+                    });
+                }, { threshold: 0.08, rootMargin: '0px 0px -40px 0px' });
+            }
+
+            items.forEach(item => window.__revealObserver.observe(item));
+        };
+
+        window.selectProductSize = function(productId, size) {
+            selectedSizes[productId] = size;
+            renderProducts();
+        };
+
+        window.renderProducts = function() {
+            const grid = document.getElementById('products-grid');
+            const searchQuery = document.getElementById('search-input').value.toLowerCase().trim();
+
+            const filtered = products.filter(p => {
+                const matchesCat = selectedCategory === 'All' || p.category === selectedCategory;
+                const matchesSearch = String(p.name || '').toLowerCase().includes(searchQuery) || String(p.category || '').toLowerCase().includes(searchQuery);
+                return matchesCat && matchesSearch;
+            });
+
+            document.getElementById('product-count-label').innerText = t('{n} items found', { n: filtered.length });
+
+            if (filtered.length === 0) {
+                grid.innerHTML = `
+                    <div class="col-span-full py-16 text-center bg-white rounded-2xl border border-slate-200">
+                        <i data-lucide="search-x" class="w-12 h-12 text-slate-300 mx-auto mb-3"></i>
+                        <h4 class="text-lg font-bold text-slate-700">No clothes found</h4>
+                        <p class="text-sm text-slate-500 mt-1">Try searching with another name or collection.</p>
+                    </div>
+                `;
+                lucide.createIcons();
+                return;
+            }
+
+            grid.innerHTML = filtered.map(product => {
+                const activeSize = selectedSizes[product.id] || 'L';
+                const sizes = ['S', 'M', 'L', 'XL'];
+                const colors = Array.isArray(product.colors) ? product.colors : [];
+                const activeColor = colors.some(c => c.name === selectedColors[product.id]) ? selectedColors[product.id] : (colors[0] ? colors[0].name : '');
+                const photos = productPhotos(product);
+                let photoIdx = selectedImages[product.id];
+                if (!(photoIdx >= 0 && photoIdx < photos.length)) {
+                    const byColor = photos.findIndex(im => activeColor && im.color === activeColor);
+                    photoIdx = byColor >= 0 ? byColor : 0;
+                }
+                const shownPhoto = photos[photoIdx];
+                const stock = Number(product.stock ?? 0);
+                const isOutOfStock = stock <= 0;
+                const price = Number(product.price);
+                const sale = Number(product.salePrice ?? product.price);
+                const hasDiscount = sale < price;
+                const pct = hasDiscount ? Math.round((1 - sale / price) * 100) : 0;
+                const stockToggle = document.getElementById('set-show-stock');
+                const showStockToCustomers = storeSettings.showStockToCustomers !== false && storeSettings.showStockToCustomers !== 'false' && (!stockToggle || stockToggle.checked);
+
+                return `
+                    <div class="product-card tilt-3d reveal bg-white/90 backdrop-blur-sm rounded-2xl border border-slate-200 overflow-hidden shadow-sm flex flex-col group">
+                        <div class="relative aspect-[4/4] bg-slate-100 overflow-hidden">
+                            <img src="${esc(shownPhoto.src)}"
+                                 alt="${esc(product.name)}"
+                                 onerror="this.onerror=null;this.src='/placeholder.svg?w=600&h=700&text=Taham'"
+                                 onmouseenter="startInPlaceZoom(this)"
+                                 onmousemove="updateInPlaceZoom(event, this)"
+                                 onmouseleave="endInPlaceZoom(this)"
+                                 class="product-image-zoom zoomable-image w-full h-full object-cover ${isOutOfStock ? 'grayscale opacity-60' : ''}">
+                            <span class="absolute top-3 left-3 bg-white/85 backdrop-blur-md text-slate-800 text-xs font-bold px-3 py-1 rounded-lg shadow-sm border border-white/50">${esc(product.category)}</span>
+                            ${isOutOfStock ? `<span class="absolute right-3 ${hasDiscount ? 'top-20' : 'top-3'} bg-rose-600 text-white text-[11px] font-bold px-2.5 py-1 rounded-lg shadow-sm">${esc(t('Out of Stock'))}</span>` : (showStockToCustomers ? `<span class="absolute right-3 ${hasDiscount ? 'top-20' : 'top-3'} ${stock < 5 ? 'bg-amber-500 text-white' : 'bg-emerald-600 text-white'} text-[11px] font-bold px-2.5 py-1 rounded-lg shadow-sm">${esc(t('Stock: {n}', { n: stock }))}</span>` : '')}
+                            ${hasDiscount ? `<span class="discount-badge absolute top-3 right-3" role="img" aria-label="${esc(`${pct}% discount`)}">
+                                <span class="discount-badge-shadow" aria-hidden="true"></span>
+                                <span class="discount-badge-layer" aria-hidden="true"></span>
+                                <span class="discount-badge-navy">${esc(t('{pct}%', { pct }))}</span>
+                                <span class="discount-badge-ribbon">${esc(t('DISCOUNT'))}</span>
+                                <span class="discount-badge-accent discount-badge-accent-one" aria-hidden="true"></span>
+                                <span class="discount-badge-accent discount-badge-accent-two" aria-hidden="true"></span>
+                                <span class="discount-badge-accent discount-badge-accent-three" aria-hidden="true"></span>
+                            </span>` : ''}
+                            ${shownPhoto.color ? `<span class="absolute bottom-3 right-3 bg-white/85 backdrop-blur-md text-slate-800 text-[11px] font-bold px-2.5 py-1 rounded-lg shadow-sm border border-white/50 flex items-center gap-1.5"><span class="w-3 h-3 rounded-full border border-slate-300" style="background:${esc((colors.find(c => c.name === shownPhoto.color) || {}).hex || '#ccc')}"></span><span>${esc(shownPhoto.color)}</span></span>` : ''}
+                        </div>
+
+                        ${photos.length > 1 ? `<div class="flex gap-2 overflow-x-auto px-4 pt-3">
+                            ${photos.map((im, k) => `<button data-id="${esc(product.id)}" data-k="${k}" onclick="selectProductImage(this.dataset.id, Number(this.dataset.k))" class="shrink-0 w-14 text-center">
+                                <img src="${esc(im.src)}" onerror="this.onerror=null;this.src='/placeholder.svg?w=100&h=100&text=Photo'" class="w-14 h-14 rounded-lg object-cover border-2 ${k === photoIdx ? 'border-brand-600' : 'border-transparent'} bg-slate-100">
+                                ${im.color ? `<span class="block text-[10px] leading-tight mt-0.5 text-slate-600 truncate">${esc(im.color)}</span>` : ''}
+                            </button>`).join('')}
+                        </div>` : ''}
+
+                        <div class="p-5 flex-1 flex flex-col justify-between space-y-4">
+                            <div>
+                                <h4 class="font-bold text-slate-900 text-lg leading-snug line-clamp-1">${esc(product.name)}</h4>
+                                <p class="text-xs text-slate-500 mt-1 line-clamp-2">${esc(product.desc || t('Premium quality fabric and flawless finishing.'))}</p>
+                            </div>
+
+                            <div class="space-y-3 pt-2 border-t border-slate-100">
+                                <div class="flex items-center justify-between">
+                                    <span class="text-xs font-semibold text-slate-500">Size:</span>
+                                    <div class="flex gap-1.5">
+                                        ${sizes.map(sz => `
+                                            <button onclick="selectProductSize('${product.id}', '${sz}')"
+                                                class="size-selector tilt-3d w-8 h-8 rounded-lg text-xs font-bold transition-all ${activeSize === sz ? 'bg-slate-900 text-white' : 'bg-slate-100 text-slate-600 hover:bg-slate-200'}">${sz}</button>
+                                        `).join('')}
+                                    </div>
+                                </div>
+
+                                ${colors.length ? `
+                                <div class="flex items-center justify-between gap-2">
+                                    <span class="text-xs font-semibold text-slate-500">Colour:</span>
+                                    <div class="flex flex-wrap justify-end gap-1.5">
+                                        ${colors.map(c => `<button data-id="${esc(product.id)}" data-color="${esc(c.name)}" onclick="selectProductColor(this.dataset.id, this.dataset.color)" title="${esc(c.name)}"
+                                            class="w-6 h-6 rounded-full border transition-all ${c.name === activeColor ? 'ring-2 ring-offset-1 ring-brand-600 border-white' : 'border-slate-300'}" style="background:${esc(c.hex)}"></button>`).join('')}
+                                    </div>
+                                </div>
+                                <p class="text-[11px] font-semibold text-slate-600 text-right -mt-1">${esc(activeColor)}</p>` : ''}
+
+                                <div class="flex items-center justify-between pt-1">
+                                    <div>
+                                        <span class="text-xs text-slate-400 block">Price</span>
+                                        <div class="flex items-baseline gap-2">
+                                            <span class="text-xl font-bold text-brand-700">৳ ${sale.toLocaleString('en-US')}</span>
+                                            ${hasDiscount ? `<span class="text-sm text-slate-400 line-through">৳ ${price.toLocaleString('en-US')}</span>` : ''}
+                                        </div>
+                                    </div>
+                                    <button onclick="addToCart('${product.id}')" ${isOutOfStock ? 'disabled' : ''}
+                                        class="action-button tilt-3d px-4 py-2.5 rounded-xl ${isOutOfStock ? 'bg-slate-200 text-slate-400 cursor-not-allowed' : 'bg-brand-600 hover:bg-brand-700 text-white shadow-sm'} text-sm font-semibold transition-all flex items-center gap-1.5">
+                                        <i data-lucide="shopping-bag" class="w-4 h-4"></i>
+                                        <span>${isOutOfStock ? 'Out of stock' : 'Add to Bag'}</span>
+                                    </button>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                `;
+            }).join('');
+            lucide.createIcons();
+            initScrollReveal(grid);
+            initTiltInteractions();
+        };
+
+        window.addToCart = function(productId) {
+            const product = products.find(p => p.id === productId);
+            if (!product || Number(product.stock) <= 0) return;
+
+            const size = selectedSizes[productId] || 'L';
+            const colorList = Array.isArray(product.colors) ? product.colors : [];
+            const chosenColor = colorList.find(c => c.name === selectedColors[productId]) || colorList[0] || null;
+            const color = chosenColor ? chosenColor.name : '';
+            const colorHex = chosenColor ? chosenColor.hex : '';
+            const existingIndex = cart.findIndex(item => item.productId === productId && item.size === size && (item.color || '') === color);
+
+            const currentQtyInCart = cart.filter(i => i.productId === productId).reduce((s, i) => s + i.qty, 0);
+            if (currentQtyInCart + 1 > Number(product.stock)) {
+                showToast(t('Sorry! Only {n} left in stock for this item.', { n: product.stock }), 'error');
+                return;
+            }
+
+            if (existingIndex > -1) {
+                cart[existingIndex].qty += 1;
+            } else {
+                cart.push({
+                    productId: product.id,
+                    name: product.name,
+                    buyingPrice: Number(product.buyingPrice || 0),
+                    price: Number(product.salePrice ?? product.price),
+                    originalPrice: Number(product.price),
+                    image: photoForColor(product, color),
+                    size: size,
+                    color: color,
+                    colorHex: colorHex,
+                    qty: 1
+                });
+            }
+
+            updateCartUI();
+            showToast(t('"{name}" ({size}) added to bag!', { name: product.name + (color ? ' / ' + color : ''), size }));
+        };
+
+        window.updateCartQty = function(index, delta) {
+            const item = cart[index];
+            const product = products.find(p => p.id === item.productId);
+            if (delta > 0 && product && item.qty + 1 > Number(product.stock)) {
+                showToast('You cannot add more than the available stock.', 'error');
+                return;
+            }
+            item.qty += delta;
+            if (item.qty <= 0) cart.splice(index, 1);
+            updateCartUI();
+        };
+
+        window.toggleCart = function(open) {
+            const drawer = document.getElementById('cart-drawer');
+            if (open) {
+                drawer.classList.remove('hidden');
+                updateCartUI();
+            } else {
+                drawer.classList.add('hidden');
+            }
+        };
+
+        function getSelectedDeliveryCharge() {
+            const checked = document.querySelector('input[name="delivery_zone"]:checked');
+            return checked ? Number(checked.value) : 60;
+        }
+
+        window.updateCartUI = function() {
+            const totalItems = cart.reduce((sum, item) => sum + item.qty, 0);
+            document.getElementById('cart-count').innerText = totalItems;
+
+            const container = document.getElementById('cart-items-container');
+            const footer = document.getElementById('cart-footer');
+
+            if (cart.length === 0) {
+                footer.classList.add('hidden');
+                container.innerHTML = `
+                    <div class="h-full flex flex-col items-center justify-center text-center py-12">
+                        <div class="w-16 h-16 rounded-full bg-slate-100 text-slate-400 flex items-center justify-center mb-4">
+                            <i data-lucide="shopping-bag" class="w-8 h-8"></i>
+                        </div>
+                        <h4 class="font-bold text-slate-800 text-lg">Your shopping bag is empty</h4>
+                        <p class="text-sm text-slate-500 mt-1 max-w-xs">Add your favourite clothes to the bag and order easily.</p>
+                    </div>
+                `;
+                lucide.createIcons();
+                return;
+            }
+
+            footer.classList.remove('hidden');
+            let subtotal = 0;
+
+            container.innerHTML = cart.map((item, idx) => {
+                subtotal += item.price * item.qty;
+                return `
+                    <div class="flex gap-3.5 bg-white p-3 rounded-xl border border-slate-200">
+                        <img src="${esc(item.image)}" onerror="this.onerror=null;this.src='/placeholder.svg?w=150&h=150&text=Dress'" class="w-16 h-20 rounded-lg object-cover bg-slate-100 shrink-0">
+                        <div class="flex-1 min-w-0">
+                            <h5 class="font-bold text-slate-900 text-sm truncate">${esc(item.name)}</h5>
+                            <span class="inline-block text-[11px] font-semibold bg-slate-100 text-slate-600 px-2 py-0.5 rounded mt-1"><span>Size:</span> ${esc(item.size)}</span>
+                            ${item.color ? `<span class="inline-flex items-center gap-1 text-[11px] font-semibold bg-slate-100 text-slate-600 px-2 py-0.5 rounded mt-1 ml-1"><span class="w-3 h-3 rounded-full border border-slate-300" style="background:${esc(item.colorHex || '#ccc')}"></span><span>${esc(item.color)}</span></span>` : ''}
+                            <div class="flex items-center justify-between mt-2">
+                                <span class="font-bold text-brand-700 text-sm">৳ ${(item.price * item.qty).toLocaleString('en-US')}</span>
+                                <div class="flex items-center gap-2 bg-slate-100 rounded-lg p-1">
+                                    <button onclick="updateCartQty(${idx}, -1)" class="w-6 h-6 rounded bg-white text-slate-700 font-bold shadow-sm">-</button>
+                                    <span class="text-xs font-bold w-4 text-center">${item.qty}</span>
+                                    <button onclick="updateCartQty(${idx}, 1)" class="w-6 h-6 rounded bg-white text-slate-700 font-bold shadow-sm">+</button>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                `;
+            }).join('');
+
+            const deliveryCharge = getSelectedDeliveryCharge();
+            const grandTotal = subtotal + deliveryCharge;
+            document.getElementById('cart-subtotal').innerText = `৳ ${subtotal.toLocaleString('en-US')}`;
+            document.getElementById('cart-delivery-display').innerText = `৳ ${deliveryCharge}`;
+            document.getElementById('cart-total').innerText = `৳ ${grandTotal.toLocaleString('en-US')}`;
+            document.getElementById('modal-order-total').innerText = `৳ ${grandTotal.toLocaleString('en-US')}`;
+            lucide.createIcons();
+        };
+
+        window.startInPlaceZoom = function(img) {
+            if (!img) return;
+            img.style.transform = 'scale(1.55)';
+        };
+
+        window.updateInPlaceZoom = function(event, img) {
+            if (!img) return;
+            const rect = img.getBoundingClientRect();
+            if (!rect.width || !rect.height) return;
+            const x = Math.max(0, Math.min(100, ((event.clientX - rect.left) / rect.width) * 100));
+            const y = Math.max(0, Math.min(100, ((event.clientY - rect.top) / rect.height) * 100));
+            img.style.transformOrigin = `${x}% ${y}%`;
+            img.style.transform = 'scale(1.55)';
+        };
+
+        window.endInPlaceZoom = function(img) {
+            if (!img) return;
+            img.style.transform = 'scale(1)';
+            img.style.transformOrigin = 'center center';
+        };
+
+        window.handleCustomDesignReferenceUpload = async function(event) {
+            const file = event.target.files && event.target.files[0];
+            if (!file) return;
+            if (!file.type.startsWith('image/')) {
+                showToast('Please choose an image reference.', 'error');
+                event.target.value = '';
+                return;
+            }
+            try {
+                customDesignReferenceImage = await readImageFile(file, 1600, 0.85);
+                document.getElementById('custom-design-reference-img').src = customDesignReferenceImage;
+                document.getElementById('custom-design-reference-preview').classList.remove('hidden');
+                showToast('Reference image attached.');
+            } catch (err) {
+                showToast(err.message || 'Could not read the reference image.', 'error');
+                clearCustomDesignReference();
+            }
+        };
+
+        window.clearCustomDesignReference = function() {
+            customDesignReferenceImage = '';
+            const input = document.getElementById('custom-design-reference');
+            const preview = document.getElementById('custom-design-reference-preview');
+            const img = document.getElementById('custom-design-reference-img');
+            if (input) input.value = '';
+            if (preview) preview.classList.add('hidden');
+            if (img) img.src = '';
+        };
+
+        window.openCheckoutModal = function() {
+            toggleCart(false);
+            clearCustomDesignReference();
+            document.getElementById('checkout-modal').classList.remove('hidden');
+        };
+
+        window.closeCheckoutModal = function() {
+            document.getElementById('checkout-modal').classList.add('hidden');
+        };
+
+        window.toggleTrxField = function(show) {
+            const box = document.getElementById('trx-id-box');
+            if (show) box.classList.remove('hidden');
+            else box.classList.add('hidden');
+        };
+
+        // Customer checkout: the server checks prices + stock and saves the order
+        window.submitCustomerOrder = async function(e) {
+            e.preventDefault();
+            if (cart.length === 0) return;
+
+            const btn = document.getElementById('place-order-btn');
+            btn.disabled = true;
+            btn.innerText = 'Processing order...';
+
+            try {
+                const name = document.getElementById('cust-name').value.trim();
+                const order = await api('POST', '/api/orders', {
+                    customerName: name,
+                    customerPhone: document.getElementById('cust-phone').value.trim(),
+                    customerAddress: document.getElementById('cust-address').value.trim(),
+                    paymentMethod: document.querySelector('input[name="payment_method"]:checked').value,
+                    trxId: document.getElementById('cust-trx-id').value.trim(),
+                    customDesignNotes: document.getElementById('custom-design-notes').value.trim(),
+                    referenceImage: customDesignReferenceImage,
+                    customDesignReferenceImage: customDesignReferenceImage,
+                    deliveryCharge: getSelectedDeliveryCharge(),
+                    items: cart.map((i) => ({ productId: i.productId, size: i.size, color: i.color || '', qty: i.qty }))
+                });
+
+                cart = [];
+                updateCartUI();
+                document.getElementById('checkout-form').reset();
+                clearCustomDesignReference();
+                closeCheckoutModal();
+                showToast(t('Thank you {name}! Your order ({num}) is complete.', { name, num: order.orderNumber }));
+                window.__refreshAll();
+                openInvoiceModal(order);
+            } catch (err) {
+                console.error('Order submit error:', err);
+                showToast(err.message || 'Could not place the order, please try again.', 'error');
+                window.__refreshAll();
+            } finally {
+                btn.disabled = false;
+                btn.innerText = 'Place Order';
+            }
+        };
+
+        // ==========================================
+        // INVOICE / CASH MEMO PRINT MODAL
+        // ==========================================
+        window.openInvoiceModal = function(order) {
+            currentInvoice = order;
+            order = order || {};
+            const items = Array.isArray(order.items) ? order.items : [];
+            const paymentRaw = String(order.paymentMethod || '').trim();
+            const paymentLower = paymentRaw.toLowerCase();
+            const isBkash = paymentLower.includes('bkash');
+            const isNagad = paymentLower.includes('nagad');
+            const isCOD = !isBkash && !isNagad;
+            const orderNo = `#${order.orderNumber || (order.id ? order.id.slice(0, 8) : 'ORD-000000')}`;
+            const money = (value) => {
+                const n = Number(value || 0);
+                return `৳ ${(Number.isFinite(n) ? n : 0).toLocaleString('en-US')}`;
+            };
+            const setText = (id, value) => {
+                const el = document.getElementById(id);
+                if (el) el.innerText = value == null ? '' : String(value);
+            };
+
+            setText('inv-shop-name', 'TAHAM');
+            setText('inv-shop-address', 'Rayerbag, Dhaka, Bangladesh');
+            setText('inv-shop-phone', 'Facebook · WhatsApp 01400570014 · taham.info@gmail.com');
+            setText('inv-order-id', orderNo);
+            setText('inv-order-no', orderNo);
+            setText('inv-order-date', fmtDate(order.createdAt) || order.dateStr || '');
+            setText('inv-cust-name', order.customerName || '');
+            setText('inv-cust-phone', order.customerPhone || '');
+            setText('inv-cust-address', order.customerAddress || '');
+            setText('inv-courier', order.courier || order.deliveryMethod || order.courierName || order.shippingMethod || order.deliveryType || (isCOD ? 'Cash on Delivery' : paymentRaw) || '');
+            setText('inv-status', order.status || '');
+            setText('inv-payment', paymentRaw);
+            setText('inv-trx', order.trxId ? `TrxID: ${order.trxId}` : '');
+
+            const setPayment = (id, active) => {
+                const el = document.getElementById(id);
+                if (!el) return;
+                el.classList.toggle('active', active);
+                el.setAttribute('aria-checked', active ? 'true' : 'false');
+            };
+            setPayment('inv-payment-cash', isCOD);
+            setPayment('inv-payment-bkash', isBkash);
+            setPayment('inv-payment-nagad', isNagad);
+
+            const tbody = document.getElementById('inv-items-tbody');
+            tbody.innerHTML = items.map((item, k) => {
+                const qty = Number(item.qty || 1) || 1;
+                const rate = Number(item.price || 0) || 0;
+                const total = rate * qty;
+                const customNote = item.customDesignNote || item.customDesignNotes || item.customDesign || item.designNote || (k === 0 ? order.customDesignNotes : '');
+                return `
+                <tr>
+                    <td class="invoice-sl">${k + 1}</td>
+                    <td><strong>${esc(item.name || '')}</strong>${item.color ? `<div class="invoice-item-meta">Colour: ${esc(item.color)}</div>` : ''}${customNote ? `<div class="invoice-custom-note"><span>Custom Design Note:</span> ${esc(customNote)}</div>` : ''}</td>
+                    <td class="invoice-center">${esc(item.size || '')}</td>
+                    <td class="invoice-center">${qty}</td>
+                    <td class="invoice-right">${money(rate)}${Number(item.originalPrice) > rate ? `<div class="invoice-original-price">${money(item.originalPrice)}</div>` : ''}</td>
+                    <td class="invoice-right"><strong>${money(total)}</strong></td>
+                </tr>`;
+            }).join('');
+
+            const subtotal = order.subtotal !== undefined ? Number(order.subtotal || 0) : items.reduce((sum, item) => sum + (Number(item.price || 0) * (Number(item.qty || 1) || 1)), 0);
+            const delivery = Number(order.deliveryCharge || 0) || 0;
+            const discount = Number(order.discount || order.discountAmount || order.discountValue || 0) || 0;
+            const grandTotal = Number(order.total !== undefined ? order.total : Math.max(0, subtotal + delivery - discount)) || 0;
+            const advance = Number(order.advancePaid || order.advance || order.advancePaidAmount || 0) || 0;
+            const due = Math.max(0, grandTotal - advance);
+
+            setText('inv-subtotal', money(subtotal));
+            setText('inv-discount', money(discount));
+            setText('inv-delivery', money(delivery));
+            setText('inv-total', money(grandTotal));
+            setText('inv-advance', money(advance));
+            setText('inv-due', money(due));
+
+            document.getElementById('invoice-modal').classList.remove('hidden');
+            if (window.applyInvoicePadSettings) window.applyInvoicePadSettings();
+            lucide.createIcons();
+        };
+
+        window.openInvoiceById = function(orderId) {
+            const order = orders.find(o => o.id === orderId);
+            if (order) openInvoiceModal(order);
+        };
+
+        window.closeInvoiceModal = function() {
+            document.getElementById('invoice-modal').classList.add('hidden');
+        };
+
+        // ==========================================
+        // SUPER ADMIN ERP OPERATIONS
+        // ==========================================
+        window.updateAdminDashboard = function() {
+            if (!isAdminAuthenticated) return;
+
+            // Calculate Financials (Excluding Cancelled Orders)
+            const activeOrders = orders.filter(o => o.status !== 'Cancelled');
+            const totalRevenue = activeOrders.reduce((sum, o) => sum + Number(o.total || 0), 0);
+            const totalProductCost = activeOrders.reduce((sum, o) => sum + Number(o.totalCost || 0), 0);
+            const totalDeliveryCost = activeOrders.reduce((sum, o) => sum + Number(o.deliveryCharge || 0), 0);
+            const totalExpenses = expenses.reduce((sum, e) => sum + Number(e.amount || 0), 0);
+
+            // Net Profit = (Revenue - Delivery Charge - Product Buying Cost) - Business Expenses
+            const grossMargin = totalRevenue - totalDeliveryCost - totalProductCost;
+            const netProfit = grossMargin - totalExpenses;
+
+            const pendingCount = orders.filter(o => o.status === 'Pending').length;
+            const lowStockCount = products.filter(p => Number(p.stock) < 5).length;
+
+            document.getElementById('stat-revenue').innerText = `৳ ${totalRevenue.toLocaleString('en-US')}`;
+            document.getElementById('stat-profit').innerText = `৳ ${netProfit.toLocaleString('en-US')}`;
+            document.getElementById('stat-expenses').innerText = `৳ ${totalExpenses.toLocaleString('en-US')}`;
+            document.getElementById('stat-pending').innerText = pendingCount;
+            document.getElementById('stat-total-orders').innerText = t('Total Orders: {n}', { n: orders.length });
+            document.getElementById('stat-low-stock').innerText = lowStockCount;
+            document.getElementById('stat-total-products').innerText = t('Total Items: {n}', { n: products.length });
+
+            renderAdminOrders();
+            renderAdminInventory();
+            renderAdminExpenses();
+            renderAdminCollections();
+            renderReports();
+        };
+
+        window.renderAdminOrders = function() {
+            const container = document.getElementById('admin-orders-list');
+            const filterVal = document.getElementById('admin-order-filter').value;
+            const filtered = filterVal === 'All' ? orders : orders.filter(o => o.status === filterVal);
+
+            if (filtered.length === 0) {
+                container.innerHTML = `<div class="text-center py-10 text-slate-500 text-sm bg-slate-50 rounded-xl">No orders in this category.</div>`;
+                return;
+            }
+
+            container.innerHTML = filtered.map(order => {
+                const statusColors = {
+                    'Pending': 'bg-amber-100 text-amber-800 border-amber-200',
+                    'Processing': 'bg-blue-100 text-blue-800 border-blue-200',
+                    'Delivered': 'bg-emerald-100 text-emerald-800 border-emerald-200',
+                    'Cancelled': 'bg-rose-100 text-rose-800 border-rose-200'
+                };
+                const badgeClass = statusColors[order.status] || 'bg-slate-100 text-slate-800';
+
+                return `
+                    <div class="p-4 sm:p-5 rounded-2xl border border-slate-200 bg-slate-50/50 space-y-3">
+                        <div class="flex flex-wrap justify-between items-start gap-3">
+                            <div>
+                                <div class="flex items-center gap-2">
+                                    <span class="font-bold text-slate-900 text-base">${esc(order.orderNumber || order.id.slice(0, 8))}</span>
+                                    <span class="text-xs px-2.5 py-0.5 rounded-full font-bold border ${badgeClass}">${esc(order.status)}</span>
+                                </div>
+                                <p class="text-xs text-slate-500 mt-0.5"><span>${esc(fmtDate(order.createdAt))}</span> • <span>Payment:</span> <strong class="text-slate-800">${esc(order.paymentMethod)}</strong> ${order.trxId ? `(TrxID: ${esc(order.trxId)})` : ''}</p>
+                            </div>
+
+                            <div class="flex flex-wrap items-center gap-2">
+                                <select onchange="changeOrderStatus('${order.id}', this.value)" class="px-3 py-1.5 rounded-xl border border-slate-300 bg-white text-xs font-bold text-slate-800">
+                                    <option value="Pending" ${order.status === 'Pending' ? 'selected' : ''}>Pending</option>
+                                    <option value="Processing" ${order.status === 'Processing' ? 'selected' : ''}>Processing</option>
+                                    <option value="Delivered" ${order.status === 'Delivered' ? 'selected' : ''}>Delivered</option>
+                                    <option value="Cancelled" ${order.status === 'Cancelled' ? 'selected' : ''}>Cancelled</option>
+                                </select>
+
+                                <button onclick="openInvoiceById('${order.id}')" class="px-3 py-1.5 rounded-xl bg-slate-900 hover:bg-slate-800 text-white text-xs font-bold flex items-center gap-1.5">
+                                    <i data-lucide="printer" class="w-3.5 h-3.5"></i>
+                                    <span>Print Receipt</span>
+                                </button>
+
+                                <button onclick="deleteOrder('${order.id}')" class="p-1.5 rounded-xl text-rose-600 hover:bg-rose-100" title="Delete order">
+                                    <i data-lucide="trash-2" class="w-4 h-4"></i>
+                                </button>
+                            </div>
+                        </div>
+
+                        <div class="bg-white p-3 rounded-xl border border-slate-200 text-xs grid grid-cols-1 sm:grid-cols-2 gap-2">
+                            <p><strong class="text-slate-700">Customer:</strong> ${esc(order.customerName)} (<a href="tel:${esc(order.customerPhone)}" class="text-brand-600 underline">${esc(order.customerPhone)}</a>)</p>
+                            <p><strong class="text-slate-700">Address:</strong> ${esc(order.customerAddress)}</p>
+                        </div>
+
+                        ${(order.customDesignNotes || order.referenceImage) ? `
+                        <div class="bg-white p-3 rounded-xl border border-slate-200 text-xs space-y-2">
+                            <p class="font-bold text-slate-700">Custom Design Instructions</p>
+                            ${order.customDesignNotes ? `<p class="whitespace-pre-line text-slate-700">${esc(order.customDesignNotes)}</p>` : ''}
+                            ${order.referenceImage ? `<div><p class="text-slate-500 mb-1">Reference Image / Mockup:</p><img src="${esc(order.referenceImage)}" alt="Custom design reference" class="h-32 w-32 object-cover rounded-xl border border-slate-200 bg-slate-50"></div>` : ''}
+                        </div>` : ''}
+
+                        <div class="flex flex-wrap justify-between items-center gap-2 pt-1 text-xs">
+                            <div>
+                                ${(order.items || []).map(i => `<span class="inline-block bg-white border border-slate-200 px-2.5 py-1 rounded-lg mr-1.5 mb-1 font-medium">${esc(i.name)} (${esc(i.size)}${i.color ? ', ' + esc(i.color) : ''}) × ${Number(i.qty)}</span>`).join('')}
+                            </div>
+                            <div class="text-right">
+                                <span class="text-slate-500 mr-2"><span>Delivery:</span> ৳${order.deliveryCharge || 0}</span>
+                                <span class="font-bold text-base text-brand-700"><span>Total:</span> ৳ ${Number(order.total).toLocaleString('en-US')}</span>
+                            </div>
+                        </div>
+                    </div>
+                `;
+            }).join('');
+            lucide.createIcons();
+            initTiltInteractions();
+        };
+
+        window.switchReportView = function(view) {
+            currentReportView = view === 'monthly' ? 'monthly' : 'daily';
+            document.querySelectorAll('.report-view').forEach(el => el.classList.toggle('hidden', el.id !== `report-${currentReportView}`));
+            document.querySelectorAll('.report-tab').forEach(btn => {
+                const active = btn.dataset.reportTab === currentReportView;
+                btn.className = active
+                    ? 'report-tab px-4 py-2 rounded-xl text-sm font-bold bg-brand-600 text-white'
+                    : 'report-tab px-4 py-2 rounded-xl text-sm font-bold bg-white text-slate-700 border border-slate-200';
+            });
+            if (currentReportView === 'daily') {
+                const dateEl = document.getElementById('daily-report-date');
+                if (dateEl && !dateEl.value) dateEl.value = todayKey();
+            } else {
+                const monthEl = document.getElementById('monthly-report-month');
+                if (monthEl && !monthEl.value) monthEl.value = monthKey(new Date());
+            }
+            renderReports();
+        };
+
+        window.clearReportFilters = function(view) {
+            const prefix = view === 'monthly' ? 'monthly' : 'daily';
+            if (prefix === 'daily') {
+                document.getElementById('daily-report-date').value = todayKey();
+                document.getElementById('daily-report-from').value = '';
+                document.getElementById('daily-report-to').value = '';
+            } else {
+                document.getElementById('monthly-report-month').value = monthKey(new Date());
+                document.getElementById('monthly-report-from').value = '';
+                document.getElementById('monthly-report-to').value = '';
+            }
+            renderReports();
+        };
+
+        window.renderReports = function() {
+            const metricsBox = document.getElementById('report-metrics');
+            const ordersBox = document.getElementById('report-orders');
+            if (!metricsBox || !ordersBox) return;
+
+            const range = getReportRange(currentReportView);
+            const filteredOrders = orders.filter(o => inReportRange(orderTime(o), range));
+            const filteredExpenses = expenses.filter(e => inReportRange(expenseTime(e), range));
+            const activeOrders = filteredOrders.filter(o => o.status !== 'Cancelled');
+
+            const totalSales = activeOrders.reduce((sum, o) => sum + Number(o.total || 0), 0);
+            const totalProductCost = activeOrders.reduce((sum, o) => sum + Number(o.totalCost || 0), 0);
+            const totalDeliveryCost = activeOrders.reduce((sum, o) => sum + Number(o.deliveryCharge || 0), 0);
+            const totalExpenses = filteredExpenses.reduce((sum, e) => sum + Number(e.amount || 0), 0);
+            const netProfit = totalSales - totalProductCost - totalDeliveryCost - totalExpenses;
+            const orderCount = filteredOrders.length;
+            const totalItems = activeOrders.reduce((sum, o) => sum + (o.items || []).reduce((n, i) => n + Number(i.qty || 0), 0), 0);
+            const cancelledCount = filteredOrders.filter(o => o.status === 'Cancelled').length;
+            const pendingCount = filteredOrders.filter(o => o.status === 'Pending').length;
+
+            setReportPrintHeader(currentReportView, range);
+
+            metricsBox.innerHTML = `
+                ${reportMetricCard('Total Sales', money(totalSales), 'banknote', 'text-brand-700')}
+                ${reportMetricCard('Total Expenses', money(totalExpenses), 'receipt', 'text-rose-600')}
+                ${reportMetricCard('Net Profit', money(netProfit), 'trending-up', netProfit < 0 ? 'text-rose-600' : 'text-emerald-700')}
+                ${reportMetricCard('Total Orders', String(orderCount), 'package-check', 'text-slate-900')}
+                ${reportMetricCard('Items Sold', String(totalItems), 'shirt', 'text-slate-900')}
+                ${reportMetricCard('Pending', String(pendingCount), 'clock', 'text-amber-600')}
+                ${reportMetricCard('Cancelled', String(cancelledCount), 'x-circle', 'text-rose-600')}
+                ${reportMetricCard('Expenses Count', String(filteredExpenses.length), 'wallet', 'text-slate-900')}
+            `;
+
+            if (!filteredOrders.length) {
+                ordersBox.innerHTML = `<div class="report-empty p-8 text-center text-sm text-slate-400">No order summaries in this date range.</div>`;
+            } else {
+                ordersBox.innerHTML = `
+                    <table class="report-print-table">
+                        <thead>
+                            <tr>
+                                <th>Date</th>
+                                <th>Order No</th>
+                                <th>Customer</th>
+                                <th>Status</th>
+                                <th>Items</th>
+                                <th class="num">Total</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            ${filteredOrders.map(o => `
+                                <tr>
+                                    <td>${esc(fmtDate(orderTime(o)))}</td>
+                                    <td class="strong">${esc(o.orderNumber || (o.id ? o.id.slice(0, 8) : ''))}</td>
+                                    <td>${esc(o.customerName || '')}</td>
+                                    <td>${esc(o.status || '')}</td>
+                                    <td>${(o.items || []).length} item(s)</td>
+                                    <td class="num strong">${money(o.total)}</td>
+                                </tr>
+                            `).join('')}
+                        </tbody>
+                    </table>`;
+            }
+            if (window.applyInvoicePadSettings) window.applyInvoicePadSettings();
+            if (window.lucide) lucide.createIcons();
+        };
+
+        function setReportPrintHeader(view, range) {
+            const set = (id, v) => { const el = document.getElementById(id); if (el) el.innerText = v == null ? '' : String(v); };
+            const get = (id) => { const el = document.getElementById(id); return el ? el.value : ''; };
+            const daily = view !== 'monthly';
+            set('report-type', daily ? 'Daily Report' : 'Monthly Report');
+
+            let period = '';
+            if (daily) {
+                const from = get('daily-report-from'), to = get('daily-report-to');
+                const date = get('daily-report-date') || todayKey();
+                period = (from || to) ? `${from || '...'} to ${to || '...'}` : date;
+            } else {
+                const from = get('monthly-report-from'), to = get('monthly-report-to');
+                const month = get('monthly-report-month') || monthKey(new Date());
+                period = (from || to) ? `${from || '...'} to ${to || '...'}` : month;
+            }
+            set('report-period', `Selected Date / Date Range: ${period}`);
+
+            const user = window.adminUsername
+                || (typeof currentUser !== 'undefined' && currentUser && (currentUser.name || currentUser.email || currentUser.uid))
+                || (typeof isAdminAuthenticated !== 'undefined' && isAdminAuthenticated ? 'Admin' : 'TAHAM');
+            set('report-generated-by', `Generated By: ${user} · Generated: ${new Date().toLocaleString('en-US')}`);
+        }
+
+        window.printReport = function() {
+            if (typeof renderReports === 'function') renderReports();
+            setReportPrintHeader(currentReportView, getReportRange(currentReportView));
+            document.body.classList.add('printing-report');
+            const cleanup = () => document.body.classList.remove('printing-report');
+            window.addEventListener('afterprint', cleanup, { once: true });
+            window.preparePrintPagination('#report-print-area');
+            window.print();
+            setTimeout(cleanup, 1000);
+        };
+
+        function reportMetricCard(label, value, icon, colorClass) {
+            return `
+                <div class="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
+                    <div class="flex items-center justify-between">
+                        <p class="text-xs font-semibold text-slate-500">${esc(label)}</p>
+                        <i data-lucide="${esc(icon)}" class="w-5 h-5 text-slate-400"></i>
+                    </div>
+                    <p class="text-2xl font-bold mt-2 ${colorClass || 'text-slate-900'}">${esc(value)}</p>
+                </div>`;
+        }
+
+        function money(value) {
+            return `৳ ${Number(value || 0).toLocaleString('en-US')}`;
+        }
+
+        function todayKey() {
+            return dateKey(new Date());
+        }
+
+        function monthKey(date) {
+            const d = date instanceof Date ? date : parseLooseDate(date);
+            if (!d) return '';
+            return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
+        }
+
+        function dateKey(date) {
+            const d = date instanceof Date ? date : parseLooseDate(date);
+            if (!d || Number.isNaN(d.getTime())) return '';
+            return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+        }
+
+        function startOfDay(date) {
+            const d = date instanceof Date ? new Date(date) : parseLooseDate(date);
+            if (!d) return null;
+            d.setHours(0, 0, 0, 0);
+            return d;
+        }
+
+        function endOfDay(date) {
+            const d = date instanceof Date ? new Date(date) : parseLooseDate(date);
+            if (!d) return null;
+            d.setHours(23, 59, 59, 999);
+            return d;
+        }
+
+        function parseLooseDate(value) {
+            if (!value) return null;
+            if (value instanceof Date) return Number.isNaN(value.getTime()) ? null : value;
+            if (typeof value === 'number') return Number.isNaN(new Date(value).getTime()) ? null : new Date(value);
+            const s = String(value).trim();
+            const dmy = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})/);
+            if (dmy) return new Date(Number(dmy[3]), Number(dmy[2]) - 1, Number(dmy[1]), 12, 0, 0, 0);
+            const parsed = new Date(s);
+            return Number.isNaN(parsed.getTime()) ? null : parsed;
+        }
+
+        function orderTime(order) {
+            if (order.createdAt) return new Date(Number(order.createdAt)).getTime();
+            const parsed = parseLooseDate(order.dateStr);
+            return parsed ? parsed.getTime() : 0;
+        }
+
+        function expenseTime(expense) {
+            if (expense.createdAt) return new Date(Number(expense.createdAt)).getTime();
+            const parsed = parseLooseDate(expense.dateStr || expense.date);
+            return parsed ? parsed.getTime() : 0;
+        }
+
+        function inReportRange(time, range) {
+            if (!range) return true;
+            if (!time) return false;
+            return time >= range.start.getTime() && time <= range.end.getTime();
+        }
+
+        function getReportRange(view) {
+            const get = (id) => { const el = document.getElementById(id); return el ? el.value : ''; };
+            const fromValue = view === 'monthly' ? get('monthly-report-from') : get('daily-report-from');
+            const toValue = view === 'monthly' ? get('monthly-report-to') : get('daily-report-to');
+
+            if (fromValue || toValue) {
+                const start = fromValue ? startOfDay(fromValue) : new Date(0);
+                const end = toValue ? endOfDay(toValue) : new Date(8640000000000000);
+                return { start, end };
+            }
+
+            if (view === 'monthly') {
+                const month = get('monthly-report-month') || monthKey(new Date());
+                const match = month.match(/^(\d{4})-(\d{2})$/);
+                if (match) {
+                    const year = Number(match[1]);
+                    const monthIndex = Number(match[2]) - 1;
+                    return { start: new Date(year, monthIndex, 1, 0, 0, 0, 0), end: new Date(year, monthIndex + 1, 0, 23, 59, 59, 999) };
+                }
+                return null;
+            }
+
+            const date = get('daily-report-date') || todayKey();
+            return { start: startOfDay(date), end: endOfDay(date) };
+        }
+
+        window.changeOrderStatus = async function(orderId, newStatus) {
+            try {
+                await api('PATCH', `/api/orders/${orderId}`, { status: newStatus });   // server also fixes stock
+                await window.__refreshAll();
+                showToast(t('Order status updated to "{s}".', { s: newStatus }));
+            } catch (err) {
+                console.error('Status update error:', err);
+                showToast(err.message || 'Could not change the status.', 'error');
+            }
+        };
+
+        window.deleteOrder = async function(orderId) {
+            if (!confirm(t('Permanently delete this order?'))) return;
+            try {
+                await api('DELETE', `/api/orders/${orderId}`);
+                await window.__refreshAll();
+                showToast('Order deleted.', 'error');
+            } catch (err) {
+                showToast(err.message || 'Could not delete the order.', 'error');
+            }
+        };
+
+        // Reads an image file, shrinks it and returns a JPEG data URL
+        function readImageFile(file, maxDim, quality) {
+            return new Promise((resolve, reject) => {
+                const fail = () => reject(new Error('Could not read the image, please choose another'));
+                const reader = new FileReader();
+                reader.onerror = fail;
+                reader.onload = (e) => {
+                    const img = new Image();
+                    img.onerror = fail;
+                    img.onload = () => {
+                        const scale = Math.min(1, maxDim / Math.max(img.width, img.height));
+                        const w = Math.max(1, Math.round(img.width * scale));
+                        const h = Math.max(1, Math.round(img.height * scale));
+                        const canvas = document.createElement('canvas');
+                        canvas.width = w; canvas.height = h;
+                        const ctx = canvas.getContext('2d');
+                        ctx.fillStyle = '#ffffff';
+                        ctx.fillRect(0, 0, w, h);
+                        ctx.drawImage(img, 0, 0, w, h);
+                        resolve(canvas.toDataURL('image/jpeg', quality));
+                    };
+                    img.src = e.target.result;
+                };
+                reader.readAsDataURL(file);
+            });
+        }
+
+        window.handleImageFileUpload = async function(event) {
+            const files = Array.from(event.target.files || []);
+            event.target.value = '';
+            if (!files.length) return;
+            const room = MAX_PHOTOS - formImages.length;
+            if (room <= 0) { showToast('You can add up to 8 photos per product', 'error'); return; }
+            let added = 0;
+            for (const file of files.slice(0, room)) {
+                try {
+                    formImages.push({ src: await readImageFile(file, 700, 0.78), color: '' });
+                    added++;
+                } catch (err) {
+                    showToast(err.message, 'error');
+                }
+            }
+            if (files.length > room) showToast('You can add up to 8 photos per product', 'error');
+            if (added) showToast(t('{n} photos added', { n: added }));
+            renderGallery();
+        };
+
+        window.addImageLink = function() {
+            const input = document.getElementById('prod-image');
+            const url = input.value.trim();
+            if (!/^(https?:\/\/|\/)/i.test(url)) { showToast('Enter a valid image link', 'error'); return; }
+            if (formImages.length >= MAX_PHOTOS) { showToast('You can add up to 8 photos per product', 'error'); return; }
+            formImages.push({ src: url, color: '' });
+            input.value = '';
+            renderGallery();
+        };
+
+        window.renderGallery = function() {
+            const box = document.getElementById('prod-gallery');
+            if (!formImages.length) {
+                box.innerHTML = '<p class="col-span-full text-[11px] text-slate-400">No photos yet</p>';
+                return;
+            }
+            box.innerHTML = formImages.map((im, i) => `
+                <div class="relative bg-white rounded-xl border ${i === 0 ? 'border-brand-500 ring-1 ring-brand-300' : 'border-slate-200'} p-1.5 space-y-1.5">
+                    <img src="${esc(im.src)}" onerror="this.onerror=null;this.src='/placeholder.svg?w=200&h=200&text=Photo'" class="w-full aspect-square object-cover rounded-lg bg-slate-100">
+                    ${i === 0
+                        ? '<span class="absolute top-2.5 left-2.5 bg-brand-600 text-white text-[9px] font-bold px-1.5 py-0.5 rounded">Main</span>'
+                        : `<button type="button" data-i="${i}" onclick="makeMainImage(Number(this.dataset.i))" class="absolute top-2.5 left-2.5 bg-white/95 text-slate-700 text-[9px] font-bold px-1.5 py-0.5 rounded border border-slate-200">Set main</button>`}
+                    <button type="button" data-i="${i}" onclick="removeFormImage(Number(this.dataset.i))" title="Remove" class="absolute top-2.5 right-2.5 w-5 h-5 rounded-full bg-rose-600 text-white text-xs leading-none">&times;</button>
+                    <select data-i="${i}" onchange="setImageColor(Number(this.dataset.i), this.value)" class="w-full px-1.5 py-1 rounded-lg border border-slate-200 text-[11px] bg-white">
+                        <option value="">General (no colour)</option>
+                        ${formColors.map(c => `<option value="${esc(c.name)}" ${im.color === c.name ? 'selected' : ''}>${esc(c.name)}</option>`).join('')}
+                    </select>
+                </div>`).join('');
+        };
+
+        window.setImageColor = function(i, color) { if (formImages[i]) formImages[i].color = color; };
+        window.removeFormImage = function(i) { formImages.splice(i, 1); renderGallery(); };
+        window.makeMainImage = function(i) {
+            const [im] = formImages.splice(i, 1);
+            formImages.unshift(im);
+            renderGallery();
+        };
+
+        // photo to show for a colour (falls back to the main photo)
+        function productPhotos(p) {
+            return (Array.isArray(p.images) && p.images.length) ? p.images : [{ src: p.image, color: '' }];
+        }
+        function photoForColor(p, color) {
+            const list = productPhotos(p);
+            return (list.find(im => color && im.color === color) || list[0]).src;
+        }
+
+        // ---- discount helpers (same maths as the server) ----
+        function computeSale(price, type, value) {
+            if (!Number.isFinite(price)) return price;
+            if (type === 'percent' && value > 0 && value <= 95) return Math.max(0, price - Math.round(price * value / 100));
+            if (type === 'amount' && value > 0 && value < price) return price - value;
+            return price;
+        }
+
+        window.updateDiscountPreview = function() {
+            const box = document.getElementById('discount-preview');
+            const type = document.getElementById('prod-discount-type').value;
+            const valueInput = document.getElementById('prod-discount-value');
+            const value = parseInt(valueInput.value, 10) || 0;
+            const price = parseInt(document.getElementById('prod-price').value, 10);
+            const buying = parseInt(document.getElementById('prod-buying-price').value, 10);
+            valueInput.disabled = type === 'none';
+            if (type === 'none' || !Number.isFinite(price) || value <= 0) { box.classList.add('hidden'); return; }
+            const finalPrice = computeSale(price, type, value);
+            const pct = Math.round((1 - finalPrice / price) * 100);
+            let msg = t('Customers pay ৳ {final} instead of ৳ {price} ({pct}% off)',
+                { final: finalPrice.toLocaleString('en-US'), price: price.toLocaleString('en-US'), pct });
+            if (Number.isFinite(buying) && finalPrice < buying) msg += ' ' + t('Warning: the sale price is below your buying price.');
+            box.textContent = msg;
+            box.classList.remove('hidden');
+        };
+
+        window.populateCategorySelect = function(selected) {
+            const sel = document.getElementById('prod-category');
+            const keep = selected !== undefined ? selected : sel.value;
+            sel.innerHTML = collections.map(c => `<option value="${esc(c.name)}">${esc(c.name)}</option>`).join('');
+            if (keep && collections.some(c => c.name === keep)) sel.value = keep;
+        };
+
+        const PRESET_COLORS = [
+            { name: 'Black', hex: '#111111' }, { name: 'White', hex: '#ffffff' }, { name: 'Grey', hex: '#9ca3af' },
+            { name: 'Red', hex: '#dc2626' }, { name: 'Maroon', hex: '#7f1d1d' }, { name: 'Pink', hex: '#ec4899' },
+            { name: 'Orange', hex: '#f97316' }, { name: 'Yellow', hex: '#facc15' }, { name: 'Mustard', hex: '#ca8a04' },
+            { name: 'Green', hex: '#16a34a' }, { name: 'Olive', hex: '#6b7a2a' }, { name: 'Teal', hex: '#0f766e' },
+            { name: 'Sky Blue', hex: '#38bdf8' }, { name: 'Blue', hex: '#2563eb' }, { name: 'Navy Blue', hex: '#1e3a8a' },
+            { name: 'Purple', hex: '#7c3aed' }, { name: 'Brown', hex: '#78350f' }, { name: 'Beige', hex: '#d6c3a1' },
+            { name: 'Cream', hex: '#fff3d6' }, { name: 'Gold', hex: '#d4af37' }
+        ];
+        const hasColor = (name) => formColors.some(c => c.name.toLowerCase() === String(name).toLowerCase());
+
+        window.renderColorEditor = function() {
+            document.getElementById('color-presets').innerHTML = PRESET_COLORS.map(c => `
+                <button type="button" data-name="${esc(c.name)}" onclick="togglePresetColor(this.dataset.name)"
+                    class="flex items-center gap-1.5 pl-1.5 pr-2.5 py-1 rounded-full border text-[11px] font-semibold ${hasColor(c.name) ? 'bg-slate-900 text-white border-slate-900' : 'bg-white text-slate-700 border-slate-200 hover:bg-slate-50'}">
+                    <span class="w-4 h-4 rounded-full border border-slate-300" style="background:${c.hex}"></span><span>${esc(c.name)}</span>
+                </button>`).join('');
+            const box = document.getElementById('color-selected');
+            box.innerHTML = formColors.length
+                ? formColors.map(c => `
+                    <span class="inline-flex items-center gap-1.5 pl-1.5 pr-1 py-1 rounded-full bg-white border border-slate-200 text-[11px] font-semibold text-slate-700">
+                        <span class="w-4 h-4 rounded-full border border-slate-300" style="background:${esc(c.hex)}"></span><span>${esc(c.name)}</span>
+                        <button type="button" data-name="${esc(c.name)}" onclick="removeColor(this.dataset.name)" title="Remove" class="w-4 h-4 rounded-full text-rose-600 hover:bg-rose-50 leading-none">&times;</button>
+                    </span>`).join('')
+                : '<span class="text-[11px] text-slate-400">No colours selected</span>';
+            formImages.forEach(im => { if (im.color && !hasColor(im.color)) im.color = ''; });
+            renderGallery();
+        };
+
+        window.togglePresetColor = function(name) {
+            if (hasColor(name)) formColors = formColors.filter(c => c.name.toLowerCase() !== name.toLowerCase());
+            else { const p = PRESET_COLORS.find(c => c.name === name); if (p) formColors.push({ name: p.name, hex: p.hex }); }
+            renderColorEditor();
+        };
+
+        window.removeColor = function(name) {
+            formColors = formColors.filter(c => c.name.toLowerCase() !== name.toLowerCase());
+            renderColorEditor();
+        };
+
+        window.addCustomColor = function() {
+            const nameInput = document.getElementById('prod-color-name');
+            const name = nameInput.value.trim();
+            const hex = document.getElementById('prod-color-hex').value || '#9ca3af';
+            if (!name) { showToast('Enter a colour name', 'error'); return; }
+            const existing = formColors.find(c => c.name.toLowerCase() === name.toLowerCase());
+            if (existing) existing.hex = hex; else formColors.push({ name, hex });
+            nameInput.value = '';
+            renderColorEditor();
+        };
+
+        window.selectProductImage = function(productId, idx) {
+            const p = products.find(x => x.id === productId);
+            selectedImages[productId] = idx;
+            const photo = p ? productPhotos(p)[idx] : null;
+            if (photo && photo.color) selectedColors[productId] = photo.color;   // tapping a photo also picks its colour
+            renderProducts();
+        };
+
+        window.selectProductColor = function(productId, name) {
+            selectedColors[productId] = name;
+            delete selectedImages[productId];
+            renderProducts();
+        };
+
+        window.handleSaveProduct = async function(e) {
+            e.preventDefault();
+            if (!currentUser || !db) return;
+
+            const editId = document.getElementById('edit-prod-id').value;
+            const name = document.getElementById('prod-name').value.trim();
+            const category = document.getElementById('prod-category').value;
+            const stock = parseInt(document.getElementById('prod-stock').value, 10);
+            const buyingPrice = parseInt(document.getElementById('prod-buying-price').value, 10);
+            const price = parseInt(document.getElementById('prod-price').value, 10);
+            const discountType = document.getElementById('prod-discount-type').value;
+            const discountValue = discountType === 'none' ? 0 : (parseInt(document.getElementById('prod-discount-value').value || '0', 10));
+            const desc = document.getElementById('prod-desc').value.trim();
+
+            if (!name) { showToast('Enter the product name', 'error'); return; }
+            if (!category) { showToast('Select a collection. Add one in the Collections tab first.', 'error'); return; }
+            if ([stock, buyingPrice, price].some((n) => !Number.isInteger(n) || n < 0)) {
+                showToast('Enter valid numbers for stock, buying price and selling price', 'error');
+                return;
+            }
+            if (!Number.isInteger(discountValue) || discountValue < 0) { showToast('Discount must be a whole number', 'error'); return; }
+
+            const pendingLink = document.getElementById('prod-image').value.trim();
+            if (pendingLink && /^(https?:\/\/|\/)/i.test(pendingLink) && formImages.length < MAX_PHOTOS) {
+                formImages.push({ src: pendingLink, color: '' });
+            }
+            const finalImage = formImages.length
+                ? formImages[0].src
+                : `/placeholder.svg?w=600&h=700&text=${encodeURIComponent(name.slice(0, 20))}`;
+
+            try {
+                const payload = {
+                    name, category, stock, buyingPrice, price,
+                    discountType, discountValue,
+                    colors: formColors,
+                    images: formImages,
+                    image: finalImage,
+                    desc: desc || 'Exclusive collection from Taham.'
+                };
+
+                if (editId) {
+                    await updateDoc(doc(db, 'artifacts', appId, 'public', 'data', 'products', editId), payload);
+                    showToast('Product updated!');
+                } else {
+                    await addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'products'), payload);
+                    showToast('New product added to the shop!');
+                }
+                resetProductForm();
+            } catch (err) {
+                console.error("Save product error:", err);
+                showToast(err.message || 'Could not save the product', 'error');
+            }
+        };
+
+        window.editProduct = function(productId) {
+            const p = products.find(item => item.id === productId);
+            if (!p) return;
+
+            populateCategorySelect(p.category);
+            document.getElementById('edit-prod-id').value = p.id;
+            document.getElementById('prod-name').value = p.name;
+            document.getElementById('prod-category').value = p.category;
+            document.getElementById('prod-stock').value = p.stock ?? 0;
+            document.getElementById('prod-buying-price').value = p.buyingPrice ?? 0;
+            document.getElementById('prod-price').value = p.price;
+            document.getElementById('prod-discount-type').value = p.discountType || 'none';
+            document.getElementById('prod-discount-value').value = p.discountValue || 0;
+            document.getElementById('prod-image').value = '';
+            formImages = productPhotos(p).filter(im => im.src).map(im => ({ src: im.src, color: im.color || '' }));
+            renderGallery();
+
+            document.getElementById('product-form-title').innerText = 'Edit Product';
+            document.getElementById('cancel-edit-btn').classList.remove('hidden');
+            updateDiscountPreview();
+            document.getElementById('product-form').scrollIntoView({ behavior: 'smooth' });
+        };
+
+        window.resetProductForm = function() {
+            document.getElementById('product-form').reset();
+            document.getElementById('edit-prod-id').value = '';
+            formColors = [];
+            renderColorEditor();
+            formImages = [];
+            renderGallery();
+            document.getElementById('product-form-title').innerText = 'Add New Product';
+            document.getElementById('cancel-edit-btn').classList.add('hidden');
+            updateDiscountPreview();
+        };
+
+        // ---------- Collections (name + cover photo) ----------
+        window.handleCollectionImageUpload = async function(event) {
+            const file = event.target.files[0];
+            if (!file) return;
+            try {
+                uploadedCollectionImage = await readImageFile(file, 800, 0.8);
+                document.getElementById('col-image-preview-img').src = uploadedCollectionImage;
+                document.getElementById('col-image-preview-box').classList.remove('hidden');
+                showToast('Image is ready!');
+            } catch (err) {
+                showToast(err.message, 'error');
+            }
+        };
+
+        window.handleSaveCollection = async function(e) {
+            e.preventDefault();
+            const editId = document.getElementById('edit-col-id').value;
+            const name = document.getElementById('col-name').value.trim();
+            if (!name) { showToast('Enter the collection name', 'error'); return; }
+            const image = uploadedCollectionImage || document.getElementById('col-image-url').value.trim();
+            const selectedProductIds = Array.from(document.querySelectorAll('#col-product-selector input[type="checkbox"]:checked')).map(el => el.value);
+            const previousName = editId ? (collections.find(x => x.id === editId) || {}).name : '';
+            const payload = { name, productIds: selectedProductIds };
+            if (image) payload.image = image;
+            try {
+                if (editId) {
+                    await updateDoc(doc(db, 'artifacts', appId, 'public', 'data', 'collections', editId), payload);
+                    showToast('Collection updated!');
+                } else {
+                    await addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'collections'), payload);
+                    showToast('Collection added!');
+                }
+
+                const affectedIds = new Set(selectedProductIds);
+                products.forEach(p => {
+                    if (p.category === name || (previousName && p.category === previousName)) affectedIds.add(p.id);
+                });
+                for (const productId of affectedIds) {
+                    const p = products.find(x => x.id === productId);
+                    if (!p) continue;
+                    const nextCategory = selectedProductIds.includes(productId) ? name : '';
+                    if (p.category !== nextCategory) {
+                        await updateDoc(doc(db, 'artifacts', appId, 'public', 'data', 'products', productId), { category: nextCategory });
+                    }
+                }
+
+                resetCollectionForm();
+                closeCollectionModal();
+                await window.__refreshAll();
+            } catch (err) {
+                showToast(err.message || 'Could not save the collection', 'error');
+            }
+        };
+
+        window.openCollectionModal = function() {
+            resetCollectionForm();
+            document.getElementById('collection-modal').classList.remove('hidden');
+            renderCollectionProductSelector();
+            if (window.lucide) lucide.createIcons();
+        };
+
+        window.closeCollectionModal = function() {
+            document.getElementById('collection-modal').classList.add('hidden');
+        };
+
+        window.editCollection = function(id) {
+            const c = collections.find(x => x.id === id);
+            if (!c) return;
+            document.getElementById('edit-col-id').value = c.id;
+            document.getElementById('col-name').value = c.name;
+            document.getElementById('col-image-url').value = String(c.image || '').startsWith('data:') ? '' : (c.image || '');
+            uploadedCollectionImage = '';
+            document.getElementById('col-image-preview-img').src = c.image || '';
+            document.getElementById('col-image-preview-box').classList.toggle('hidden', !c.image);
+            document.getElementById('col-form-title').innerText = 'Edit Collection';
+            document.getElementById('col-cancel-btn').classList.remove('hidden');
+            document.getElementById('collection-modal').classList.remove('hidden');
+            renderCollectionProductSelector();
+            if (window.lucide) lucide.createIcons();
+        };
+
+        window.renderCollectionProductSelector = function() {
+            const box = document.getElementById('col-product-selector');
+            if (!box) return;
+            const name = document.getElementById('col-name').value.trim();
+            const editId = document.getElementById('edit-col-id').value;
+            const oldName = editId ? (collections.find(x => x.id === editId) || {}).name : '';
+            const selected = new Set(Array.from(document.querySelectorAll('#col-product-selector input[type="checkbox"]:checked')).map(el => el.value));
+            const assigned = new Set(((collections.find(x => x.id === editId) || {}).productIds || []));
+            if (!products.length) {
+                box.innerHTML = `<p class="p-3 text-center text-xs text-slate-400">No products yet.</p>`;
+                return;
+            }
+            box.innerHTML = products.map(p => `
+                <label class="flex items-center gap-3 p-3 hover:bg-slate-50 cursor-pointer">
+                    <input type="checkbox" class="w-4 h-4 rounded border-slate-300 text-brand-600" value="${esc(p.id)}" ${selected.has(p.id) || assigned.has(p.id) || p.category === name || p.category === oldName ? 'checked' : ''}>
+                    <span class="text-sm text-slate-700">${esc(p.name)}</span>
+                    <span class="text-xs text-slate-400 ml-auto">${esc(p.category || '')}</span>
+                </label>
+            `).join('');
+        };
+
+        window.resetCollectionForm = function() {
+            document.getElementById('collection-form').reset();
+            document.getElementById('edit-col-id').value = '';
+            uploadedCollectionImage = '';
+            document.getElementById('col-image-preview-box').classList.add('hidden');
+            document.getElementById('col-form-title').innerText = 'Add New Collection';
+            document.getElementById('col-cancel-btn').classList.add('hidden');
+            renderCollectionProductSelector();
+        };
+
+        window.deleteCollection = async function(id) {
+            if (!confirm(t('Delete this collection?'))) return;
+            try {
+                await deleteDoc(doc(db, 'artifacts', appId, 'public', 'data', 'collections', id));
+                showToast('Collection deleted', 'error');
+            } catch (err) {
+                showToast(err.message || 'Could not delete the collection', 'error');
+            }
+        };
+
+        window.renderAdminCollections = function() {
+            const box = document.getElementById('admin-collections-list');
+            if (!collections.length) {
+                box.innerHTML = `<p class="text-center py-8 text-sm text-slate-400">No collections yet.</p>`;
+                return;
+            }
+            box.innerHTML = collections.map(c => {
+                const assigned = Array.isArray(c.productIds) ? c.productIds : [];
+                const n = products.filter(p => assigned.includes(p.id) || p.category === c.name).length;
+                return `
+                    <div class="py-3.5 flex items-center justify-between gap-3">
+                        <div class="flex items-center gap-3 min-w-0">
+                            <img src="${esc(c.image)}" onerror="this.onerror=null;this.src='/placeholder.svg?w=100&h=125&text=Taham'" class="w-14 h-[70px] rounded-xl object-cover bg-slate-100 shrink-0 border border-slate-200">
+                            <div class="min-w-0">
+                                <h5 class="font-bold text-slate-900 text-sm truncate">${esc(c.name)}</h5>
+                                <p class="text-xs text-slate-500 mt-0.5">${esc(t('{n} items', { n }))}</p>
+                            </div>
+                        </div>
+                        <div class="flex items-center gap-2 shrink-0">
+                            <button data-id="${esc(c.id)}" onclick="editCollection(this.dataset.id)" class="p-2 rounded-xl text-blue-600 hover:bg-blue-50" title="Edit"><i data-lucide="edit-3" class="w-4 h-4"></i></button>
+                            <button data-id="${esc(c.id)}" onclick="deleteCollection(this.dataset.id)" class="p-2 rounded-xl text-rose-600 hover:bg-rose-50" title="Delete"><i data-lucide="trash-2" class="w-4 h-4"></i></button>
+                        </div>
+                    </div>`;
+            }).join('');
+            lucide.createIcons();
+            initTiltInteractions();
+        };
+
+        window.adjustStockQuick = async function(productId, delta) {
+            if (!currentUser || !db) return;
+            const p = products.find(item => item.id === productId);
+            if (!p) return;
+            const nextStock = Math.max(0, Number(p.stock || 0) + delta);
+            try {
+                await updateDoc(doc(db, 'artifacts', appId, 'public', 'data', 'products', productId), { stock: nextStock });
+            } catch (err) {
+                showToast(err.message || 'Could not update the stock.', 'error');
+            }
+        };
+
+        window.deleteProduct = async function(productId) {
+            if (!currentUser || !db) return;
+            if (!confirm(t('Permanently delete this product?'))) return;
+            try {
+                await deleteDoc(doc(db, 'artifacts', appId, 'public', 'data', 'products', productId));
+                showToast('Product deleted.', 'error');
+            } catch (err) {
+                showToast(err.message || 'Could not delete.', 'error');
+            }
+        };
+
+        window.renderAdminInventory = function() {
+            const container = document.getElementById('admin-products-list');
+            container.innerHTML = products.map(p => {
+                const price = Number(p.price);
+                const sale = Number(p.salePrice ?? p.price);
+                const hasDiscount = sale < price;
+                const pct = hasDiscount ? Math.round((1 - sale / price) * 100) : 0;
+                const stockToggle = document.getElementById('set-show-stock');
+                const showStockToCustomers = storeSettings.showStockToCustomers !== false && storeSettings.showStockToCustomers !== 'false' && (!stockToggle || stockToggle.checked);
+                const profitPerUnit = sale - Number(p.buyingPrice || 0);
+                const colorDots = (p.colors || []).map(c => `<span title="${esc(c.name)}" class="inline-block w-3 h-3 rounded-full border border-slate-300 align-middle" style="background:${esc(c.hex)}"></span>`).join(' ');
+                const stock = Number(p.stock ?? 0);
+                return `
+                    <div class="py-3.5 flex flex-wrap sm:flex-nowrap items-center justify-between gap-3">
+                        <div class="flex items-center gap-3 min-w-0">
+                            <img src="${esc(p.image)}" onerror="this.onerror=null;this.src='/placeholder.svg?w=100&h=100&text=Cloth'" class="w-14 h-14 rounded-xl object-cover bg-slate-100 shrink-0 border border-slate-200">
+                            <div class="min-w-0">
+                                <h5 class="font-bold text-slate-900 text-sm truncate">${esc(p.name)}</h5>
+                                <p class="text-xs text-slate-500 mt-0.5">
+                                    <span>${esc(p.category)}</span> • ${colorDots ? colorDots + ' • ' : ''}<span>Buy:</span> ৳${p.buyingPrice || 0} • <span>Price:</span>
+                                    ${hasDiscount
+                                        ? `<span class="line-through text-slate-400">৳${price}</span> <strong class="text-brand-700">৳${sale}</strong> <span class="bg-rose-100 text-rose-700 font-bold px-1.5 py-0.5 rounded">-${pct}%</span>`
+                                        : `<strong class="text-brand-700">৳${price}</strong>`}
+                                    • <span class="${profitPerUnit < 0 ? 'text-rose-600' : 'text-emerald-600'} font-bold"><span>Profit/pc:</span> ৳${profitPerUnit}</span>
+                                </p>
+                            </div>
+                        </div>
+
+                        <div class="flex items-center gap-2 shrink-0">
+                            <div class="flex items-center gap-1.5 bg-slate-100 px-2 py-1 rounded-xl border border-slate-200">
+                                <button onclick="adjustStockQuick('${p.id}', -1)" class="w-6 h-6 rounded-lg bg-white font-bold text-slate-700 shadow-sm">-</button>
+                                <span class="text-xs font-bold px-1.5 ${stock < 5 ? 'text-rose-600' : 'text-slate-800'}"><span>${stock}</span> <span>pcs</span></span>
+                                <button onclick="adjustStockQuick('${p.id}', 1)" class="w-6 h-6 rounded-lg bg-white font-bold text-slate-700 shadow-sm">+</button>
+                            </div>
+
+                            <button onclick="editProduct('${p.id}')" class="p-2 rounded-xl text-blue-600 hover:bg-blue-50" title="Edit">
+                                <i data-lucide="edit-3" class="w-4 h-4"></i>
+                            </button>
+                            <button onclick="deleteProduct('${p.id}')" class="p-2 rounded-xl text-rose-600 hover:bg-rose-50" title="Delete">
+                                <i data-lucide="trash-2" class="w-4 h-4"></i>
+                            </button>
+                        </div>
+                    </div>
+                `;
+            }).join('');
+            lucide.createIcons();
+            initTiltInteractions();
+        };
+
+        // Expenses Management
+        window.openExpenseModal = function() {
+            document.getElementById('expense-modal').classList.remove('hidden');
+            if (window.lucide) lucide.createIcons();
+        };
+
+        window.closeExpenseModal = function() {
+            document.getElementById('expense-modal').classList.add('hidden');
+        };
+
+        window.handleAddExpense = async function(e) {
+            e.preventDefault();
+            if (!currentUser || !db) return;
+            const title = document.getElementById('exp-title').value.trim();
+            const category = document.getElementById('exp-category').value;
+            const amount = parseInt(document.getElementById('exp-amount').value, 10);
+
+            if (!title || !Number.isInteger(amount) || amount < 1) {
+                showToast('Enter the expense description and a valid amount.', 'error');
+                return;
+            }
+            try {
+                await addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'expenses'), { title, category, amount });
+                e.target.reset();
+                closeExpenseModal();
+                showToast('Expense recorded!');
+            } catch (err) {
+                showToast(err.message || 'Could not add the expense.', 'error');
+            }
+        };
+
+        window.deleteExpense = async function(expId) {
+            if (!currentUser || !db) return;
+            try {
+                await deleteDoc(doc(db, 'artifacts', appId, 'public', 'data', 'expenses', expId));
+                showToast('Expense deleted.', 'error');
+            } catch (err) {
+                showToast(err.message || 'Could not delete.', 'error');
+            }
+        };
+
+        window.renderAdminExpenses = function() {
+            const container = document.getElementById('admin-expenses-list');
+            if (expenses.length === 0) {
+                container.innerHTML = `<p class="text-center py-8 text-sm text-slate-400">No expenses added yet.</p>`;
+                return;
+            }
+            container.innerHTML = expenses.map(exp => `
+                <div class="py-3 flex items-center justify-between gap-3">
+                    <div>
+                        <h5 class="font-bold text-slate-800 text-sm">${esc(exp.title)}</h5>
+                        <p class="text-xs text-slate-500">${esc(exp.category)} • ${esc(fmtDate(exp.createdAt, true))}</p>
+                    </div>
+                    <div class="flex items-center gap-3">
+                        <span class="font-bold text-rose-600 text-sm">- ৳ ${Number(exp.amount).toLocaleString('en-US')}</span>
+                        <button onclick="deleteExpense('${exp.id}')" class="p-1.5 rounded-lg text-slate-400 hover:text-rose-600">
+                            <i data-lucide="trash-2" class="w-4 h-4"></i>
+                        </button>
+                    </div>
+                </div>
+            `).join('');
+            lucide.createIcons();
+        };
+
+        // Store Settings & Password Update
+        window.handleSaveSettings = async function(e) {
+            e.preventDefault();
+            if (!currentUser || !db) return;
+
+            const val = (id) => {
+                const el = document.getElementById(id);
+                return el ? el.value.trim() : '';
+            };
+            const shopName = val('set-shop-name') || storeSettings.shopName || 'Taham';
+            const pageName = val('page-name') || storeSettings.pageName || shopName;
+            const themeSelector = document.getElementById('theme-selector');
+            const updatedSettings = {
+                ...storeSettings,
+                shopName,
+                pageName,
+                theme: (themeSelector && themeSelector.dataset.selected) || storeSettings.theme || 'classic-pink',
+                shopPhone: val('set-shop-phone') || storeSettings.shopPhone,
+                paymentNumber: val('set-payment-number') || storeSettings.paymentNumber,
+                shopAddress: val('set-shop-address') || storeSettings.shopAddress,
+                showStockToCustomers: document.getElementById('set-show-stock') ? document.getElementById('set-show-stock').checked : storeSettings.showStockToCustomers !== false,
+                adminUser: val('set-admin-user') || storeSettings.adminUser || '',
+                adminPass: val('set-admin-pass')
+            };
+
+            const settingsDoc = doc(db, 'artifacts', appId, 'public', 'data', 'settings', 'store_config');
+            try {
+                await setDoc(settingsDoc, updatedSettings);
+                storeSettings = { ...storeSettings, ...updatedSettings };
+                delete storeSettings.adminPass;
+                applyStoreSettingsToUI();
+                showToast('Settings updated successfully!');
+            } catch (err) {
+                showToast(err.message || 'Could not save the settings.', 'error');
+            }
+        };
+
+        window.uploadSiteLogo = async function() {
+            const input = document.getElementById('logo-upload');
+            if (!input || !input.files || !input.files.length) {
+                showToast('Please choose an image file.', 'error');
+                return;
+            }
+            const file = input.files[0];
+            if (!file.type.startsWith('image/')) {
+                showToast('Please choose an image file.', 'error');
+                return;
+            }
+            try {
+                const dataUrl = await new Promise((resolve, reject) => {
+                    const reader = new FileReader();
+                    reader.onload = () => resolve(reader.result);
+                    reader.onerror = () => reject(new Error('Could not read the image.'));
+                    reader.readAsDataURL(file);
+                });
+                await api('POST', '/api/logo', { dataUrl });
+                const cacheBust = Date.now();
+                ['site-logo', 'settings-logo-preview'].forEach(id => {
+                    const img = document.getElementById(id);
+                    if (img) img.src = `/logo.png?v=${cacheBust}`;
+                });
+                showToast('Logo uploaded successfully!');
+            } catch (err) {
+                showToast(err.message || 'Could not upload logo.', 'error');
+            }
+        };
+
+        // Start App
+        window.addEventListener('DOMContentLoaded', () => {
+            lucide.createIcons();
+            renderCategoryFilters();
+            renderColorEditor();
+            renderGallery();
+            let saved = 'en';
+            try { saved = localStorage.getItem('taham_lang') || 'en'; } catch (e) { /* ignore */ }
+            initApp();
+            window.setLanguage(saved);
+        });
+    </script>
+</body>
+</html>"""
+
+
+if __name__ == "__main__":
+    port = PORT
+    for candidate in range(PORT, PORT + 20):          # if 5000 is busy, try the next ports
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            if probe.connect_ex(("127.0.0.1", candidate)) != 0:
+                port = candidate
+                break
+    url = f"http://localhost:{port}"
+    print(f"\n  Taham Store is running ->  {url}   (press Ctrl+C to stop)\n")
+    if os.environ.get("NO_BROWSER") != "1":
+        threading.Timer(1.2, lambda: webbrowser.open(url)).start()
+    app.run(host=HOST, port=port, debug=False, threaded=True)
+"""
+Taham Store  -  Flask + SQLite  (single file: backend + whole website)
+----------------------------------------------------------------------
+Run:      python app.py          ->  http://localhost:5000   (browser opens automatically)
+Admin:    "Super Admin" button   (default login: see DEFAULT_ADMIN_* below, change it in Admin > Settings)
+
+Everything is inside this ONE file:
+  * the server / database / business logic (prices, stock, order status, login)
+  * the full web page (INDEX_HTML at the bottom of this file)
+
+Data is saved in taham.db (next to this file). Delete taham.db to start from scratch.
+Optional env vars:  PORT=8000   HOST=0.0.0.0 (open to your Wi-Fi)   NO_BROWSER=1   TAHAM_DB=path/to/file.db
+"""
+import json
+import os
+import socket
+import subprocess
+import sys
+import random
+import secrets
+import sqlite3
+import threading
+import time
+import webbrowser
+from datetime import datetime, timedelta
+from functools import wraps
+
+import base64
+import re
+from functools import lru_cache
+from urllib.parse import quote
+from xml.sax.saxutils import escape as xml_escape
+
+try:
+    from flask import Flask, Response, g, jsonify, request, session
+except ImportError:                                   # first run: install Flask automatically
+    print("Flask paoa jayni, install kora hocche... (pip install Flask)")
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "Flask>=3.0"])
+    from flask import Flask, Response, g, jsonify, request, session
+from werkzeug.security import check_password_hash, generate_password_hash
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DEFAULT_DB_PATH = os.path.join("/tmp" if os.environ.get("VERCEL") else BASE_DIR, "taham.db")
+DB_PATH = os.environ.get("TAHAM_DB", DEFAULT_DB_PATH)
+SECRET_PATH = os.path.join(os.path.dirname(DB_PATH), "secret.key")
+if os.path.dirname(DB_PATH):
+    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+HOST = os.environ.get("HOST", "0.0.0.0")   # allow access from other PCs on the same LAN/Wi-Fi
+PORT = int(os.environ.get("PORT", "5000"))
+
+# ======================= EASY SETTINGS (edit here) =======================
+DEFAULT_ADMIN_USER = os.environ.get("TAHAM_ADMIN_USER", "taham@1234")      # used only the FIRST time (when taham.db is created)
+DEFAULT_ADMIN_PASS = os.environ.get("TAHAM_ADMIN_PASS", "taham@1234")      # change it later from Admin > Settings
+DEFAULT_SETTINGS = {
+    "shopName": "Taham",
+    "pageName": "Taham",
+    "theme": "classic-pink",
+    "shopPhone": "01400-570014",
+    "paymentNumber": "01400-570014",
+    "shopAddress": "Rayerbag, Dhaka, Bangladesh.",
+    "showStockToCustomers": True,
+    "invoicePadUrl": "/official-pad-background.jpg",
+    "invoicePadFilename": "official_pad_background.jpg",
+    "invoiceMarginTop": "58",
+    "invoiceMarginBottom": "48",
+    "invoiceMarginLeft": "18",
+    "invoiceMarginRight": "18",
+    "invoiceMarginUnit": "mm",
+}
+DELIVERY_OPTIONS = (60, 120)           # Dhaka / outside Dhaka (must match the radio buttons)
+PAYMENT_METHODS = ("Cash on Delivery", "bKash", "Nagad")
+ORDER_STATUSES = ("Pending", "Processing", "Delivered", "Cancelled")
+SIZES = ("S", "M", "L", "XL")
+DEFAULT_PRODUCTS = [{'name': 'Premium Embroidered Cotton Panjabi',
+  'category': 'Panjabi',
+  'buyingPrice': 950,
+  'price': 1550,
+  'stock': 25,
+  'image': '/placeholder.svg?w=600&h=700&bg=1e293b&text=Premium+Cotton+Panjabi',
+  'desc': '100% pure cotton Panjabi with fine hand-embroidered detailing.'},
+ {'name': 'Traditional Dhakai Jamdani Saree',
+  'category': 'Saree',
+  'buyingPrice': 2100,
+  'price': 3200,
+  'stock': 12,
+  'image': '/placeholder.svg?w=600&h=700&bg=9d174d&text=Dhakai+Jamdani+Saree',
+  'desc': 'An elegant Dhakai Jamdani saree for festivals and parties (blouse piece included).'},
+ {'name': 'Luxury Boutique Lawn Three-Piece',
+  'category': 'Salwar Kameez',
+  'buyingPrice': 1150,
+  'price': 1850,
+  'stock': 18,
+  'image': '/placeholder.svg?w=600&h=700&bg=0f766e&text=Boutique+Three+Piece',
+  'desc': 'Comfortable soft cotton orna with a designer salwar kameez set.'},
+ {'name': 'Men’s Casual Polo T-Shirt',
+  'category': 'T-Shirt',
+  'buyingPrice': 380,
+  'price': 650,
+  'stock': 40,
+  'image': '/placeholder.svg?w=600&h=700&bg=1d4ed8&text=Mens+Polo+T-Shirt',
+  'desc': 'Stylish polo T-shirt with colour guarantee, for everyday wear.'},
+ {'name': 'Kids’ Festive Panjabi Set',
+  'category': 'Kids',
+  'buyingPrice': 550,
+  'price': 950,
+  'stock': 4,
+  'image': '/placeholder.svg?w=600&h=700&bg=b45309&text=Kids+Festive+Set',
+  'desc': 'Soft cotton Panjabi and pajama set for little ones.'}]
+# =========================================================================
+
+# Windows consoles can choke on Bengali text; make printing safe
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
+app = Flask(__name__, static_folder=None)
+
+
+def _load_secret():
+    configured_secret = (os.environ.get("SESSION_SECRET") or "").strip()
+    if configured_secret:
+        if len(configured_secret) < 32:
+            raise RuntimeError("SESSION_SECRET must be at least 32 characters long.")
+        return configured_secret
+    if os.environ.get("VERCEL") or os.environ.get("VERCEL_ENV"):
+        raise RuntimeError("SESSION_SECRET must be configured for Vercel deployments.")
+    if not os.path.exists(SECRET_PATH):
+        with open(SECRET_PATH, "w") as f:
+            f.write(secrets.token_hex(32))
+    with open(SECRET_PATH) as f:
+        return f.read().strip()
+
+
+app.secret_key = _load_secret()
+app.config.update(
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SECURE=(
+        bool(os.environ.get("VERCEL") or os.environ.get("VERCEL_ENV"))
+        or os.environ.get("SESSION_COOKIE_SECURE", "").strip().lower() in ("1", "true", "yes", "on")
+    ),
+    SESSION_COOKIE_PATH="/",
+    SESSION_COOKIE_SAMESITE=os.environ.get("SESSION_COOKIE_SAMESITE", "Lax"),
+    SESSION_COOKIE_NAME="taham_session",
+    PERMANENT_SESSION_LIFETIME=timedelta(hours=12),
+    SESSION_REFRESH_EACH_REQUEST=True,
+    MAX_CONTENT_LENGTH=24 * 1024 * 1024,
+)
+
+# ----------------------------- database ---------------------------------
+
+
+def get_db():
+    if "db" not in g:
+        g.db = sqlite3.connect(DB_PATH, timeout=10, isolation_level=None)  # autocommit; BEGIN used where needed
+        g.db.row_factory = sqlite3.Row
+    return g.db
+
+
+@app.teardown_appcontext
+def close_db(_exc):
+    db = g.pop("db", None)
+    if db is not None:
+        db.close()
+
+
+def now_ms():
+    return int(time.time() * 1000)
+
+
+def init_db():
+    db = sqlite3.connect(DB_PATH, isolation_level=None)
+    db.execute("CREATE TABLE IF NOT EXISTS docs (col TEXT NOT NULL, id TEXT NOT NULL, data TEXT NOT NULL, "
+               "created INTEGER NOT NULL, PRIMARY KEY (col, id))")
+    db.execute("CREATE TABLE IF NOT EXISTS admin (id INTEGER PRIMARY KEY CHECK (id = 1), "
+               "username TEXT NOT NULL, pw_hash TEXT NOT NULL)")
+    if not db.execute("SELECT 1 FROM admin").fetchone():
+        db.execute("INSERT INTO admin VALUES (1, ?, ?)", (DEFAULT_ADMIN_USER, generate_password_hash(DEFAULT_ADMIN_PASS)))
+    if not db.execute("SELECT 1 FROM docs WHERE col='settings'").fetchone():
+        db.execute("INSERT INTO docs VALUES ('settings', 'store_config', ?, ?)",
+                   (json.dumps(DEFAULT_SETTINGS, ensure_ascii=False), now_ms()))
+    if not db.execute("SELECT 1 FROM docs WHERE col='products'").fetchone():
+        base = now_ms()
+        for i, p in enumerate(DEFAULT_PRODUCTS):
+            kind, val = DEFAULT_DISCOUNTS.get(i, ("none", 0))
+            p = dict(p, createdAt=base + i, discountType=kind, discountValue=val)
+            db.execute("INSERT INTO docs VALUES ('products', ?, ?, ?)",
+                       (secrets.token_hex(8), json.dumps(p, ensure_ascii=False), base + i))
+    if not db.execute("SELECT 1 FROM docs WHERE col='collections'").fetchone():
+        base = now_ms()
+        for i, c in enumerate(DEFAULT_COLLECTIONS):
+            c = dict(c, createdAt=base + i)
+            db.execute("INSERT INTO docs VALUES ('collections', ?, ?, ?)",
+                       (secrets.token_hex(8), json.dumps(c, ensure_ascii=False), base + i))
+    known = {json.loads(r[0]).get("name") for r in db.execute("SELECT data FROM docs WHERE col='collections'")}
+    for (data,) in db.execute("SELECT data FROM docs WHERE col='products'").fetchall():
+        cat = (json.loads(data).get("category") or "").strip()      # keep older products visible
+        if cat and cat not in known:
+            c = {"name": cat, "image": f"/placeholder.svg?w=600&h=750&text={quote(cat)}", "createdAt": now_ms()}
+            db.execute("INSERT INTO docs VALUES ('collections', ?, ?, ?)",
+                       (secrets.token_hex(8), json.dumps(c, ensure_ascii=False), now_ms()))
+            known.add(cat)
+    row = db.execute("SELECT pw_hash FROM admin WHERE id=1").fetchone()
+    if check_password_hash(row[0], DEFAULT_ADMIN_PASS):
+        print("!! WARNING: the admin password is still the default. Change it in Admin > Settings.")
+    db.close()
+
+
+def _row_to_doc(row):
+    d = json.loads(row["data"])
+    d["id"] = row["id"]
+    return d
+
+
+def get_doc(db, col, doc_id):
+    row = db.execute("SELECT * FROM docs WHERE col=? AND id=?", (col, doc_id)).fetchone()
+    return _row_to_doc(row) if row else None
+
+
+def list_docs(db, col):
+    rows = db.execute("SELECT * FROM docs WHERE col=? ORDER BY created DESC", (col,)).fetchall()
+    return [_row_to_doc(r) for r in rows]
+
+
+def save_doc(db, col, doc_id, data):
+    data = {k: v for k, v in data.items() if k != "id"}
+    db.execute("INSERT INTO docs (col, id, data, created) VALUES (?, ?, ?, ?) "
+               "ON CONFLICT(col, id) DO UPDATE SET data=excluded.data",
+               (col, doc_id, json.dumps(data, ensure_ascii=False), data.get("createdAt") or now_ms()))
+    return dict(data, id=doc_id)
+
+
+# ------------------------------ helpers ---------------------------------
+
+
+def err(message, code=400):
+    return jsonify(error=message), code
+
+
+def body():
+    d = request.get_json(silent=True)
+    return d if isinstance(d, dict) else {}
+
+
+def is_admin():
+    return session.get("admin") is True
+
+
+def is_super_admin():
+    return session.get("admin") is True
+
+
+def admin_required(fn):
+    @wraps(fn)
+    def wrapper(*args, **kwargs):
+        if not is_admin():
+            return err("Admin login required", 401)
+        return fn(*args, **kwargs)
+    return wrapper
+
+
+def super_admin_required(fn):
+    @wraps(fn)
+    def wrapper(*args, **kwargs):
+        if not is_super_admin():
+            return err("Only the Super Admin can perform this action.", 403)
+        return fn(*args, **kwargs)
+    return wrapper
+
+
+def to_int(value, label):
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"{label} is not a valid number")
+    if n < 0:
+        raise ValueError(f"{label} cannot be negative")
+    return n
+
+
+# ------------------------------ pages -----------------------------------
+
+
+@app.get("/")
+def index():
+    resp = Response(INDEX_HTML, mimetype="text/html")
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+
+@app.get("/placeholder.svg")
+def placeholder():
+    """Local replacement for placehold.co, so product images still look fine offline."""
+    def num(key, default):
+        try:
+            return max(20, min(int(request.args.get(key, default)), 1200))
+        except ValueError:
+            return default
+    w, h = num("w", 600), num("h", 700)
+    text = xml_escape(request.args.get("text", "Taham").replace("+", " ")[:40])
+    bg = request.args.get("bg", "be185d")
+    if not (len(bg) in (3, 6) and all(c in "0123456789abcdefABCDEF" for c in bg)):
+        bg = "be185d"
+    svg = (f'<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}" viewBox="0 0 {w} {h}">'
+           f'<rect width="100%" height="100%" fill="#{bg}"/>'
+           f'<text x="50%" y="50%" fill="#ffffff" font-family="Arial, sans-serif" font-size="{max(12, w // 14)}" '
+           f'text-anchor="middle" dominant-baseline="middle">{text}</text></svg>')
+    resp = Response(svg, mimetype="image/svg+xml")
+    resp.headers["Cache-Control"] = "public, max-age=86400"
+    return resp
+
+
+@lru_cache(maxsize=1)
+def _logo_bytes():
+    return base64.b64decode(LOGO_PNG_B64)
+
+
+@app.get("/logo.png")
+@app.get("/favicon.ico")
+def logo():
+    db = get_db()
+    logo_doc = get_doc(db, "settings", "logo")
+    if logo_doc and logo_doc.get("data"):
+        try:
+            image_bytes = base64.b64decode(logo_doc["data"])
+        except Exception:
+            image_bytes = _logo_bytes()
+        resp = Response(image_bytes, mimetype=logo_doc.get("mimetype") or "image/png")
+        resp.headers["Cache-Control"] = "no-store"
+        return resp
+
+    resp = Response(_logo_bytes(), mimetype="image/png")
+    resp.headers["Cache-Control"] = "public, max-age=86400"
+    return resp
+
+
+@lru_cache(maxsize=1)
+def _hero_bytes():
+    return base64.b64decode(HERO_JPG_B64)
+
+
+@app.get("/hero.jpg")
+def hero():
+    resp = Response(_hero_bytes(), mimetype="image/jpeg")
+    resp.headers["Cache-Control"] = "public, max-age=86400"
+    return resp
+
+
+@app.get("/official-pad-background.jpg")
+def official_pad_background():
+    path = os.path.join(BASE_DIR, "official_pad_background.jpg")
+    with open(path, "rb") as f:
+        image_bytes = f.read()
+    resp = Response(image_bytes, mimetype="image/jpeg")
+    resp.headers["Cache-Control"] = "public, max-age=86400"
+    return resp
+
+
+@app.after_request
+def no_cache_api(resp):
+    if request.path.startswith("/api/"):
+        resp.headers["Cache-Control"] = "no-store"
+    resp.headers.setdefault("X-Content-Type-Options", "nosniff")
+    return resp
+
+
+# ------------------------------- auth -----------------------------------
+SUPER_ADMIN_ROLE = "Super Admin"
+USER_ROLES = ("Admin", "Manager", "Salesman", "Marketing")
+PERMISSION_DEFS = (
+    {"key": "viewOrders", "label": "View Orders"},
+    {"key": "editOrders", "label": "Edit Orders"},
+    {"key": "manageProducts", "label": "Manage Products & Stock"},
+    {"key": "addCollections", "label": "Add Collections"},
+    {"key": "deleteCollections", "label": "Delete Collections"},
+    {"key": "manageExpenses", "label": "Manage Daily Expenses"},
+    {"key": "viewProfit", "label": "View Profit/Revenue Stats"},
+    {"key": "accessSettings", "label": "Access Settings"},
+    {"key": "userManagement", "label": "User Management"},
+)
+PERMISSION_KEYS = tuple(p["key"] for p in PERMISSION_DEFS)
+DEFAULT_PERMISSIONS = {key: False for key in PERMISSION_KEYS}
+EMAIL_RE = re.compile(r"^[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}$")
+STRONG_PASSWORD_RE = re.compile(r"^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[^A-Za-z0-9]).{10,}$")
+
+
+def sanitize_permissions(d):
+    src = d if isinstance(d, dict) else {}
+    return {key: bool(src.get(key, False)) for key in PERMISSION_KEYS}
+
+
+def public_user(u):
+    return {
+        "id": u.get("id", ""),
+        "fullName": u.get("fullName", ""),
+        "role": u.get("role", "Marketing"),
+        "email": u.get("email", ""),
+        "permissions": sanitize_permissions(u.get("permissions")),
+        "isSuperAdmin": False,
+    }
+
+
+def super_admin_user():
+    db = get_db()
+    row = db.execute("SELECT username FROM admin WHERE id=1").fetchone()
+    username = row["username"] if row else "Super Admin"
+    return {
+        "id": "super-admin",
+        "fullName": username,
+        "role": SUPER_ADMIN_ROLE,
+        "email": "",
+        "permissions": {key: True for key in PERMISSION_KEYS},
+        "isSuperAdmin": True,
+    }
+
+_FAILS = {}
+
+
+@app.get("/api/me")
+def me():
+    admin = is_admin()
+    return jsonify(
+        admin=admin,
+        role=SUPER_ADMIN_ROLE if admin else None,
+        isSuperAdmin=admin,
+        permissions={key: admin for key in PERMISSION_KEYS},
+    )
+
+
+@app.post("/api/login")
+def login():
+    ip = request.remote_addr or "?"
+    now = time.time()
+    _FAILS[ip] = [t for t in _FAILS.get(ip, []) if now - t < 300]
+    if len(_FAILS[ip]) >= 5:
+        return err("Too many wrong attempts, please try again in 5 minutes.", 429)
+    d = body()
+    row = get_db().execute("SELECT * FROM admin WHERE id=1").fetchone()
+    ok = (row is not None and str(d.get("username", "")).strip() == row["username"]
+          and check_password_hash(row["pw_hash"], str(d.get("password", ""))))
+    if not ok:
+        _FAILS[ip].append(now)
+        time.sleep(0.5)
+        return err("Wrong username or password!", 401)
+    session.clear()
+    session["admin"] = True
+    session["role"] = SUPER_ADMIN_ROLE
+    session.permanent = True
+    return jsonify(ok=True)
+
+
+@app.post("/api/logout")
+def logout():
+    session.clear()
+    return jsonify(ok=True)
+
+
+@app.get("/api/users")
+@admin_required
+def users_list():
+    db = get_db()
+    users = [public_user(u) for u in list_docs(db, "users")]
+    users.sort(key=lambda u: (u.get("fullName") or u.get("email") or "").lower())
+    return jsonify(
+        users=users,
+        superAdmin=super_admin_user(),
+        roles=list(USER_ROLES),
+        permissionDefs=list(PERMISSION_DEFS),
+        isSuperAdmin=is_super_admin(),
+    )
+
+
+@app.post("/api/users")
+@admin_required
+def users_add():
+    d = body()
+    full_name = str(d.get("fullName", "")).strip()[:120]
+    role = str(d.get("role", "")).strip()
+    email = str(d.get("email", "")).strip().lower()[:200]
+    password = str(d.get("password", ""))
+
+    if not full_name:
+        return err("Full name is required.")
+    if role not in USER_ROLES or role == SUPER_ADMIN_ROLE:
+        return err("Invalid role. Super Admin is reserved for the primary owner account.")
+    if not EMAIL_RE.fullmatch(email):
+        return err("Please enter a strict valid email address.")
+    if not STRONG_PASSWORD_RE.fullmatch(password):
+        return err("Password must be at least 10 characters and include uppercase, lowercase, number, and special character.")
+
+    db = get_db()
+    if any(str(u.get("email", "")).lower() == email for u in list_docs(db, "users")):
+        return err("A user with this email already exists.", 409)
+
+    user = {
+        "id": secrets.token_hex(8),
+        "fullName": full_name,
+        "role": role,
+        "email": email,
+        "pw_hash": generate_password_hash(password),
+        "permissions": sanitize_permissions(d.get("permissions")),
+        "createdAt": now_ms(),
+    }
+    saved = save_doc(db, "users", user["id"], user)
+    return jsonify(public_user(saved)), 201
+
+
+@app.put("/api/users/<user_id>/permissions")
+@super_admin_required
+def user_permissions_update(user_id):
+    db = get_db()
+    user = get_doc(db, "users", user_id)
+    if not user:
+        return err("User not found.", 404)
+    user["permissions"] = sanitize_permissions(body().get("permissions"))
+    saved = save_doc(db, "users", user_id, user)
+    return jsonify(public_user(saved))
+
+
+@app.delete("/api/users/<user_id>")
+@super_admin_required
+def users_delete(user_id):
+    if user_id == "super-admin":
+        return err("Super Admin cannot be deleted.", 403)
+    db = get_db()
+    if not get_doc(db, "users", user_id):
+        return err("User not found.", 404)
+    db.execute("DELETE FROM docs WHERE col='users' AND id=?", (user_id,))
+    return jsonify(ok=True)
+
+
+# ----------------------------- products ---------------------------------
+DEFAULT_COLLECTIONS = [
+    {"name": "Panjabi", "image": "/placeholder.svg?w=600&h=750&bg=1e293b&text=Panjabi"},
+    {"name": "Saree", "image": "/placeholder.svg?w=600&h=750&bg=9d174d&text=Saree"},
+    {"name": "Salwar Kameez", "image": "/placeholder.svg?w=600&h=750&bg=0f766e&text=Salwar+Kameez"},
+    {"name": "T-Shirt", "image": "/placeholder.svg?w=600&h=750&bg=1d4ed8&text=T-Shirt"},
+    {"name": "Kids", "image": "/placeholder.svg?w=600&h=750&bg=b45309&text=Kids"},
+]
+DEFAULT_DISCOUNTS = {0: ("percent", 10), 4: ("amount", 100)}   # demo discounts for the first run
+
+
+HEX_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
+
+
+def clean_colors(raw):
+    """Colour options of a product: [{name, hex}] (max 30, no duplicates)."""
+    if not isinstance(raw, list):
+        raise ValueError("Colours must be a list.")
+    out, seen = [], set()
+    for c in raw[:30]:
+        if not isinstance(c, dict):
+            continue
+        name = str(c.get("name", "")).strip()[:30]
+        hexv = str(c.get("hex", "")).strip()
+        if not name or name.lower() in seen:
+            continue
+        seen.add(name.lower())
+        out.append({"name": name, "hex": hexv if HEX_RE.match(hexv) else "#9ca3af"})
+    return out
+
+
+def clean_images(raw):
+    """Photos of a product: [{src, color}] (max 8)."""
+    if not isinstance(raw, list):
+        raise ValueError("Photos must be a list.")
+    if len(raw) > 8:
+        raise ValueError("Too many photos (max 8).")
+    out = []
+    for im in raw:
+        if not isinstance(im, dict):
+            continue
+        src = str(im.get("src", "")).strip()
+        if not src:
+            continue
+        if len(src) > 3_000_000:
+            raise ValueError("Image is too large, please use a smaller one.")
+        out.append({"src": src, "color": str(im.get("color", "")).strip()[:30]})
+    return out
+
+
+def sale_price(p):
+    """Price the customer really pays (after the product discount)."""
+    price = int(p.get("price", 0))
+    kind = p.get("discountType", "none")
+    val = int(p.get("discountValue", 0) or 0)
+    if kind == "percent" and 0 < val <= 95:
+        return max(0, price - int(price * val / 100 + 0.5))
+    if kind == "amount" and 0 < val < price:
+        return price - val
+    return price
+
+
+def check_product(db, p):
+    names = {c.get("name") for c in list_docs(db, "collections")}
+    if p.get("category") not in names:
+        raise ValueError("Please choose a valid collection.")
+    names = {c["name"].lower(): c["name"] for c in p.get("colors") or []}
+    for im in p.get("images") or []:                  # a photo can only point to one of the product's colours
+        im["color"] = names.get(im.get("color", "").lower(), "")
+    kind, val = p.get("discountType", "none"), int(p.get("discountValue", 0) or 0)
+    if kind == "none" or val == 0:
+        p["discountType"], p["discountValue"] = "none", 0
+    elif kind == "percent" and not 1 <= val <= 95:
+        raise ValueError("Percentage discount must be between 1 and 95.")
+    elif kind == "amount" and val >= int(p.get("price", 0)):
+        raise ValueError("Discount amount must be less than the selling price.")
+
+
+PRODUCT_TEXT = ("name", "category", "image", "desc")
+PRODUCT_NUM = {"stock": "Stock", "buyingPrice": "Buying price", "price": "Selling price"}
+
+
+def clean_product(d):
+    out = {}
+    for key in PRODUCT_TEXT:
+        if key in d:
+            val = str(d[key]).strip()
+            if key == "image" and len(val) > 3_000_000:
+                raise ValueError("Image is too large, please use a smaller one.")
+            out[key] = val[:2000] if key != "image" else val
+    for key, label in PRODUCT_NUM.items():
+        if key in d:
+            out[key] = to_int(d[key], label)
+    if "discountType" in d:
+        kind = str(d["discountType"]).strip()
+        if kind not in ("none", "percent", "amount"):
+            raise ValueError("Discount type is not valid.")
+        out["discountType"] = kind
+    if "discountValue" in d:
+        out["discountValue"] = to_int(d["discountValue"] or 0, "Discount value")
+    if "colors" in d:
+        out["colors"] = clean_colors(d["colors"])
+    if "images" in d:
+        out["images"] = clean_images(d["images"])
+        if out["images"]:
+            out["image"] = out["images"][0]["src"]      # main photo = first photo
+    return out
+
+
+@app.get("/api/products")
+def products_list():
+    items = list_docs(get_db(), "products")
+    if not is_admin():                      # customers must not see your buying price
+        for p in items:
+            p.pop("buyingPrice", None)
+    for p in items:
+        p["salePrice"] = sale_price(p)
+    return jsonify(items)
+
+
+@app.post("/api/products")
+@admin_required
+def products_add():
+    try:
+        data = clean_product(body())
+    except ValueError as e:
+        return err(str(e))
+    if not data.get("name") or "price" not in data:
+        return err("Enter the product name and price.")
+    data = {"category": "", "stock": 0, "buyingPrice": 0, "image": "", "desc": "",
+            "discountType": "none", "discountValue": 0, "colors": [], "images": [], **data, "createdAt": now_ms()}
+    db = get_db()
+    try:
+        check_product(db, data)
+    except ValueError as e:
+        return err(str(e))
+    saved = save_doc(db, "products", secrets.token_hex(8), data)
+    saved["salePrice"] = sale_price(saved)
+    return jsonify(saved), 201
+
+
+@app.patch("/api/products/<pid>")
+@admin_required
+def products_update(pid):
+    db = get_db()
+    cur = get_doc(db, "products", pid)
+    if not cur:
+        return err("Product not found", 404)
+    try:
+        cur.update(clean_product(body()))
+        check_product(db, cur)
+    except ValueError as e:
+        return err(str(e))
+    saved = save_doc(db, "products", pid, cur)
+    saved["salePrice"] = sale_price(saved)
+    return jsonify(saved)
+
+
+# ----------------------------- collections ------------------------------
+
+
+def clean_collection(d):
+    out = {}
+    if "name" in d:
+        name = str(d["name"]).strip()[:40]
+        if not name:
+            raise ValueError("Collection name is required.")
+        out["name"] = name
+    if "image" in d:
+        img = str(d["image"]).strip()
+        if len(img) > 3_000_000:
+            raise ValueError("Image is too large, please use a smaller one.")
+        out["image"] = img
+    if "productIds" in d:
+        ids = d.get("productIds") or []
+        if not isinstance(ids, list):
+            raise ValueError("Assigned products must be a list.")
+        out["productIds"] = [str(x) for x in ids if str(x).strip()]
+    return out
+
+
+def _col_placeholder(name):
+    return f"/placeholder.svg?w=600&h=750&text={quote(name)}"
+
+
+@app.get("/api/collections")
+def collections_list():
+    items = list_docs(get_db(), "collections")
+    items.sort(key=lambda c: c.get("createdAt", 0))
+    return jsonify(items)
+
+
+@app.post("/api/collections")
+@admin_required
+def collections_add():
+    db = get_db()
+    try:
+        data = clean_collection(body())
+    except ValueError as e:
+        return err(str(e))
+    if "name" not in data:
+        return err("Collection name is required.")
+    if any(c.get("name", "").lower() == data["name"].lower() for c in list_docs(db, "collections")):
+        return err("A collection with this name already exists.", 409)
+    data = {"image": "", **data, "createdAt": now_ms()}
+    if not data["image"]:
+        data["image"] = _col_placeholder(data["name"])
+    return jsonify(save_doc(db, "collections", secrets.token_hex(8), data)), 201
+
+
+@app.patch("/api/collections/<cid>")
+@admin_required
+def collections_update(cid):
+    db = get_db()
+    try:
+        changes = clean_collection(body())
+    except ValueError as e:
+        return err(str(e))
+    db.execute("BEGIN IMMEDIATE")
+    try:
+        cur = get_doc(db, "collections", cid)
+        if not cur:
+            db.execute("ROLLBACK")
+            return err("Collection not found.", 404)
+        old, new = cur["name"], changes.get("name", cur["name"])
+        if any(c["name"].lower() == new.lower() for c in list_docs(db, "collections") if c["id"] != cid):
+            db.execute("ROLLBACK")
+            return err("A collection with this name already exists.", 409)
+        cur.update(changes)
+        if not cur.get("image"):
+            cur["image"] = _col_placeholder(new)
+        if new != old:                                   # rename -> move its products along
+            for p in list_docs(db, "products"):
+                if p.get("category") == old:
+                    p["category"] = new
+                    save_doc(db, "products", p["id"], p)
+        saved = save_doc(db, "collections", cid, cur)
+        db.execute("COMMIT")
+    except Exception:
+        db.execute("ROLLBACK")
+        raise
+    return jsonify(saved)
+
+
+# ------------------------------ orders ----------------------------------
+
+
+@app.get("/api/orders")
+@admin_required
+def orders_list():
+    return jsonify(list_docs(get_db(), "orders"))
+
+
+@app.post("/api/orders")
+def order_create():
+    """Customer checkout. Prices, totals and stock are all decided HERE, never trusted from the browser."""
+    d = body()
+    name = str(d.get("customerName", "")).strip()[:100]
+    phone = str(d.get("customerPhone", "")).strip()[:30]
+    address = str(d.get("customerAddress", "")).strip()[:300]
+    if not (name and phone and address):
+        return err("Please enter name, phone number and address.")
+    method = d.get("paymentMethod")
+    if method not in PAYMENT_METHODS:
+        return err("Invalid payment method.")
+    delivery = d.get("deliveryCharge")
+    delivery = delivery if delivery in DELIVERY_OPTIONS else DELIVERY_OPTIONS[0]
+
+    want = {}                                           # (productId, size) -> qty
+    for it in d.get("items") or []:
+        try:
+            pid, qty = str(it["productId"]), int(it["qty"])
+        except (KeyError, TypeError, ValueError):
+            return err("Invalid cart data.")
+        size = it.get("size") if it.get("size") in SIZES else "L"
+        if not 1 <= qty <= 100:
+            return err("Invalid quantity.")
+        color = str(it.get("color") or "").strip()[:30]
+        key = (pid, size, color)
+        want[key] = want.get(key, 0) + qty
+    if not want:
+        return err("Your cart is empty.")
+
+    db = get_db()
+    db.execute("BEGIN IMMEDIATE")
+    try:
+        need = {}
+        for (pid, _size, _color), q in want.items():
+            need[pid] = need.get(pid, 0) + q
+        prods = {}
+        for pid, q in need.items():
+            p = get_doc(db, "products", pid)
+            if not p:
+                raise ValueError("A product is no longer available.")
+            if int(p.get("stock", 0)) < q:
+                raise ValueError(f"Sorry! \"{p['name']}\" has only {p.get('stock', 0)} in stock.")
+            prods[pid] = p
+        items, subtotal, cost = [], 0, 0
+        for (pid, size, color), q in want.items():
+            p = prods[pid]
+            unit = sale_price(p)
+            options = {c["name"].lower(): c for c in p.get("colors") or []}
+            chosen = None
+            if options:                                    # product has colours -> customer must pick one
+                if not color:
+                    raise ValueError("Please choose a colour.")
+                chosen = options.get(color.lower())
+                if chosen is None:
+                    raise ValueError("This colour is not available.")
+            items.append({"productId": pid, "name": p["name"], "size": size, "qty": q,
+                          "color": chosen["name"] if chosen else "", "colorHex": chosen["hex"] if chosen else "",
+                          "price": unit, "originalPrice": int(p["price"]),
+                          "buyingPrice": p.get("buyingPrice", 0)})
+            subtotal += unit * q
+            cost += p.get("buyingPrice", 0) * q
+        for pid, q in need.items():
+            prods[pid]["stock"] = int(prods[pid]["stock"]) - q
+            save_doc(db, "products", pid, prods[pid])
+        order = {
+            "orderNumber": "ORD-" + str(random.randint(100000, 999999)),
+            "customerName": name, "customerPhone": phone, "customerAddress": address,
+            "paymentMethod": method, "trxId": str(d.get("trxId", "")).strip()[:40],
+            "customDesignNotes": str(d.get("customDesignNotes", "")).strip()[:2000],
+            "referenceImage": str(d.get("referenceImage") or d.get("customDesignReferenceImage") or "").strip()[:8000000],
+            "items": items, "subtotal": subtotal, "deliveryCharge": delivery,
+            "total": subtotal + delivery, "totalCost": cost,
+            "status": "Pending", "stockDeducted": True,
+            "dateStr": datetime.now().strftime("%d/%m/%Y, %I:%M %p"), "createdAt": now_ms(),
+        }
+        saved = save_doc(db, "orders", secrets.token_hex(8), order)
+        db.execute("COMMIT")
+    except ValueError as e:
+        db.execute("ROLLBACK")
+        return err(str(e), 409)
+    except Exception:
+        db.execute("ROLLBACK")
+        raise
+    public = {k: v for k, v in saved.items() if k not in ("totalCost", "stockDeducted")}
+    public["items"] = [{k: v for k, v in it.items() if k != "buyingPrice"} for it in saved["items"]]
+    return jsonify(public), 201
+
+
+@app.patch("/api/orders/<oid>")
+@admin_required
+def order_status(oid):
+    status = body().get("status")
+    if status not in ORDER_STATUSES:
+        return err("Invalid status.")
+    db = get_db()
+    db.execute("BEGIN IMMEDIATE")
+    try:
+        order = get_doc(db, "orders", oid)
+        if not order:
+            db.execute("ROLLBACK")
+            return err("Order not found", 404)
+        if status == "Cancelled" and order.get("stockDeducted"):            # cancelled -> put stock back
+            _shift_stock(db, order, +1)
+            order["stockDeducted"] = False
+        elif order["status"] == "Cancelled" and status != "Cancelled" and not order.get("stockDeducted"):
+            _shift_stock(db, order, -1)                                      # restored -> take stock again
+            order["stockDeducted"] = True
+        order["status"] = status
+        saved = save_doc(db, "orders", oid, order)
+        db.execute("COMMIT")
+    except Exception:
+        db.execute("ROLLBACK")
+        raise
+    return jsonify(saved)
+
+
+def _shift_stock(db, order, sign):
+    for it in order.get("items", []):
+        p = get_doc(db, "products", it["productId"])
+        if p:
+            p["stock"] = max(0, int(p.get("stock", 0)) + sign * int(it["qty"]))
+            save_doc(db, "products", p["id"], p)
+
+
+# ------------------------------ expenses --------------------------------
+
+
+@app.get("/api/expenses")
+@admin_required
+def expenses_list():
+    return jsonify(list_docs(get_db(), "expenses"))
+
+
+@app.post("/api/expenses")
+@admin_required
+def expenses_add():
+    d = body()
+    title = str(d.get("title", "")).strip()[:120]
+    if not title:
+        return err("Enter the expense description.")
+    try:
+        amount = to_int(d.get("amount"), "Expense amount")
+    except ValueError as e:
+        return err(str(e))
+    data = {"title": title, "category": str(d.get("category", "")).strip()[:40], "amount": amount,
+            "dateStr": datetime.now().strftime("%d/%m/%Y"), "createdAt": now_ms()}
+    return jsonify(save_doc(get_db(), "expenses", secrets.token_hex(8), data)), 201
+
+
+# ------------------------------ settings --------------------------------
+
+
+@app.get("/api/settings")
+def settings_get():
+    db = get_db()
+    s = get_doc(db, "settings", "store_config") or dict(DEFAULT_SETTINGS, id="store_config")
+    if is_admin():
+        s["adminUser"] = db.execute("SELECT username FROM admin WHERE id=1").fetchone()["username"]
+    return jsonify([s])
+
+
+@app.put("/api/settings/store_config")
+@admin_required
+def settings_put():
+    d = body()
+    db = get_db()
+    s = dict(get_doc(db, "settings", "store_config") or DEFAULT_SETTINGS)
+
+    required_keys = ("shopName", "shopPhone", "paymentNumber", "shopAddress", "pageName", "theme")
+    for key in DEFAULT_SETTINGS:
+        if key in d:
+            if key == "showStockToCustomers":
+                raw = d.get(key)
+                s[key] = raw is True or str(raw).strip().lower() in ("true", "1", "on", "yes")
+                continue
+            val = str(d.get(key, "")).strip()[:200]
+            if key in required_keys and not val:
+                return err("Please fill in all the shop details.")
+            s[key] = val
+        elif key not in s:
+            default = DEFAULT_SETTINGS.get(key, "")
+            s[key] = default if isinstance(default, bool) else str(default).strip()
+
+    if not str(s.get("pageName", "")).strip():
+        s["pageName"] = str(s.get("shopName", "Taham")).strip() or "Taham"
+    if not str(s.get("theme", "")).strip():
+        s["theme"] = "classic-pink"
+
+    s.pop("id", None)
+    s.pop("adminUser", None)
+    s.pop("adminPass", None)
+
+    user, pw = str(d.get("adminUser", "")).strip()[:60], str(d.get("adminPass", ""))
+    if pw and not STRONG_PASSWORD_RE.fullmatch(pw):
+        return err("Password must be at least 10 characters and include uppercase, lowercase, number, and special character.")
+
+    save_doc(db, "settings", "store_config", s)
+    if user:
+        db.execute("UPDATE admin SET username=? WHERE id=1", (user,))
+    if pw:
+        db.execute("UPDATE admin SET pw_hash=? WHERE id=1", (generate_password_hash(pw),))
+    return jsonify(ok=True)
+
+
+@app.post("/api/logo")
+@admin_required
+def logo_upload():
+    data_url = str(body().get("dataUrl", "")).strip()
+    if not data_url.startswith("data:image/") or "," not in data_url:
+        return err("Please choose an image file.")
+
+    header, encoded = data_url.split(",", 1)
+    mimetype = header[5:].split(";")[0].lower() or "image/png"
+    if not mimetype.startswith("image/"):
+        return err("Please choose an image file.")
+
+    try:
+        image_bytes = base64.b64decode(encoded)
+    except Exception:
+        return err("Could not read the image file.")
+
+    if not image_bytes:
+        return err("Could not read the image file.")
+    if len(image_bytes) > 8 * 1024 * 1024:
+        return err("Image must be smaller than 8 MB.")
+
+    db = get_db()
+    save_doc(db, "settings", "logo", {"mimetype": mimetype, "data": base64.b64encode(image_bytes).decode("ascii"), "updatedAt": now_ms()})
+    return jsonify(ok=True, logoUrl=f"/logo.png?v={now_ms()}")
+
+
+@app.post("/api/invoice-pad")
+@admin_required
+def invoice_pad_upload():
+    data_url = str(body().get("dataUrl", "")).strip()
+    if not data_url.startswith("data:image/") or "," not in data_url:
+        return err("Please choose an image file.")
+
+    header, encoded = data_url.split(",", 1)
+    mimetype = header[5:].split(";")[0].lower() or "image/png"
+    if not mimetype.startswith("image/"):
+        return err("Please choose an image file.")
+
+    try:
+        image_bytes = base64.b64decode(encoded)
+    except Exception:
+        return err("Could not read the image file.")
+
+    if not image_bytes:
+        return err("Could not read the image file.")
+    if len(image_bytes) > 8 * 1024 * 1024:
+        return err("Image must be smaller than 8 MB.")
+
+    db = get_db()
+    save_doc(db, "settings", "invoice_pad", {"mimetype": mimetype, "data": base64.b64encode(image_bytes).decode("ascii"), "updatedAt": now_ms()})
+
+    s = dict(get_doc(db, "settings", "store_config") or DEFAULT_SETTINGS)
+    pad_url = f"/invoice-pad-background.jpg?v={now_ms()}"
+    s["invoicePadUrl"] = pad_url
+    s["invoicePadFilename"] = str(body().get("filename", "invoice-pad.jpg"))[:200]
+    s.pop("id", None)
+    s.pop("adminUser", None)
+    s.pop("adminPass", None)
+    save_doc(db, "settings", "store_config", s)
+    return jsonify(ok=True, padUrl=pad_url, invoicePadUrl=pad_url)
+
+
+@app.get("/invoice-pad-background.jpg")
+def invoice_pad_background():
+    db = get_db()
+    doc = get_doc(db, "settings", "invoice_pad")
+    if doc and doc.get("data"):
+        return Response(base64.b64decode(doc["data"]), mimetype=doc.get("mimetype") or "image/jpeg")
+    with open(os.path.join(BASE_DIR, "official_pad_background.jpg"), "rb") as f:
+        return Response(f.read(), mimetype="image/jpeg")
+
+# ------------------------------- delete ---------------------------------
+
+
+@app.delete("/api/<col>/<doc_id>")
+@admin_required
+def doc_delete(col, doc_id):
+    if col not in ("products", "orders", "expenses", "collections"):
+        return err("Not found", 404)
+    db = get_db()
+    db.execute("BEGIN IMMEDIATE")
+    try:
+        if col == "orders":                      # Pending/Processing order deleted -> put its stock back
+            order = get_doc(db, "orders", doc_id)
+            if order and order.get("stockDeducted") and order.get("status") in ("Pending", "Processing"):
+                _shift_stock(db, order, +1)
+        if col == "collections":
+            c = get_doc(db, "collections", doc_id)
+            if c and any(p.get("category") == c.get("name") for p in list_docs(db, "products")):
+                db.execute("ROLLBACK")
+                return err("This collection still has products. Move or delete them first.", 409)
+        db.execute("DELETE FROM docs WHERE col=? AND id=?", (col, doc_id))
+        db.execute("COMMIT")
+    except Exception:
+        db.execute("ROLLBACK")
+        raise
+    return jsonify(ok=True)
+
+
+init_db()
+
+
+# Taham hero banner (JPEG, embedded)
+HERO_JPG_B64 = (
+    "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"
+    "6hh4+aXWyOee3gi1UbWHP1lmn3Wfx9tdGejKmDjaa6nyhuncnaSeXoEYJ5uuc/rm4Uxr3j5RcRnakrR7bdkXOMBsGKjIWH3J"
+    "ieQYC0tad7YYfXJEXT1yh3sHZygp7mIjBOjKU0sPv/XuilxpjYCCh+Jr3DiqruZP1U076B26p+WuFUN8kbRtJGcsdRfZvcX7"
+    "0n4P9oiL55enoTRq+0zhIxDfD+gefSM/VHNFO9HNf+AehCLbbpOL5I5/aDT0ZfPCTIieGg7S2viqw/TAdlRSYXKzqdXpCLE1"
+    "H9CM3ArlbDRUF0Qq1qv2lndETaeu9omxSv3OlOaMCJk+E0SwHdvXCh0LExOw9Tx9uxrSMztSlrDO0F2DRrgqocphKnjlULk6"
+    "S7cHhC1Wj31L1AaKzjPJc7hnDF5HLdXS+HnF4DQHVLS6hdzSp5tpbbqOHCh1T+Mbnl+AaCS1nLnrBemKgaZ3I3GuTNSbRsbm"
+    "Kpn8L6e6PLSuxuPXRNwNRpxIZLeWO3kdg0WX+9pRHWbQqVQphKTEk3aibhI+bzdqtdRXu+H4B/hGqlFq8ykCWA+mWmfzfLGM"
+    "zkLRpiZ/4imCn+jn/QMd3KXaEdeUuW/vpHHR/T9f43rfYffQswtpmMzawJLl4y5bunW1/OERyxZFRvx01CdfVE7stpCM4mqc"
+    "6f328llipTqrQhkxVeMRAnjRyb/sF+DLuKLkk1qhd3MqkmS8KdS1FXsdvin8BGHPj8xed7cqfzNpPUdCy1BFjJWLftXAIcuF"
+    "l55t/XPE3GNwx+iCeidyFX6ErtNXmU2mRGjCYJaOS2PfTn3in6picfxt8e/B8qaPIpNKhYJpr5o0RPfJcJtC90/lj6T2UVn2"
+    "cUcg/U9dpKmaOuuXneUWJDeUO2pJO4dRWx98mQxn7nN0hkkHObcnK/YFOkGj8ktXcJZuR0fvV/eOYvsxuX8ntjanl1Ebnu5I"
+    "a1JA6qqGQpxVbHijdFWkNK0ryZbc68t9btdfVL3L5Ye3lPlECk05k0zlLik6hlqKclWNitXrQnbDFXmLk1rvvw50Pmya5kiD"
+    "d3sE9mkTBv8AijmM4Zr/AOiav4Ig+b49a/WH21I9nZqkbuolrGa+sBhShJq6nc0ZxwsirVzcUM0cJGjqK6mt7/g90ain5w1k"
+    "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"
+    "+Ui1GUXRW4Ps+tMp9dlKrXyVFsnrB9HSBiQWX73f7hSE5o+zk+kLSqJHMpLMk8eWzBqq0cIXzJ3klCRIcuWG/DVibfgOEUX6"
+    "HzYJQVQMZ7KKCRPMmapVUDzF85dppnLwRuKKRLvdzLCIwPMzN08+WSrt5Tu0N1Vpl63lziNPJO450fCydrJnP8V8eaqLTgz3"
+    "Nu5bXXjgo+mg6Vyn8HGbfqj6W23bimyPdBVK3qSrqeWXnhEiomesXyrRRymXgKpd3j+/xsndGwrbcgWSWiUJS9GzqlP3sU5i"
+    "aKl7V2s2Khfhr6yZoGPl7t6Md/fHBlOE+isVDLJ7uW09GzJlMrlUsL2auCLXdRxxrsYjX2gzqW1R6Jluf4yZ+1m2ZUy5zrMX"
+    "BF8DYu+PdHYWPoe1g8spObU01o1cklmzhs7eoaXd7RVviYOvfvFu46nv5d8S+xrcmWUWATVeZULSCMqmLhLNzTBRZV04wo75"
+    "iFOqY1yEe7kyZe6IJwDdsLpy/dgbk186UwWic6c33K2qnyjfuiLbr3dGzW0imd07ZYhKJfGRUhJGLhKZslTnWUOZ0zvkV5ur"
+    "tfkD2NbZYFQu6IphCRV1JtLNG6ucNzkVOgs2UyZLyahckYZYcPcj3YDR2Ubk2y+xejp7S9N0ujGVT4kUZvpFY7s8wTyRLcVO"
+    "fm5Dx1d6Gt7IJweL7T5o0m8j9D9asXSLp0V/LoxRRVgc0LuY3vngOE17NXVm7OsrTZan2/JrXajlfkPGFz8yI+k9k24OsXsU"
+    "rolW01TC6c8bxjFkd6+WcptL3QkUjkhH243owG0nW41shn9KVDTb6l1FpNUM87JH6MJi52r/AHy4sD37xN4xtUuqIZ4FsOpj"
+    "sLtLtXkvf29gaWL1zy1qofzjjre4D3LNCw3OFP2voMn8a7cSmbI4mfHwd/OG/I8XiD17+5os57MalqfQJ9M1JI+xuZLZ8ttW"
+    "GGRLCuXrpNRMkLxdYSmy6zGm7HKIltIUox0bT8vv5q1O4OuYt48VDa6kYmjrHNwxER8nEpzL4eg8LS/P20XvZXhZtiwxL2c3"
+    "8l3h4ut7w6haLYfIred3tQFD1TGYNJc4s1ZrK6PcYC5TppK5N/WHqo/od9g/phdmHYR29j59o/PltH497LfzbLd4ebxfFHWV"
+    "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"
+    "o3Oez1IijNCYoYmdsdRe/wBEaP5p/rjQ1wc+g0f6V+YJ6szzd3hroYiDi9f+iJcvvDn1alXYS5JivHGzd0bX8MtzUj8MB1Fa"
+    "3DE7zOyp83t8hG6TGnJfx+21eMtzvJGGwr9/I3eJLVDoDOpyg3c3jnUyTWQQ5uNsvpE07GJVT8wzF+7kaHhInRVUNv8AkwGv"
+    "FFM9qarcT6mVzo2OXHvONZKrfXeN6rS1Ca+/xvjHXKZc0naHJF12j8ktwSX3DV2TEwi+/Df+YcyntlFNzxHHpedI593WS3EP"
+    "1O7ARSmG08s7rBod2xOTa4K6KkNVVI28cvvRKNmCarp5MEyYmrzQEkUErcUeTuh9gPQ06b7F7LavYIPyP2GnMZudDi6zZO/9"
+    "A9fjzruCaAaWf7ndig0d58lMH7yYY3iGUuJwN7ZSJlyj0UPNVa3nfyzOwh/LaVJwCgA40jKAYABEAcIHEMA4AtwQxgADAEAA"
+    "ABIA4ACIcUJwioBCAAACIYAACIA4QOAR5HF0KGH1A+TgHCBwCHAAAjMAYAcEjV1DU8lpOXZ3Opm1lLTiYztaCZb3gl9mPtQG"
+    "O2rymnFPadTqGWaF4mkM7Jg3vBMfuR9qI4pbZLWlUbo+y6RTZDO5Sduqc7JTkzcf9Qo5lO6eQl/7oSnpahmkpY5s7bsualcX"
+    "/VHUS1cjHLllw+lzu4aON8aYlzXP4Xsew3NTyVu7YNF5syQdzEl9kio4KVRyXxIc/wCAWnNbU8zz/HnsrQ0ecpHuI7IXNlDc"
+    "Qqu/qZe5lHkioatzi02wp30UqlnnqXAtYeqFm9uU6+6KvbI/i1RiWv42T+2uZU0fwxO4/wA2PXx6wkTdpLXempem0mJ8Fkvn"
+    "BMNybwSRy5Dx94X53UkppvAUm0yZSlNwrgpZ0tBPFU8EuXujxQzmS/YFQlNP/X9PVyVt+DPkUJ+ePSO6rpLssscnuH67lhyz"
+    "FLyOP5kTDLHVOkY57U4GGSkbE9rFXJVOkv59LZO7YNH8zatHb49xqgutBNRc3gkhHfjHf7g1vpl0mnUOguyWWaWv4OZZ2TEx"
+    "PA9/2uEee6eqf04LU5DOk/W9LUhnxvFfHSj+d9Qc0RoySqbj93VmjSdkul/sp37lYQGB1Y5ewmWf0M7KBvB7s8vqe5iVDKVJ"
+    "2pJk5k1PNiJYx5fjFzgpPCucOTfGJ2eU1o92/wCyGWZgxVzdw6zsmGgrHmHjlyQj7URwWzdypMN1tjr8urSDRY/Wi3bjli3/"
+    "AIe7X/8AO9D+tE6r8uv0OdharsOLp9T2nIawkVUKqaFnsvmyhOPmrsixi/BCI3g8hMKSkVH26WMdiaCDR3MJaVaZINVr3Cnr"
+    "mNw8MLw9dEGxDK6W+JMzVqIGw2wrdFHAAONg1wAAOIQwxDuVJXMWj5PlG6uN8QyxYfo4iQxPbiaZGOwuRx3xOLRpL0Dk18Ut"
+    "74xqsFdxs0xrLN3/AGR0y0QxNuyLm6vwcQ3xCVP1tFpYaHLnHjpG4HK09zHJjajgYSFBv1/OGfg4fJpjVSombpOHa6g1y1Wr"
+    "p8RP8YMYyQncrp97ELqTO5PUOnUL+aO0kmivuRimPcveJGJxLJJNHcwRxF0MNPw/CF+a5polc7v1pdNf6sd4QzSInXcJbNMW"
+    "JlNVE0cPkxcph4umiowdrkcZvqX/AAvYN8MAsyYIZ2nxFPDPfCAX5E5X5TD2Ykhz7Ea1Fyno7oPEF9FZPBw8TaAkY1zEWGfh"
+    "DCv98w+JzBkHmqCfKKbTqG/QCpHyd3d25U0hur6lqhTtSRTiVNpnjd7x+QW/q73ljyxU9a0ZZejmNLNM7m0Pt1cg+ovol1HT"
+    "Kudz5Mn1NuMadSk6bjBQJtl2l7bEh72qpk8QfI2S0VLKXx5rPF20+fNyYuj2quKin9+PwH6sN72YhEaZWVup9Dsiqya5qi4j"
+    "2ujHl3PULzC+NH4B0un44FKJr0hIu21eJgExHC/vqcYcmatpzapVm/HXPrqrL8i2ShwnP4JCw/RAbefWjxkbtBjS6502Mvb5"
+    "qkt0vhqeVH9Ajk2c1haaw5eRPW/+j3hoJlVD+YJ6Jqhush0TmKMSKIG97ul9mAzJDJ6orjt6ZTNdhJuOq9XVwy+R7InzOpGE"
+    "0l2iZb6pIJal+ZXc3/2gjg5ZSyy8nni7RdDHd8T+/vwGVaE+5DmC7PlVpPNseDFGVO2ihW6qCCt5FRI3FOT+waysJWgn283d"
+    "451j8TF1viERjUfNXbeYJ9Bzx1FytiS/qDmdMYEJe4x1M04tzYxNeMOhIrNJhKV00FzqLnJqbE929AREXWRziYYaYltnWJR9"
+    "eSWZYmHm7jj9bU/PECmq0yTmDFfA25BKXNTsHDTb51ifef0RGNyY0Uyxyat7XpyU6kQ82mGml2F9d3fzcmJ4UREXliktp+Xa"
+    "SqybZoofXzUnKDqLm0WS0fZPTU6YIYjuYNzuFfv986Z/iuDzjM5xUNrVS5sSCjxwrHeITgu/kh7MR56Fkl15Ih9DqZYtWx3a"
+    "c7gnqbh5aVJpQjmVP0+yUgTiqO25VvK3xOqCmVok0l+dpYLRorxV1LjZFP4ef5MIjRyiRUvRDtohqTqdd9X+1UOpDn9Y3wQH"
+    "WHiKFSI47ue5oolqHRXFK9nBvzUVLE/FrHu4ckyNbmZ03ePPaodTL+atFooI/Hxz+aILbM0k67RjPGbFGGarkgsdqQvyT5Pm"
+    "jESRzZRKZptOzPaeBcin+kaJGyypKfmPqSuhPWixbirXGIbFJ4JyRyZQY34eKmaeJ8sasRt7/EgrCZMZhyCjpRQ/HO6P7PD8"
+    "31hZI/TbrKJ+BxATSjI0zVSKborqn2jzfTK6JxPDJe+iPsDPq2mGkrwMwvrqXNc/NGw9rfmdVGsmFcSWcnEeQ2kLyuY4aimz"
+    "HoSkp2hUEpxE9omcg8lySQqTh2pr4ZCDt9lbzsfmOYY58DVGCeNreydjQzyYt7gX6zYZvtBz5Yiiio6baE29VnaCa5NTmHOI"
+    "1QDZvNEXabtDAUvmJ1hgRTLKz3mEWjyZuqgph88dP0whL8RdTZiBkJoNXqCH1/U7skvxMTluIOUZrN0et2dq+RO5xa1KW6uH"
+    "iCUSep5bWEpUXaKYiiROJ+aPJRGzucKjqNlaKkjdr7fZnJrjNLA1je1malPpCSWTebuk5nDzZLylT1o+Jz+bl/Qe4Yc5o1yw"
+    "Xq+cT2bNUYoIb95cmIXE8GEBftEqZdOUt8C/2wQ31xaYWY1BN5W0cP5TNmcq8Bo0Mou5jHjGyc3L7JviGeFm76mtVS45mta3"
+    "FbP+Db1BugoxdwzBvqJcGJrJ+9c4MkYdwR5o/pyr3UYNZFNZK4UjlitKFYqoJx9nCPv5PLgJlJmEslktVat5bMaHmCUdk/ey"
+    "szoy8PH1L0PIESrUtotMs0HcyfPXUmd8k9aqRzdX6MnvGKUONjEyZ+5gmlm7cy3TyS9vunyNhPpdW1kS6UxI6jM5Nf2Uya5T"
+    "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"
+)
+
+# Taham logo (PNG, embedded)
+LOGO_PNG_B64 = (
+    "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"
+)
+
+
+# ======================================================================
+#  THE WEBSITE (HTML + CSS + JavaScript)
+# ======================================================================
+INDEX_HTML = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Taham | Clothing Store & Admin Panel</title>
+    <link rel="icon" type="image/png" href="/logo.png?v=2">
+    <!-- Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com/3.4.17"></script>
+    <!-- Google Fonts: Hind Siliguri & Inter -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Hind+Siliguri:wght@400;500;600;700&family=Inter:wght@400;500;600;700&family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+    <!-- Lucide Icons -->
+    <script src="https://unpkg.com/lucide@0.469.0/dist/umd/lucide.min.js"></script>
+    <script>if (!window.lucide) window.lucide = { createIcons: function () {} };</script>
+    <script>
+        tailwind.config = {
+            theme: {
+                extend: {
+                    fontFamily: {
+                        sans: ['"Plus Jakarta Sans"', '"Inter"', '"Hind Siliguri"', 'sans-serif'],
+                    },
+                    colors: {
+                        brand: {
+                            50: 'var(--brand-50)',
+                            100: 'var(--brand-100)',
+                            300: 'var(--brand-300)',
+                            500: 'var(--brand-500)',
+                            600: 'var(--brand-600)',
+                            700: 'var(--brand-700)',
+                            900: 'var(--brand-900)',
+                        }
+                    }
+                }
+            }
+        }
+    </script>
+    <style>
+        :root {
+            --brand-50: #fdf2f8;
+            --brand-100: #fce7f3;
+            --brand-300: #fbcfe8;
+            --brand-500: #ec4899;
+            --brand-600: #db2777;
+            --brand-700: #be185d;
+            --brand-900: #831843;
+            --app-bg: #f8fafc;
+            --app-surface: #ffffff;
+            --app-text: #0f172a;
+        }
+
+        html {
+            font-family: "Plus Jakarta Sans", Inter, "Hind Siliguri", ui-sans-serif, system-ui, sans-serif;
+            font-size: 16px;
+        }
+
+        body {
+            background-color: var(--app-bg) !important;
+            color: var(--app-text);
+            font-family: "Plus Jakarta Sans", Inter, "Hind Siliguri", ui-sans-serif, system-ui, sans-serif;
+            font-weight: 400;
+            line-height: 1.5;
+            -webkit-font-smoothing: antialiased;
+            -moz-osx-font-smoothing: grayscale;
+        }
+
+        h1, h2, h3, h4, h5, h6 {
+            font-weight: 700;
+            letter-spacing: -0.012em;
+        }
+
+        h1 { font-weight: 800; letter-spacing: -0.02em; }
+        .text-\[11px\], .text-xs { font-weight: 500; }
+        .font-bold { font-weight: 700 !important; }
+        .font-semibold { font-weight: 600 !important; }
+
+        html { scroll-behavior: smooth; }
+        body { overflow-x: hidden; }
+        ::selection { background: var(--brand-500); color: #ffffff; }
+
+        /* Modern digital 3D + glassmorphism */
+        .glass,
+        .glass-card {
+            background: rgba(255, 255, 255, 0.72);
+            border: 1px solid rgba(255, 255, 255, 0.55);
+            box-shadow: 0 12px 34px rgba(15, 23, 42, 0.10), inset 0 1px 0 rgba(255, 255, 255, 0.70);
+            backdrop-filter: blur(16px) saturate(140%);
+            -webkit-backdrop-filter: blur(16px) saturate(140%);
+        }
+
+        .product-card {
+            position: relative;
+            border-radius: 1.25rem;
+            border: 1px solid rgba(148, 163, 184, 0.22);
+            background: rgba(255, 255, 255, 0.90);
+            box-shadow: 0 10px 28px rgba(15, 23, 42, 0.08), 0 2px 8px rgba(15, 23, 42, 0.05), inset 0 1px 0 rgba(255, 255, 255, 0.85);
+            transition: transform 240ms cubic-bezier(0.22, 1.18, 0.36, 1), box-shadow 240ms ease, border-color 240ms ease;
+            transform-style: preserve-3d;
+            will-change: transform;
+            backdrop-filter: blur(10px);
+        }
+
+        .product-card:hover {
+            border-color: rgba(var(--brand-rgb, 99, 102, 241), 0.30);
+            box-shadow: 0 22px 48px rgba(15, 23, 42, 0.16), 0 8px 18px rgba(15, 23, 42, 0.08), inset 0 1px 0 rgba(255, 255, 255, 0.90);
+        }
+
+        .tilt-3d {
+            transform-style: preserve-3d;
+            transition: transform 160ms cubic-bezier(0.22, 1.18, 0.36, 1), box-shadow 160ms ease, background-color 160ms ease, border-color 160ms ease;
+            will-change: transform;
+        }
+
+        .size-selector {
+            min-width: 2rem;
+            min-height: 2rem;
+            box-shadow: 0 4px 10px rgba(15, 23, 42, 0.08), inset 0 1px 0 rgba(255, 255, 255, 0.75);
+        }
+
+        .size-selector[aria-pressed="true"],
+        .size-selector.active,
+        .is-active {
+            box-shadow: 0 8px 18px rgba(var(--brand-rgb, 99, 102, 241), 0.32), 0 0 0 3px rgba(var(--brand-rgb, 99, 102, 241), 0.14), inset 0 1px 0 rgba(255, 255, 255, 0.35);
+        }
+
+        .action-button {
+            position: relative;
+            overflow: hidden;
+            box-shadow: 0 8px 18px rgba(var(--brand-rgb, 99, 102, 241), 0.24), inset 0 1px 0 rgba(255, 255, 255, 0.25);
+            transition: transform 160ms cubic-bezier(0.22, 1.18, 0.36, 1), box-shadow 160ms ease, background-color 160ms ease;
+        }
+
+        .action-button:hover:not(:disabled) {
+            box-shadow: 0 12px 26px rgba(var(--brand-rgb, 99, 102, 241), 0.32), 0 0 0 3px rgba(var(--brand-rgb, 99, 102, 241), 0.12), inset 0 1px 0 rgba(255, 255, 255, 0.30);
+        }
+
+        .action-button:active:not(:disabled) {
+            transform: translateY(1px) scale(0.97);
+            box-shadow: 0 4px 10px rgba(var(--brand-rgb, 99, 102, 241), 0.22);
+        }
+
+        .cat-btn.active,
+        .admin-sub-btn.bg-brand-600,
+        .admin-sub-btn.is-active {
+            box-shadow: 0 8px 18px rgba(var(--brand-rgb, 99, 102, 241), 0.28), 0 0 0 3px rgba(var(--brand-rgb, 99, 102, 241), 0.12);
+        }
+
+        button,
+        .tilt-3d {
+            -webkit-tap-highlight-color: transparent;
+        }
+
+        button:not(:disabled) { transition-property: transform, box-shadow, background-color, color, border-color, opacity; transition-duration: 160ms; }
+        button:not(:disabled):active { transform: translateY(1px) scale(0.97); }
+        button:disabled { cursor: not-allowed; }
+
+        .reveal {
+            opacity: 0;
+            transform: translateY(18px) scale(0.995);
+            will-change: opacity, transform;
+        }
+
+        .reveal-visible {
+            animation: reveal-up 520ms cubic-bezier(0.22, 1, 0.36, 1) both;
+        }
+
+        @keyframes reveal-up {
+            from { opacity: 0; transform: translateY(18px) scale(0.995); }
+            to { opacity: 1; transform: translateY(0) scale(1); }
+        }
+
+        @keyframes spring-press {
+            0% { transform: scale(1); }
+            45% { transform: scale(0.955); }
+            100% { transform: scale(1); }
+        }
+
+        button:not(:disabled):active { animation: spring-press 180ms ease-out; }
+
+        /* Universal TAHAM Official Pad printing */
+        .print-pad { background: #ffffff; }
+        .report-print-header { border-bottom: 1px solid #d8dee9; padding-bottom: 10px; margin-bottom: 12px; }
+        .report-print-kicker { margin: 0; color: #c1121f; font-size: 11px; font-weight: 900; letter-spacing: 0.06em; text-transform: uppercase; }
+        .report-print-title { margin: 3px 0 4px; color: #0b1f3a; font-size: 18px; font-weight: 900; }
+        .report-print-period { margin: 2px 0 0; color: #172033; font-size: 12px; font-weight: 700; }
+        .report-print-generated { margin: 3px 0 0; color: #526078; font-size: 11px; }
+        .report-metrics-grid { margin: 12px 0; }
+        .report-orders-wrap { margin-top: 12px; }
+        .report-orders-title { margin: 0 0 8px; color: #0b1f3a; font-size: 13px; font-weight: 900; text-transform: uppercase; letter-spacing: 0.03em; }
+        .report-print-table { width: 100%; border-collapse: collapse; font-size: 12px; background: #fff; }
+        .report-print-table th, .report-print-table td { border: 1px solid #d8dee9; padding: 6px 8px; text-align: left; }
+        .report-print-table thead th { background: #0b1f3a; color: #fff; font-weight: 900; }
+        .report-print-table tbody tr:nth-child(even) { background: #f8fafc; }
+        .report-print-table .num { text-align: right; }
+        .report-print-table .strong { font-weight: 800; }
+
+        /* Custom Taham Official Invoice / Cash Memo Pad */
+        .invoice-pad {
+            position: relative;
+            overflow: hidden;
+            background: #ffffff;
+            color: #172033;
+            border: 1px solid #d8dee9;
+            border-radius: 14px;
+            padding: 18px;
+            font-size: 12px;
+            line-height: 1.45;
+            box-shadow: 0 10px 28px rgba(11,31,58,0.10);
+        }
+
+        .invoice-pad * { position: relative; z-index: 1; }
+        .invoice-accent-stripe, .invoice-watermark { position: absolute; }
+
+        .invoice-accent-stripe {
+            top: 0;
+            left: 0;
+            right: 0;
+            height: 7px;
+            z-index: 3;
+            background: linear-gradient(90deg, #0b1f3a 0 33.333%, #c1121f 33.333% 66.666%, #d4af37 66.666% 100%);
+        }
+
+        .invoice-watermark {
+            top: 48%;
+            left: 50%;
+            z-index: 0;
+            transform: translate(-50%, -50%) rotate(-28deg) scale(1.25);
+            color: #0b1f3a;
+            opacity: 0.055;
+            font-size: 112px;
+            font-weight: 900;
+            letter-spacing: 0.08em;
+            white-space: nowrap;
+            pointer-events: none;
+            user-select: none;
+        }
+
+        .invoice-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: flex-start;
+            gap: 18px;
+            padding: 16px 2px 14px;
+            border-bottom: 2px solid #0b1f3a;
+            position: relative;
+            z-index: 2;
+        }
+
+        .invoice-brand { display: flex; align-items: center; gap: 12px; min-width: 0; }
+        .invoice-logo { width: 48px; height: 48px; object-fit: cover; border-radius: 10px; border: 1px solid #d8dee9; background: #fff; }
+        .invoice-title { margin: 0; color: #0b1f3a; font-size: 25px; line-height: 1; font-weight: 900; letter-spacing: 0.04em; }
+        .invoice-subtitle { margin: 4px 0 0; color: #c1121f; font-size: 11px; font-weight: 800; }
+        .invoice-address { margin: 4px 0 0; color: #526078; font-size: 11px; }
+
+        .invoice-order-heading { text-align: right; min-width: 180px; }
+        .invoice-badge { display: inline-block; padding: 7px 10px; background: #0b1f3a; color: #fff; border-radius: 7px; border: 1px solid #d4af37; font-size: 10px; font-weight: 900; letter-spacing: 0.09em; text-transform: uppercase; }
+        .invoice-helpline { margin: 7px 0 0; color: #526078; font-size: 10px; font-weight: 700; }
+
+        .invoice-info-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin: 14px 0; }
+        .invoice-box { background: #f8fafc; border: 1px solid #d8dee9; border-radius: 10px; padding: 11px; min-width: 0; }
+        .invoice-box-title { margin: 0 0 8px; padding-bottom: 6px; border-bottom: 1px solid #e2e8f0; color: #0b1f3a; font-size: 11px; font-weight: 900; letter-spacing: 0.04em; text-transform: uppercase; }
+        .invoice-label { margin: 7px 0 2px; color: #718096; font-size: 9px; font-weight: 800; text-transform: uppercase; letter-spacing: 0.04em; }
+        .invoice-value { margin: 0; color: #172033; font-size: 11px; font-weight: 700; overflow-wrap: anywhere; }
+        .invoice-address-value { white-space: pre-line; }
+        .invoice-order-row { display: flex; justify-content: space-between; gap: 10px; padding: 5px 0; border-bottom: 1px dashed #e2e8f0; }
+        .invoice-order-row:last-of-type { border-bottom: 0; }
+        .invoice-status { padding: 2px 7px; border-radius: 999px; background: #ecfdf5; color: #047857; border: 1px solid #a7f3d0; font-size: 9px; font-weight: 900; text-transform: uppercase; }
+
+        .invoice-table { width: 100%; border-collapse: collapse; margin: 14px 0; font-size: 10px; background: #fff; }
+        .invoice-table th, .invoice-table td { border: 1px solid #d8dee9; padding: 7px 6px; vertical-align: top; }
+        .invoice-table thead th { background: #0b1f3a; color: #fff; font-weight: 900; text-align: left; letter-spacing: 0.03em; text-transform: uppercase; }
+        .invoice-table tbody tr:nth-child(even) { background: #f8fafc; }
+        .invoice-sl { width: 34px; text-align: center; font-weight: 900; }
+        .invoice-center { text-align: center; }
+        .invoice-right { text-align: right; }
+        .invoice-item-meta { margin-top: 3px; color: #718096; font-size: 9px; font-weight: 600; }
+        .invoice-custom-note { margin-top: 5px; padding: 5px 6px; border-left: 3px solid #c1121f; background: #fff7f7; color: #172033; font-size: 9px; white-space: pre-line; }
+        .invoice-custom-note span { display: block; color: #c1121f; font-weight: 900; }
+        .invoice-original-price { color: #94a3b8; text-decoration: line-through; font-size: 9px; }
+
+        .invoice-summary-grid { display: grid; grid-template-columns: 1.1fr 0.9fr; gap: 12px; margin: 12px 0; align-items: start; }
+        .invoice-policy-box { border: 1px solid #d8dee9; background: #f8fafc; border-radius: 10px; padding: 10px; font-size: 10px; }
+        .invoice-policy-box ul { margin: 0; padding-left: 15px; }
+        .invoice-policy-box li { margin: 4px 0; }
+        .invoice-totals { border: 1px solid #d8dee9; border-radius: 10px; padding: 8px; background: #fff; }
+        .invoice-total-row { display: flex; justify-content: space-between; gap: 10px; padding: 5px 4px; border-bottom: 1px dashed #e2e8f0; }
+        .invoice-total-row:last-child { border-bottom: 0; }
+        .invoice-grand-total { background: #0b1f3a; color: #fff; border: 1px solid #d4af37; border-radius: 7px; margin-top: 6px; padding: 7px; font-weight: 900; }
+        .invoice-due-total { background: #fff7ed; color: #9a3412; border: 1px solid #fed7aa; border-radius: 7px; margin-top: 6px; padding: 7px; font-weight: 900; }
+
+        .invoice-payment-box { border: 1px solid #d8dee9; background: #f8fafc; border-radius: 10px; padding: 10px; margin: 12px 0; }
+        .invoice-payment-methods { display: flex; flex-wrap: wrap; gap: 7px; margin-top: 8px; }
+        .invoice-payment-option { display: inline-flex; align-items: center; gap: 6px; padding: 6px 9px; border: 1px solid #d8dee9; border-radius: 8px; background: #fff; color: #526078; font-size: 10px; font-weight: 800; opacity: 0.55; }
+        .invoice-check { display: inline-flex; width: 13px; height: 13px; align-items: center; justify-content: center; border: 1px solid #94a3b8; border-radius: 50%; background: #fff; color: transparent; font-size: 9px; font-weight: 900; }
+        .invoice-payment-option.active { opacity: 1; border-color: #c1121f; background: #fff1f2; color: #9f1239; box-shadow: 0 3px 10px rgba(193,18,31,0.12); }
+        .invoice-payment-option.active .invoice-check { background: #c1121f; border-color: #c1121f; color: #fff; }
+        .invoice-payment-note { margin: 5px 0 0; color: #526078; font-size: 9px; font-weight: 700; }
+
+        .invoice-signatures-footer { margin-top: 18px; }
+        .invoice-signatures { display: grid; grid-template-columns: 1fr 1fr; gap: 24px; padding: 20px 8px 10px; }
+        .invoice-signature { text-align: center; }
+        .invoice-signature-line { display: block; height: 34px; border-bottom: 1px solid #0b1f3a; margin-bottom: 6px; }
+        .invoice-signature p { margin: 0; color: #172033; font-size: 10px; font-weight: 800; }
+        .invoice-footer-bar { padding: 10px 12px; background: #0b1f3a; color: #fff; border-radius: 8px; border-top: 2px solid #c1121f; text-align: center; font-size: 10px; font-weight: 800; letter-spacing: 0.02em; }
+
+        @media print {
+            @page { size: A4; margin: 0; background-image: url("/official-pad-background.jpg"); background-size: cover; background-position: center; background-repeat: no-repeat; print-color-adjust: exact; -webkit-print-color-adjust: exact; }
+            body * { visibility: hidden !important; }
+            #invoice-print-area, #invoice-print-area *, .print-pad, .print-pad *, #report-print-area, #report-print-area * { visibility: visible !important; }
+            #invoice-print-area {
+                position: fixed !important;
+                inset: 0 !important;
+                z-index: 9999 !important;
+                width: 100% !important;
+                max-height: none !important;
+                overflow: visible !important;
+                margin: 0 !important;
+                padding: 14px !important;
+                border-radius: 0 !important;
+                box-shadow: none !important;
+                background: #fff !important;
+                color: #172033 !important;
+            }
+            #invoice-modal { position: static !important; max-height: none !important; overflow: visible !important; background: #fff !important; }
+            .no-print { display: none !important; }
+            .invoice-pad { -webkit-print-color-adjust: exact !important; print-color-adjust: exact !important; }
+            .invoice-accent-stripe, .invoice-badge, .invoice-table thead th, .invoice-grand-total, .invoice-footer-bar, .invoice-payment-option.active { -webkit-print-color-adjust: exact !important; print-color-adjust: exact !important; }
+            .invoice-watermark { opacity: 0.05 !important; }
+            html, body { background-image: url("/official-pad-background.jpg") !important; background-size: cover !important; background-position: center !important; background-repeat: no-repeat !important; -webkit-print-color-adjust: exact !important; print-color-adjust: exact !important; }
+            .invoice-accent-stripe { display: none !important; }
+            .print-pad, #invoice-print-area, #report-print-area {
+                position: relative !important;
+                z-index: 9999 !important;
+                width: 210mm !important;
+                max-width: 210mm !important;
+                min-height: 297mm !important;
+                max-height: none !important;
+                margin: 0 auto !important;
+                padding: 58mm 18mm 48mm !important;
+                box-sizing: border-box !important;
+                border: 0 !important;
+                border-radius: 0 !important;
+                box-shadow: none !important;
+                overflow: visible !important;
+                background-color: transparent !important;
+                background-image: url("/official-pad-background.jpg") !important;
+                background-size: cover !important;
+                background-position: center !important;
+                background-repeat: no-repeat !important;
+                background-origin: border-box !important;
+                background-clip: border-box !important;
+                -webkit-print-color-adjust: exact !important;
+                print-color-adjust: exact !important;
+            }
+            #invoice-print-area { padding: 58mm 18mm 48mm !important; }
+            #report-print-area { padding: 56mm 18mm 48mm !important; }
+            .no-print { display: none !important; }
+        }
+
+        /* Dynamic TAHAM pad sizing, safe margins, and multi-page printing */
+        @media print {
+            @page {
+                size: A4;
+                margin: 0;
+                width: 210mm;
+                height: 297mm;
+                background-image: url("/official-pad-background.jpg");
+                background-size: cover;
+                background-position: center;
+                background-repeat: no-repeat;
+                print-color-adjust: exact;
+                -webkit-print-color-adjust: exact;
+            }
+
+            html, body { width: 210mm; margin: 0 !important; padding: 0 !important; }
+
+            .print-pad {
+                position: relative !important;
+                width: 210mm !important;
+                height: 297mm !important;
+                max-width: 210mm !important;
+                max-height: none !important;
+                min-height: 297mm !important;
+                margin: 0 !important;
+                padding: var(--invoice-margin-top, 58mm) var(--invoice-margin-right, 18mm) var(--invoice-margin-bottom, 48mm) var(--invoice-margin-left, 18mm) !important;
+                box-sizing: border-box !important;
+                overflow: visible !important;
+                border: 0 !important;
+                border-radius: 0 !important;
+                box-shadow: none !important;
+                background-color: transparent !important;
+                background-image: var(--invoice-pad-image, url("/official-pad-background.jpg")) !important;
+                background-size: cover !important;
+                background-position: center !important;
+                background-repeat: no-repeat !important;
+                page-break-inside: auto !important;
+                break-inside: auto !important;
+                -webkit-print-color-adjust: exact !important;
+                print-color-adjust: exact !important;
+            }
+
+            #invoice-print-area, #report-print-area {
+                padding: var(--invoice-margin-top, 58mm) var(--invoice-margin-right, 18mm) var(--invoice-margin-bottom, 48mm) var(--invoice-margin-left, 18mm) !important;
+            }
+
+            .print-pad-background {
+                position: absolute !important;
+                top: 0 !important;
+                right: 0 !important;
+                bottom: 0 !important;
+                left: 0 !important;
+                width: 100% !important;
+                height: 100% !important;
+                max-width: none !important;
+                min-width: 0 !important;
+                object-fit: cover !important;
+                object-position: center center !important;
+                z-index: 0 !important;
+                visibility: visible !important;
+                pointer-events: none !important;
+                -webkit-print-color-adjust: exact !important;
+                print-color-adjust: exact !important;
+            }
+
+            .print-pad > :not(.print-pad-background) { position: relative; z-index: 1; }
+
+            .invoice-table, .report-print-table, table { page-break-inside: auto !important; break-inside: auto !important; }
+            .invoice-table thead, .report-print-table thead { display: table-header-group !important; }
+            .invoice-table tfoot, .report-print-table tfoot { display: table-footer-group !important; }
+            .invoice-table tbody tr, .report-print-table tbody tr, table tbody tr {
+                page-break-inside: avoid !important;
+                break-inside: avoid !important;
+                page-break-after: auto !important;
+                break-after: auto !important;
+            }
+            .invoice-totals, .invoice-payment-box, .invoice-signatures-footer, .report-print-header { page-break-inside: avoid !important; break-inside: avoid !important; }
+            .no-print { display: none !important; }
+        }
+
+        /* Invoice Setup live preview */
+        .invoice-pad-live-preview {
+            position: relative;
+            width: 100%;
+            max-width: 420px;
+            aspect-ratio: 210 / 297;
+            overflow: hidden;
+            border: 1px solid #d8dee9;
+            border-radius: 12px;
+            background: #fff;
+            margin-top: 12px;
+        }
+        .invoice-pad-live-bg { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
+        .invoice-pad-live-safe {
+            position: absolute;
+            top: 58mm;
+            bottom: 48mm;
+            left: 18mm;
+            right: 18mm;
+            border: 1px dashed #c1121f;
+            background: rgba(255,255,255,0.35);
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            gap: 4px;
+            color: #0b1f3a;
+            font-size: 11px;
+            text-align: center;
+        }
+        /* Floating 3D storefront footer */
+        .footer-3d {
+            position: relative;
+            z-index: 10;
+            max-width: 72rem;
+            margin: 2rem auto 1.5rem;
+            border-radius: 1.5rem;
+            border: 1px solid rgba(148, 163, 184, 0.22);
+            background: linear-gradient(145deg, #111827 0%, #0b1220 48%, #030712 100%);
+            color: #cbd5e1;
+            box-shadow:
+                0 28px 70px rgba(2, 6, 23, 0.45),
+                0 10px 24px rgba(15, 23, 42, 0.35),
+                inset 0 1px 0 rgba(255, 255, 255, 0.16),
+                inset 0 -1px 0 rgba(255, 255, 255, 0.04);
+            transform-style: preserve-3d;
+            overflow: hidden;
+        }
+
+        .footer-3d::before {
+            content: "";
+            position: absolute;
+            top: 0;
+            left: 1.5rem;
+            right: 1.5rem;
+            height: 1px;
+            background: linear-gradient(90deg, transparent, rgba(255,255,255,0.55), transparent);
+            pointer-events: none;
+        }
+
+        .footer-3d::after {
+            content: "";
+            position: absolute;
+            inset: auto -10% -45% -10%;
+            height: 8rem;
+            background: radial-gradient(ellipse at center, rgba(255,255,255,0.10), transparent 68%);
+            pointer-events: none;
+        }
+
+        .footer-title {
+            text-shadow: 0 1px 0 rgba(255,255,255,0.12), 0 8px 22px rgba(0,0,0,0.35);
+            letter-spacing: -0.02em;
+        }
+
+        .footer-address {
+            color: #94a3b8;
+            line-height: 1.45;
+            text-shadow: 0 1px 1px rgba(0,0,0,0.35);
+        }
+
+        .footer-phone-pill {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.55rem;
+            padding: 0.75rem 1.05rem;
+            border-radius: 999px;
+            border: 1px solid rgba(255,255,255,0.16);
+            background: linear-gradient(145deg, rgba(255,255,255,0.12), rgba(255,255,255,0.04));
+            color: #ffffff;
+            font-weight: 800;
+            font-size: 0.8rem;
+            letter-spacing: 0.01em;
+            box-shadow: 0 10px 24px rgba(0,0,0,0.28), inset 0 1px 0 rgba(255,255,255,0.22), inset 0 -1px 0 rgba(0,0,0,0.25);
+            backdrop-filter: blur(10px);
+            transition: transform 180ms cubic-bezier(0.22, 1.18, 0.36, 1), box-shadow 180ms ease, border-color 180ms ease, background 180ms ease;
+            text-decoration: none;
+        }
+
+        .footer-phone-pill:hover {
+            transform: translateY(-3px) scale(1.02);
+            border-color: rgba(255,255,255,0.34);
+            background: linear-gradient(145deg, rgba(255,255,255,0.18), rgba(255,255,255,0.07));
+            box-shadow: 0 16px 34px rgba(0,0,0,0.34), 0 0 0 3px rgba(255,255,255,0.06), inset 0 1px 0 rgba(255,255,255,0.28);
+        }
+
+        .footer-phone-pill:active { transform: translateY(1px) scale(0.98); }
+
+        @media (prefers-reduced-motion: reduce) {
+            html { scroll-behavior: auto; }
+            *, *::before, *::after {
+                animation-duration: 0.001ms !important;
+                animation-iteration-count: 1 !important;
+                transition-duration: 0.001ms !important;
+                scroll-behavior: auto !important;
+            }
+            .reveal { opacity: 1; transform: none; }
+            .tilt-3d, .product-card, .size-selector, .action-button, .footer-phone-pill { transform: none !important; }
+        }
+
+        .bg-slate-50 { background-color: var(--app-bg) !important; }
+        .bg-white { background-color: var(--app-surface) !important; }
+
+        .admin-sidebar,
+        .admin-subtab-panel.bg-white,
+        .settings-section {
+            box-shadow: var(--app-shadow);
+        }
+
+        .admin-sidebar {
+            position: sticky;
+            top: 1rem;
+            max-height: calc(100vh - 2rem);
+            overflow-y: auto;
+        }
+
+        .admin-sub-btn { text-align: left; }
+        .settings-submenu-btn { text-align: left; }
+        .theme-option { cursor: pointer; }
+
+        .product-image-zoom { cursor: zoom-in; }
+        .zoomable-image {
+            transform-origin: center center;
+            transition: transform 180ms ease-out;
+            will-change: transform, transform-origin;
+        }
+        .discount-badge {
+            display: inline-grid;
+            place-items: center;
+            z-index: 15;
+            width: 5.5rem;
+            min-height: 4.25rem;
+            padding: 0;
+            border: 0;
+            background: transparent;
+            color: #ffffff;
+            font-weight: 900;
+            text-transform: uppercase;
+            transform: rotate(5deg);
+            transform-style: preserve-3d;
+            isolation: isolate;
+            filter: drop-shadow(0 12px 16px rgba(15,23,42,0.32));
+            pointer-events: none;
+        }
+
+        .discount-badge::before {
+            content: "";
+            position: absolute;
+            inset: 0.45rem -0.25rem -0.45rem 0.45rem;
+            z-index: -2;
+            background: linear-gradient(135deg, #fbbf24 0%, #f59e0b 55%, #d97706 100%);
+            clip-path: polygon(10% 0, 90% 0, 100% 18%, 100% 100%, 0 100%, 0 18%);
+        }
+
+        .discount-badge::after {
+            content: "";
+            position: absolute;
+            right: -0.35rem;
+            bottom: -0.3rem;
+            width: 0.95rem;
+            height: 0.95rem;
+            z-index: -1;
+            background: #f59e0b;
+            transform: rotate(45deg);
+            box-shadow: inset 0 1px 0 rgba(255,255,255,0.35);
+        }
+
+        .discount-badge-shadow {
+            position: absolute;
+            inset: 0.55rem -0.5rem -0.55rem 0.55rem;
+            z-index: -3;
+            background: linear-gradient(135deg, #b45309 0%, #92400e 100%);
+            clip-path: polygon(10% 0, 90% 0, 100% 18%, 100% 100%, 0 100%, 0 18%);
+        }
+
+        .discount-badge-layer {
+            position: absolute;
+            inset: 0.25rem -0.3rem -0.25rem 0.25rem;
+            z-index: -1;
+            background: linear-gradient(135deg, #ff6b4a 0%, #f43f5e 55%, #e11d48 100%);
+            clip-path: polygon(10% 0, 90% 0, 100% 18%, 100% 100%, 0 100%, 0 18%);
+            box-shadow: inset 0 1px 0 rgba(255,255,255,0.30);
+        }
+
+        .discount-badge-navy {
+            position: relative;
+            z-index: 2;
+            width: 100%;
+            padding: 0.48rem 0.35rem 0.42rem;
+            background: linear-gradient(135deg, #0f172a 0%, #172554 100%);
+            border: 1px solid rgba(255,255,255,0.24);
+            border-bottom: 0;
+            clip-path: polygon(12% 0, 88% 0, 100% 18%, 100% 100%, 0 100%, 0 18%);
+            color: #ffffff;
+            font-size: 0.98rem;
+            line-height: 1;
+            font-weight: 900;
+            letter-spacing: -0.01em;
+            text-align: center;
+            transform: translateY(-2px);
+            box-shadow: inset 0 1px 0 rgba(255,255,255,0.22), 0 2px 0 rgba(15,23,42,0.45);
+        }
+
+        .discount-badge-ribbon {
+            position: relative;
+            z-index: 3;
+            width: 116%;
+            margin-top: -0.35rem;
+            padding: 0.25rem 0.25rem;
+            background: linear-gradient(135deg, #ff6b4a 0%, #e11d48 100%);
+            border: 1px solid rgba(255,255,255,0.30);
+            border-radius: 0.2rem;
+            color: #ffffff;
+            font-size: 0.58rem;
+            line-height: 1;
+            font-weight: 900;
+            letter-spacing: 0.13em;
+            text-align: center;
+            transform: rotate(-2deg);
+            box-shadow: 0 4px 0 #9f1239, 0 7px 12px rgba(15,23,42,0.22), inset 0 1px 0 rgba(255,255,255,0.28);
+        }
+
+        .discount-badge-accent {
+            position: absolute;
+            z-index: 4;
+            width: 0.48rem;
+            height: 0.48rem;
+            background: #fbbf24;
+            box-shadow: inset 0 1px 0 rgba(255,255,255,0.35), 0 2px 3px rgba(15,23,42,0.25);
+        }
+
+        .discount-badge-accent-one { top: -0.28rem; left: -0.28rem; transform: rotate(45deg); background: #fde68a; }
+        .discount-badge-accent-two { bottom: -0.22rem; left: 0.32rem; border-radius: 50%; background: #ef4444; }
+        .discount-badge-accent-three { top: 0.48rem; right: -0.28rem; transform: rotate(45deg); background: #f59e0b; }
+
+        .stock-switch input:checked + span { background-color: var(--brand-600); }
+        .stock-switch input:checked + span > span { transform: translateX(1.25rem); }
+
+        .bg-brand-50 { background-color: var(--brand-50) !important; }
+        .bg-brand-100 { background-color: var(--brand-100) !important; }
+        .bg-brand-300 { background-color: var(--brand-300) !important; }
+        .bg-brand-500 { background-color: var(--brand-500) !important; }
+        .bg-brand-600 { background-color: var(--brand-600) !important; }
+        .bg-brand-700 { background-color: var(--brand-700) !important; }
+        .bg-brand-900 { background-color: var(--brand-900) !important; }
+
+        .text-brand-500 { color: var(--brand-500) !important; }
+        .text-brand-600 { color: var(--brand-600) !important; }
+        .text-brand-700 { color: var(--brand-700) !important; }
+        .text-brand-900 { color: var(--brand-900) !important; }
+
+        .border-brand-300 { border-color: var(--brand-300) !important; }
+        .border-brand-500 { border-color: var(--brand-500) !important; }
+        .border-brand-600 { border-color: var(--brand-600) !important; }
+        .border-brand-700 { border-color: var(--brand-700) !important; }
+
+        .hover\:bg-brand-50:hover { background-color: var(--brand-50) !important; }
+        .hover\:bg-brand-600:hover { background-color: var(--brand-600) !important; }
+        .hover\:bg-brand-700:hover { background-color: var(--brand-700) !important; }
+        .hover\:border-brand-300:hover { border-color: var(--brand-300) !important; }
+        .hover\:border-brand-600:hover { border-color: var(--brand-600) !important; }
+        .ring-brand-500 { --tw-ring-color: var(--brand-500) !important; }
+        .selection\:bg-brand-500::selection { background-color: var(--brand-500) !important; }
+
+        @media print {
+            body * { visibility: hidden !important; }
+            #invoice-print-area, #invoice-print-area *, .print-pad, .print-pad *, #report-print-area, #report-print-area * { visibility: visible !important; }
+            #invoice-print-area {
+                position: fixed !important;
+                left: 0 !important;
+                top: 0 !important;
+                width: 100% !important;
+                background: white !important;
+                padding: 20px !important;
+                box-shadow: none !important;
+            }
+            .no-print { display: none !important; }
+        }
+            /* Single letterhead pad layer (screen + print). */
+        .print-pad-background { display: block; }
+
+        @media print {
+            @page {
+                size: A4 portrait;
+                margin: 0;
+                width: 210mm;
+                height: 297mm;
+                background-image: url("/official-pad-background.jpg");
+                background-size: 100% 100%;
+                background-position: 0 0;
+                background-repeat: no-repeat;
+                print-color-adjust: exact;
+                -webkit-print-color-adjust: exact;
+            }
+
+            html, body {
+                width: 210mm !important;
+                min-height: 297mm !important;
+                margin: 0 !important;
+                padding: 0 !important;
+                background: transparent !important;
+            }
+
+            body * { visibility: hidden !important; }
+
+            #report-print-area,
+            #report-print-area *,
+            #invoice-print-area,
+            #invoice-print-area *,
+            .print-pad,
+            .print-pad *,
+            .print-pad-background {
+                visibility: visible !important;
+            }
+
+            .print-pad {
+                display: block !important;
+                position: relative !important;
+                z-index: 1 !important;
+                width: 210mm !important;
+                height: 297mm !important;
+                min-height: 297mm !important;
+                max-width: 210mm !important;
+                max-height: none !important;
+                margin: 0 !important;
+                padding: var(--invoice-margin-top, 58mm) var(--invoice-margin-right, 18mm) var(--invoice-margin-bottom, 48mm) var(--invoice-margin-left, 18mm) !important;
+                box-sizing: border-box !important;
+                overflow: visible !important;
+                border: 0 !important;
+                border-radius: 0 !important;
+                box-shadow: none !important;
+                color: #172033 !important;
+                background-color: transparent !important;
+                background-image: var(--invoice-pad-image, url("/official-pad-background.jpg")) !important;
+                background-size: 100% 100% !important;
+                background-position: 0 0 !important;
+                background-repeat: no-repeat !important;
+                -webkit-print-color-adjust: exact !important;
+                print-color-adjust: exact !important;
+            }
+
+            #report-print-area.print-pad,
+            #invoice-print-area.print-pad {
+                position: relative !important;
+                inset: auto !important;
+                padding: var(--invoice-margin-top, 58mm) var(--invoice-margin-right, 18mm) var(--invoice-margin-bottom, 48mm) var(--invoice-margin-left, 18mm) !important;
+            }
+
+            .print-pad-background {
+                display: block !important;
+                position: absolute !important;
+                top: 0 !important;
+                right: 0 !important;
+                bottom: 0 !important;
+                left: 0 !important;
+                width: 100% !important;
+                height: 100% !important;
+                max-width: none !important;
+                max-height: none !important;
+                min-width: 0 !important;
+                min-height: 0 !important;
+                margin: 0 !important;
+                padding: 0 !important;
+                border: 0 !important;
+                transform: none !important;
+                object-fit: cover !important;
+                object-position: center center !important;
+                background-size: 100% 100% !important;
+                z-index: 0 !important;
+                visibility: visible !important;
+                opacity: 1 !important;
+                pointer-events: none !important;
+                -webkit-print-color-adjust: exact !important;
+                print-color-adjust: exact !important;
+            }
+
+            .print-pad > :not(.print-pad-background) {
+                position: relative;
+                z-index: 2 !important;
+                visibility: visible !important;
+            }
+
+            .report-print-header,
+            .report-metrics-grid,
+            .report-orders-wrap,
+            .report-print-table,
+            .report-print-table *,
+            .invoice-table,
+            .invoice-table * {
+                visibility: visible !important;
+                opacity: 1 !important;
+            }
+
+            .no-print { display: none !important; }
+        }
+</style>
+</head>
+<body class="bg-slate-50 text-slate-800 font-sans antialiased selection:bg-brand-500 selection:text-white">
+
+    <!-- Toast Notification Container -->
+    <div id="toast-container" class="fixed bottom-5 right-5 z-50 flex flex-col gap-2 pointer-events-none no-print"></div>
+
+    <!-- Top Navigation Bar -->
+    <header class="sticky top-0 z-40 bg-white/95 backdrop-blur-md border-b border-slate-200 shadow-sm no-print">
+        <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+            <div class="flex justify-between items-center h-16 sm:h-20">
+                <!-- Brand Logo -->
+                <div class="flex items-center gap-3 cursor-pointer" onclick="switchView('store')">
+                    <div class="w-11 h-11 sm:w-12 sm:h-12 rounded-xl overflow-hidden bg-black shadow-md shrink-0">
+                        <img id="site-logo" src="/logo.png?v=2" alt="Taham" class="w-full h-full object-cover">
+                    </div>
+                    <div>
+                        <h1 id="header-shop-name" class="text-lg sm:text-2xl font-bold bg-gradient-to-r from-brand-700 to-slate-900 bg-clip-text text-transparent leading-tight">
+                            Taham
+                        </h1>
+                        <div class="flex items-center gap-1.5">
+                            <span id="cloud-status-dot" class="w-2 h-2 rounded-full bg-amber-400 animate-pulse"></span>
+                            <p id="cloud-status-text" class="text-[10px] sm:text-xs text-slate-500 font-medium">Syncing...</p>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Navigation / Mode Switcher -->
+                <div class="flex items-center gap-2 sm:gap-3">
+                    <!-- Language switch -->
+                    <div class="flex items-center rounded-xl border border-slate-200 bg-white p-0.5 text-xs font-bold" data-notranslate role="group">
+                        <button id="lang-en" onclick="setLanguage('en')" class="px-2.5 py-1.5 rounded-lg bg-slate-900 text-white">English</button>
+                        <button id="lang-bn" onclick="setLanguage('bn')" class="px-2.5 py-1.5 rounded-lg text-slate-600 hover:bg-slate-100">বাংলা</button>
+                    </div>
+
+                    <!-- Storefront Button -->
+                    <button id="nav-store-btn" onclick="switchView('store')" class="px-3 sm:px-4 py-2 rounded-xl text-xs sm:text-sm font-semibold transition-all bg-brand-50 text-brand-700 border border-brand-200 flex items-center gap-1.5">
+                        <i data-lucide="store" class="w-4 h-4"></i>
+                        <span class="hidden sm:inline">Store</span>
+                    </button>
+
+                    <!-- Super Admin Button -->
+                    <button id="nav-admin-btn" onclick="handleAdminNavClick()" class="px-3 sm:px-4 py-2 rounded-xl text-xs sm:text-sm font-semibold transition-all bg-slate-900 text-white hover:bg-slate-800 shadow-sm flex items-center gap-1.5">
+                        <i data-lucide="shield-check" class="w-4 h-4 text-pink-400"></i>
+                        <span>Super Admin</span>
+                        <span id="pending-orders-badge" class="hidden bg-rose-600 text-white text-[10px] px-1.5 py-0.5 rounded-full font-bold">0</span>
+                    </button>
+
+                    <!-- Logout Button (Only shown when logged in) -->
+                    <button id="admin-logout-btn" onclick="logoutAdmin()" class="hidden p-2 sm:px-3 sm:py-2 rounded-xl bg-rose-50 text-rose-600 hover:bg-rose-100 border border-rose-200 text-xs font-bold flex items-center gap-1" title="Log out">
+                        <i data-lucide="log-out" class="w-4 h-4"></i>
+                        <span class="hidden md:inline">Logout</span>
+                    </button>
+
+                    <!-- Cart Button (Visible in Store Mode) -->
+                    <button id="header-cart-btn" onclick="toggleCart(true)" class="relative p-2.5 sm:p-3 rounded-xl bg-brand-600 text-white hover:bg-brand-700 transition-colors shadow-sm">
+                        <i data-lucide="shopping-cart" class="w-5 h-5"></i>
+                        <span id="cart-count" class="absolute -top-1.5 -right-1.5 bg-slate-900 text-white text-xs font-bold w-5 h-5 rounded-full flex items-center justify-center border-2 border-white">
+                            0
+                        </span>
+                    </button>
+                </div>
+            </div>
+        </div>
+    </header>
+
+    <!-- ========================================== -->
+    <!-- 1. CUSTOMER STOREFRONT VIEW                -->
+    <!-- ========================================== -->
+    <main id="store-view" class="pb-16 no-print">
+        <!-- Hero Banner (picture) -->
+        <section class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 pt-6 sm:pt-8">
+            <a href="#products-section" class="block rounded-3xl overflow-hidden shadow-xl border border-slate-200 bg-sky-100">
+                <img src="/hero.jpg?v=1" alt="Taham oversized hoodie collection" class="w-full h-auto block">
+            </a>
+            <div class="grid grid-cols-1 sm:grid-cols-2 gap-4 mt-5">
+                <div class="bg-white p-4 sm:p-5 rounded-2xl border border-slate-200 shadow-sm flex items-start gap-3.5">
+                    <div class="w-11 h-11 rounded-xl bg-brand-50 text-brand-600 flex items-center justify-center shrink-0">
+                        <i data-lucide="truck" class="w-5 h-5"></i>
+                    </div>
+                    <div>
+                        <h3 class="font-bold text-slate-900">Fast Home Delivery</h3>
+                        <p class="text-xs text-slate-500 mt-0.5">Delivery charge is only ৳60 inside Dhaka and ৳120 across Bangladesh.</p>
+                    </div>
+                </div>
+                <div class="bg-white p-4 sm:p-5 rounded-2xl border border-slate-200 shadow-sm flex items-start gap-3.5">
+                    <div class="w-11 h-11 rounded-xl bg-emerald-50 text-emerald-600 flex items-center justify-center shrink-0">
+                        <i data-lucide="shield-check" class="w-5 h-5"></i>
+                    </div>
+                    <div>
+                        <h3 class="font-bold text-slate-900">100% Colour Guarantee</h3>
+                        <p class="text-xs text-slate-500 mt-0.5">Inspect the product on delivery and pay after you receive it.</p>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- Shop by Collection -->
+        <section id="collections-section" class="hidden max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 pt-10 sm:pt-14">
+            <h3 class="text-xl sm:text-2xl font-bold text-slate-800 mb-5">Shop by Collection</h3>
+            <div id="collections-grid" class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-4"></div>
+        </section>
+
+        <!-- Search & Category Filter Bar -->
+        <section id="products-section" class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 pt-8 sm:pt-12">
+            <div class="bg-white p-4 sm:p-5 rounded-2xl shadow-sm border border-slate-200">
+                <div class="flex flex-col md:flex-row justify-between items-stretch md:items-center gap-4">
+                    <!-- Category Pills -->
+                    <div id="category-filters" class="flex items-center gap-2 overflow-x-auto pb-2 md:pb-0"></div>
+
+                    <!-- Search Input -->
+                    <div class="relative w-full md:w-72">
+                        <i data-lucide="search" class="w-4 h-4 text-slate-400 absolute left-3.5 top-1/2 -translate-y-1/2"></i>
+                        <input type="text" id="search-input" oninput="renderProducts()" placeholder="Search clothes by name..." class="w-full pl-10 pr-4 py-2.5 rounded-xl border border-slate-200 bg-slate-50 focus:bg-white focus:outline-none focus:ring-2 focus:ring-brand-500 text-sm">
+                    </div>
+                </div>
+            </div>
+
+            <!-- Products Grid -->
+            <div class="mt-8">
+                <div class="flex justify-between items-center mb-6">
+                    <h3 class="text-xl sm:text-2xl font-bold text-slate-800" id="current-category-title">All Collections</h3>
+                    <span id="product-count-label" class="text-sm text-slate-500 font-medium">Loading...</span>
+                </div>
+
+                <div id="products-grid" class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-6">
+                    <!-- Products dynamically rendered here -->
+                </div>
+            </div>
+        </section>
+    </main>
+
+    <!-- ========================================== -->
+    <!-- 2. SUPER ADMIN ERP DASHBOARD VIEW          -->
+    <!-- ========================================== -->
+    <main id="admin-view" class="hidden max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8 pb-20 no-print">
+        <!-- Business Analytics Overview Cards -->
+        <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-4 mb-8">
+            <button type="button" onclick="openAdminSummary('orders')" class="bg-white p-5 rounded-2xl border border-slate-200 shadow-sm text-left w-full hover:border-brand-300 hover:shadow-md transition-all">
+                <div class="flex items-center justify-between">
+                    <p class="text-xs font-semibold text-slate-500">Total Sales</p>
+                    <div class="w-9 h-9 rounded-xl bg-blue-50 text-blue-600 flex items-center justify-center">
+                        <i data-lucide="banknote" class="w-5 h-5"></i>
+                    </div>
+                </div>
+                <p id="stat-revenue" class="text-2xl font-bold text-slate-900 mt-2">৳ 0</p>
+                <p class="text-[11px] text-slate-400 mt-1">Total sales including delivery charge</p>
+            </button>
+
+            <button type="button" onclick="openAdminSummary('orders')" class="bg-white p-5 rounded-2xl border border-emerald-200 shadow-sm bg-gradient-to-br from-white to-emerald-50/40 text-left w-full hover:border-emerald-400 hover:shadow-md transition-all">
+                <div class="flex items-center justify-between">
+                    <p class="text-xs font-semibold text-emerald-700">Net Profit</p>
+                    <div class="w-9 h-9 rounded-xl bg-emerald-100 text-emerald-700 flex items-center justify-center">
+                        <i data-lucide="trending-up" class="w-5 h-5"></i>
+                    </div>
+                </div>
+                <p id="stat-profit" class="text-2xl font-bold text-emerald-700 mt-2">৳ 0</p>
+                <p class="text-[11px] text-emerald-600/80 mt-1">Net profit after purchase cost and expenses</p>
+            </button>
+
+            <button type="button" onclick="openAdminSummary('expenses')" class="bg-white p-5 rounded-2xl border border-slate-200 shadow-sm text-left w-full hover:border-rose-300 hover:shadow-md transition-all">
+                <div class="flex items-center justify-between">
+                    <p class="text-xs font-semibold text-slate-500">Total Expenses</p>
+                    <div class="w-9 h-9 rounded-xl bg-rose-50 text-rose-600 flex items-center justify-center">
+                        <i data-lucide="receipt" class="w-5 h-5"></i>
+                    </div>
+                </div>
+                <p id="stat-expenses" class="text-2xl font-bold text-rose-600 mt-2">৳ 0</p>
+                <p class="text-[11px] text-slate-400 mt-1">Shop & other expenses</p>
+            </button>
+
+            <button type="button" onclick="openAdminSummary('orders', 'Pending')" class="bg-white p-5 rounded-2xl border border-slate-200 shadow-sm text-left w-full hover:border-amber-300 hover:shadow-md transition-all">
+                <div class="flex items-center justify-between">
+                    <p class="text-xs font-semibold text-slate-500">Pending Orders</p>
+                    <div class="w-9 h-9 rounded-xl bg-amber-50 text-amber-600 flex items-center justify-center">
+                        <i data-lucide="clock" class="w-5 h-5"></i>
+                    </div>
+                </div>
+                <p id="stat-pending" class="text-2xl font-bold text-amber-600 mt-2">0</p>
+                <p id="stat-total-orders" class="text-[11px] text-slate-400 mt-1">Total Orders: 0</p>
+            </button>
+
+            <button type="button" onclick="openAdminSummary('inventory')" class="bg-white p-5 rounded-2xl border border-slate-200 shadow-sm text-left w-full hover:border-purple-300 hover:shadow-md transition-all">
+                <div class="flex items-center justify-between">
+                    <p class="text-xs font-semibold text-slate-500">Low Stock Alert</p>
+                    <div class="w-9 h-9 rounded-xl bg-purple-50 text-purple-600 flex items-center justify-center">
+                        <i data-lucide="alert-triangle" class="w-5 h-5"></i>
+                    </div>
+                </div>
+                <p id="stat-low-stock" class="text-2xl font-bold text-purple-700 mt-2">0</p>
+                <p id="stat-total-products" class="text-[11px] text-slate-400 mt-1">Total Items: 0</p>
+            </button>
+        </div>
+
+        <!-- Admin Sub-Navigation Tabs -->
+        <div class="admin-layout flex flex-col lg:flex-row gap-6 items-start">
+            <nav id="admin-sidebar" class="admin-sidebar w-full lg:w-64 lg:flex-shrink-0 bg-white rounded-2xl border border-slate-200 shadow-sm p-3 space-y-1" aria-label="Admin navigation">
+                <button type="button" onclick="switchAdminSubTab('orders')" data-subtab="orders" class="admin-sub-btn w-full px-4 py-2.5 rounded-xl text-sm font-bold bg-brand-600 text-white shadow-sm flex items-center justify-start gap-2">
+                    <i data-lucide="package-check" class="w-4 h-4"></i>
+                    <span>Orders & Invoices</span>
+                </button>
+                <button type="button" onclick="switchAdminSubTab('inventory')" data-subtab="inventory" class="admin-sub-btn w-full px-4 py-2.5 rounded-xl text-sm font-bold bg-white text-slate-700 hover:bg-slate-100 border border-slate-200 flex items-center justify-start gap-2">
+                    <i data-lucide="shirt" class="w-4 h-4"></i>
+                    <span>Products & Stock (Inventory)</span>
+                </button>
+                <button type="button" onclick="switchAdminSubTab('collections')" data-subtab="collections" class="admin-sub-btn w-full px-4 py-2.5 rounded-xl text-sm font-bold bg-white text-slate-700 hover:bg-slate-100 border border-slate-200 flex items-center justify-start gap-2">
+                    <i data-lucide="layout-grid" class="w-4 h-4"></i>
+                    <span>Collections</span>
+                </button>
+                <button type="button" onclick="switchAdminSubTab('expenses')" data-subtab="expenses" class="admin-sub-btn w-full px-4 py-2.5 rounded-xl text-sm font-bold bg-white text-slate-700 hover:bg-slate-100 border border-slate-200 flex items-center justify-start gap-2">
+                    <i data-lucide="wallet" class="w-4 h-4"></i>
+                    <span>Daily Expenses</span>
+                </button>
+                <button type="button" onclick="switchAdminSubTab('settings')" data-subtab="settings" class="admin-sub-btn w-full px-4 py-2.5 rounded-xl text-sm font-bold bg-white text-slate-700 hover:bg-slate-100 border border-slate-200 flex items-center justify-start gap-2">
+                    <i data-lucide="settings" class="w-4 h-4"></i>
+                    <span>Settings</span>
+                </button>
+                <button type="button" onclick="switchAdminSubTab('reports')" data-subtab="reports" class="admin-sub-btn w-full px-4 py-2.5 rounded-xl text-sm font-bold bg-white text-slate-700 hover:bg-slate-100 border border-slate-200 flex items-center justify-start gap-2">
+                    <i data-lucide="bar-chart-3" class="w-4 h-4"></i>
+                    <span>Reports</span>
+                </button>
+            </nav>
+
+            <div class="admin-content flex-1 min-w-0 w-full space-y-6">
+        <!-- SUB-TAB 1: ORDERS & INVOICE PRINTING -->
+        <div id="subtab-orders" class="admin-subtab-panel space-y-6">
+            <div class="bg-white p-6 rounded-2xl border border-slate-200 shadow-sm">
+                <div class="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4 mb-6 pb-4 border-b border-slate-100">
+                    <div>
+                        <h3 class="text-lg font-bold text-slate-900">All Customer Orders</h3>
+                        <p class="text-xs text-slate-500">Changing the order status updates stock automatically, and you can print the receipt.</p>
+                    </div>
+                    <select id="admin-order-filter" onchange="renderAdminOrders()" class="px-3.5 py-2 rounded-xl border border-slate-200 text-sm font-semibold bg-slate-50">
+                        <option value="All">All Orders</option>
+                        <option value="Pending">Pending</option>
+                        <option value="Processing">Processing</option>
+                        <option value="Delivered">Delivered</option>
+                        <option value="Cancelled">Cancelled</option>
+                    </select>
+                </div>
+
+                <div id="admin-orders-list" class="space-y-4">
+                    <!-- Orders injected here -->
+                </div>
+            </div>
+        </div>
+
+        <!-- SUB-TAB 2: PRODUCT & INVENTORY MANAGEMENT -->
+        <div id="subtab-inventory" class="admin-subtab-panel hidden grid grid-cols-1 lg:grid-cols-3 gap-8">
+            <!-- Add / Edit Product Form -->
+            <div class="lg:col-span-1">
+                <div class="bg-white p-6 rounded-2xl border border-slate-200 shadow-sm sticky top-24">
+                    <div class="flex items-center justify-between mb-5 pb-3 border-b border-slate-100">
+                        <div class="flex items-center gap-2">
+                            <i data-lucide="plus-circle" class="w-5 h-5 text-brand-600"></i>
+                            <h3 id="product-form-title" class="text-lg font-bold text-slate-900">Add New Product</h3>
+                        </div>
+                        <button id="cancel-edit-btn" onclick="resetProductForm()" class="hidden text-xs text-rose-600 font-bold hover:underline">Cancel</button>
+                    </div>
+
+                    <form id="product-form" onsubmit="handleSaveProduct(event)" class="space-y-4">
+                        <input type="hidden" id="edit-prod-id">
+                        
+                        <div>
+                            <label class="block text-xs font-bold text-slate-700 mb-1">Product Name *</label>
+                            <input type="text" id="prod-name" required placeholder="e.g. Premium Cotton Panjabi" class="w-full px-3.5 py-2.5 rounded-xl border border-slate-200 focus:outline-none focus:ring-2 focus:ring-brand-500 text-sm">
+                        </div>
+
+                        <div class="grid grid-cols-2 gap-3">
+                            <div>
+                                <label class="block text-xs font-bold text-slate-700 mb-1">Collection *</label>
+                                <select id="prod-category" class="w-full px-3 py-2.5 rounded-xl border border-slate-200 focus:outline-none focus:ring-2 focus:ring-brand-500 text-sm bg-white"></select>
+                            </div>
+                            <div>
+                                <label class="block text-xs font-bold text-slate-700 mb-1">Stock (Pcs) *</label>
+                                <input type="number" id="prod-stock" required min="0" value="20" class="w-full px-3.5 py-2.5 rounded-xl border border-slate-200 focus:outline-none focus:ring-2 focus:ring-brand-500 text-sm">
+                            </div>
+                        </div>
+
+                        <div class="grid grid-cols-2 gap-3">
+                            <div>
+                                <label class="block text-xs font-bold text-slate-700 mb-1">Buying Price (৳) *</label>
+                                <input type="number" id="prod-buying-price" required oninput="updateDiscountPreview()" min="1" placeholder="850" class="w-full px-3.5 py-2.5 rounded-xl border border-slate-200 focus:outline-none focus:ring-2 focus:ring-brand-500 text-sm bg-amber-50/30">
+                            </div>
+                            <div>
+                                <label class="block text-xs font-bold text-slate-700 mb-1">Selling Price (৳) *</label>
+                                <input type="number" id="prod-price" required oninput="updateDiscountPreview()" min="1" placeholder="1450" class="w-full px-3.5 py-2.5 rounded-xl border border-slate-200 focus:outline-none focus:ring-2 focus:ring-brand-500 text-sm bg-emerald-50/30">
+                            </div>
+                        </div>
+
+                        <!-- Discount -->
+                        <div class="p-3.5 rounded-xl border border-amber-200 bg-amber-50/50 space-y-2">
+                            <label class="block text-xs font-bold text-amber-900">Discount (optional)</label>
+                            <div class="grid grid-cols-2 gap-3">
+                                <select id="prod-discount-type" onchange="updateDiscountPreview()" class="w-full px-3 py-2.5 rounded-xl border border-slate-200 text-sm bg-white focus:outline-none focus:ring-2 focus:ring-brand-500">
+                                    <option value="none">No discount</option>
+                                    <option value="percent">Percentage (%)</option>
+                                    <option value="amount">Fixed amount (৳)</option>
+                                </select>
+                                <input type="number" id="prod-discount-value" min="0" step="1" value="0" oninput="updateDiscountPreview()" placeholder="Value" class="w-full px-3.5 py-2.5 rounded-xl border border-slate-200 text-sm focus:outline-none focus:ring-2 focus:ring-brand-500">
+                            </div>
+                            <p id="discount-preview" class="hidden text-xs font-semibold text-amber-900"></p>
+                        </div>
+
+                        <!-- Colours -->
+                        <div class="p-3.5 rounded-xl border border-slate-200 bg-slate-50/60 space-y-2.5">
+                            <label class="block text-xs font-bold text-slate-800">Colours (optional)</label>
+                            <p class="text-[11px] text-slate-500">Pick from the list or add your own colour:</p>
+                            <div id="color-presets" class="flex flex-wrap gap-1.5"></div>
+                            <div class="flex items-center gap-2">
+                                <input type="color" id="prod-color-hex" value="#7f1d1d" class="w-10 h-9 p-0.5 rounded-lg border border-slate-200 bg-white cursor-pointer shrink-0">
+                                <input type="text" id="prod-color-name" maxlength="30" placeholder="Colour name, e.g. Wine Red" onkeydown="if(event.key==='Enter'){event.preventDefault();addCustomColor();}" class="flex-1 min-w-0 px-3 py-2 rounded-lg border border-slate-200 text-xs bg-white focus:outline-none focus:ring-2 focus:ring-brand-500">
+                                <button type="button" onclick="addCustomColor()" class="px-3 py-2 rounded-lg bg-slate-900 text-white text-xs font-bold hover:bg-slate-800 shrink-0">Add</button>
+                            </div>
+                            <div>
+                                <p class="text-[11px] font-semibold text-slate-600 mb-1">Selected colours:</p>
+                                <div id="color-selected" class="flex flex-wrap gap-1.5"></div>
+                            </div>
+                        </div>
+
+                        <!-- Product photos -->
+                        <div class="p-3.5 rounded-xl border border-dashed border-brand-300 bg-brand-50/30 space-y-2.5">
+                            <label class="block text-xs font-bold text-brand-900">Product photos</label>
+                            <p class="text-[11px] text-slate-500">Upload several photos at once (up to 8). The first photo is the main one.</p>
+                            <input type="file" id="prod-image-file" accept="image/*" multiple onchange="handleImageFileUpload(event)" class="w-full text-xs text-slate-600 file:mr-3 file:py-1.5 file:px-3 file:rounded-lg file:border-0 file:text-xs file:font-semibold file:bg-brand-600 file:text-white hover:file:bg-brand-700 cursor-pointer">
+                            <p class="text-[11px] text-slate-500">Set a colour under each photo so customers can recognise it.</p>
+                            <div id="prod-gallery" class="grid grid-cols-2 gap-2"></div>
+                            <div class="flex items-center gap-2">
+                                <input type="text" id="prod-image" placeholder="Or add an image link (URL)..." onkeydown="if(event.key==='Enter'){event.preventDefault();addImageLink();}" class="flex-1 min-w-0 px-3 py-2 rounded-lg border border-slate-200 bg-white text-xs">
+                                <button type="button" onclick="addImageLink()" class="px-3 py-2 rounded-lg bg-slate-900 text-white text-xs font-bold hover:bg-slate-800 shrink-0">Add link</button>
+                            </div>
+                        </div>
+
+                        <div>
+                            <label class="block text-xs font-bold text-slate-700 mb-1">Description</label>
+                            <textarea id="prod-desc" rows="2" placeholder="Write about fabric quality, colour or size..." class="w-full px-3.5 py-2 rounded-xl border border-slate-200 focus:outline-none focus:ring-2 focus:ring-brand-500 text-sm"></textarea>
+                        </div>
+
+                        <button type="submit" id="save-product-submit-btn" class="w-full py-3 rounded-xl bg-brand-600 hover:bg-brand-700 text-white font-semibold shadow-md transition-all flex items-center justify-center gap-2">
+                            <i data-lucide="save" class="w-4 h-4"></i>
+                            <span>Save Product</span>
+                        </button>
+                    </form>
+                </div>
+            </div>
+
+            <!-- Inventory Table -->
+            <div class="lg:col-span-2">
+                <div class="bg-white p-6 rounded-2xl border border-slate-200 shadow-sm">
+                    <div class="flex justify-between items-center mb-5 pb-3 border-b border-slate-100">
+                        <h3 class="text-lg font-bold text-slate-900">Stock & Profit/Loss List</h3>
+                        <span class="text-xs text-slate-500">Only you can see the buying price</span>
+                    </div>
+
+                    <div id="admin-products-list" class="divide-y divide-slate-100">
+                        <!-- Inventory items injected here -->
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- SUB-TAB: COLLECTIONS (photo + name) -->
+        <div id="subtab-collections" class="admin-subtab-panel hidden">
+            <div class="bg-white p-6 rounded-2xl border border-slate-200 shadow-sm">
+                <div class="flex items-center justify-between gap-4 mb-5 pb-3 border-b border-slate-100">
+                    <div>
+                        <h3 class="text-lg font-bold text-slate-900">Your Collections</h3>
+                        <p class="text-xs text-slate-500 mt-1">These photos appear on the storefront. Customers tap a collection to see its clothes.</p>
+                    </div>
+                    <button type="button" onclick="openCollectionModal()" class="px-4 py-2.5 rounded-xl bg-brand-600 hover:bg-brand-700 text-white text-sm font-bold shadow-sm flex items-center gap-2 whitespace-nowrap">
+                        <i data-lucide="plus" class="w-4 h-4"></i>
+                        <span>Add New Collection</span>
+                    </button>
+                </div>
+                <div id="admin-collections-list" class="divide-y divide-slate-100"></div>
+            </div>
+        </div>
+
+        <!-- Collection Modal -->
+        <div id="collection-modal" class="fixed inset-0 z-50 hidden flex items-center justify-center p-4 no-print">
+            <div onclick="closeCollectionModal()" class="fixed inset-0 bg-slate-900/75 backdrop-blur-sm"></div>
+            <div class="bg-white rounded-2xl max-w-2xl w-full p-6 sm:p-8 relative z-10 shadow-2xl max-h-[90vh] overflow-y-auto">
+                <div class="flex justify-between items-start gap-4 pb-4 border-b border-slate-100 mb-5">
+                    <div class="flex items-center gap-2">
+                        <i data-lucide="layout-grid" class="w-5 h-5 text-brand-600"></i>
+                        <h3 id="col-form-title" class="text-lg font-bold text-slate-900">Add New Collection</h3>
+                    </div>
+                    <div class="flex items-center gap-2">
+                        <button id="col-cancel-btn" onclick="closeCollectionModal()" class="hidden text-xs text-rose-600 font-bold hover:underline">Cancel</button>
+                        <button type="button" onclick="closeCollectionModal()" class="p-2 rounded-xl text-slate-400 hover:bg-slate-100"><i data-lucide="x" class="w-4 h-4"></i></button>
+                    </div>
+                </div>
+                <form id="collection-form" onsubmit="handleSaveCollection(event)" class="space-y-4">
+                    <input type="hidden" id="edit-col-id">
+                    <div>
+                        <label class="block text-xs font-bold text-slate-700 mb-1">Collection Name *</label>
+                        <input type="text" id="col-name" required maxlength="40" placeholder="e.g. Winter Wear" class="w-full px-3.5 py-2.5 rounded-xl border border-slate-200 focus:outline-none focus:ring-2 focus:ring-brand-500 text-sm" oninput="renderCollectionProductSelector()">
+                    </div>
+                    <div class="p-3.5 rounded-xl border border-dashed border-brand-300 bg-brand-50/30 space-y-2">
+                        <label class="block text-xs font-bold text-brand-900">Cover Photo (upload or URL)</label>
+                        <input type="file" id="col-image-file" accept="image/*" onchange="handleCollectionImageUpload(event)" class="w-full text-xs text-slate-600 file:mr-3 file:py-1.5 file:px-3 file:rounded-lg file:border-0 file:text-xs file:font-semibold file:bg-brand-600 file:text-white hover:file:bg-brand-700 cursor-pointer">
+                        <div id="col-image-preview-box" class="hidden pt-2">
+                            <img id="col-image-preview-img" src="" class="h-28 w-24 object-cover rounded-lg border border-slate-200 shadow-sm">
+                        </div>
+                        <input type="text" id="col-image-url" placeholder="Or paste an image link (URL)..." class="w-full px-3 py-2 rounded-lg border border-slate-200 bg-white text-xs mt-1">
+                    </div>
+                    <div>
+                        <label class="block text-xs font-bold text-slate-700 mb-1">Assign Products to Collection</label>
+                        <div id="col-product-selector" class="max-h-48 overflow-y-auto rounded-xl border border-slate-200 divide-y divide-slate-100 bg-white"></div>
+                        <p class="text-[11px] text-slate-400 mt-1">Select products to assign. Products removed here will be unassigned from this collection.</p>
+                    </div>
+                    <button type="submit" class="w-full py-3 rounded-xl bg-brand-600 hover:bg-brand-700 text-white font-semibold shadow-md transition-all flex items-center justify-center gap-2">
+                        <i data-lucide="save" class="w-4 h-4"></i>
+                        <span>Save Collection</span>
+                    </button>
+                </form>
+            </div>
+        </div>
+
+        <!-- SUB-TAB 3: DAILY EXPENSE TRACKER -->
+        <div id="subtab-expenses" class="admin-subtab-panel hidden">
+            <div class="bg-white p-6 rounded-2xl border border-slate-200 shadow-sm">
+                <div class="flex items-center justify-between gap-4 mb-5 pb-3 border-b border-slate-100">
+                    <div>
+                        <h3 class="text-lg font-bold text-slate-900">Daily Expense List</h3>
+                    </div>
+                    <button type="button" onclick="openExpenseModal()" class="px-4 py-2.5 rounded-xl bg-brand-600 hover:bg-brand-700 text-white text-sm font-bold shadow-sm flex items-center gap-2 whitespace-nowrap">
+                        <i data-lucide="plus" class="w-4 h-4"></i>
+                        <span>Add New Expense</span>
+                    </button>
+                </div>
+                <div id="admin-expenses-list" class="divide-y divide-slate-100">
+                    <!-- Expenses injected here -->
+                </div>
+            </div>
+        </div>
+
+        <!-- Expense Modal -->
+        <div id="expense-modal" class="fixed inset-0 z-50 hidden flex items-center justify-center p-4 no-print">
+            <div onclick="closeExpenseModal()" class="fixed inset-0 bg-slate-900/75 backdrop-blur-sm"></div>
+            <div class="bg-white rounded-2xl max-w-lg w-full p-6 sm:p-8 relative z-10 shadow-2xl max-h-[90vh] overflow-y-auto">
+                <div class="flex justify-between items-center pb-4 border-b border-slate-100 mb-5">
+                    <h3 class="text-lg font-bold text-slate-900">Add New Expense</h3>
+                    <button type="button" onclick="closeExpenseModal()" class="p-2 rounded-xl text-slate-400 hover:bg-slate-100"><i data-lucide="x" class="w-4 h-4"></i></button>
+                </div>
+                <form onsubmit="handleAddExpense(event)" class="space-y-4">
+                    <div>
+                        <label class="block text-xs font-bold text-slate-700 mb-1">Expense Description *</label>
+                        <input type="text" id="exp-title" required placeholder="e.g. Shop rent / Packaging bags" class="w-full px-3.5 py-2.5 rounded-xl border border-slate-200 text-sm">
+                    </div>
+                    <div>
+                        <label class="block text-xs font-bold text-slate-700 mb-1">Expense Category *</label>
+                        <select id="exp-category" class="w-full px-3.5 py-2.5 rounded-xl border border-slate-200 text-sm bg-white">
+                            <option value="Shop rent & bills">Shop rent & electricity bill</option>
+                            <option value="Packaging & delivery">Packaging & courier cost</option>
+                            <option value="Marketing & boosting">Facebook boosting / marketing</option>
+                            <option value="Staff & hospitality">Staff salary & hospitality</option>
+                            <option value="Other">Other expenses</option>
+                        </select>
+                    </div>
+                    <div>
+                        <label class="block text-xs font-bold text-slate-700 mb-1">Amount (৳) *</label>
+                        <input type="number" id="exp-amount" required min="1" placeholder="500" class="w-full px-3.5 py-2.5 rounded-xl border border-slate-200 text-sm">
+                    </div>
+                    <button type="submit" class="w-full py-3 rounded-xl bg-rose-600 hover:bg-rose-700 text-white font-semibold shadow-sm transition-all">
+                        Add Expense
+                    </button>
+                </form>
+            </div>
+        </div>
+
+        <!-- SUB-TAB 4: SETTINGS -->
+        <div id="subtab-settings" class="admin-subtab-panel hidden w-full">
+            <div class="settings-layout grid grid-cols-1 lg:grid-cols-[220px_1fr] gap-6 items-start">
+                <nav class="settings-submenu bg-white rounded-2xl border border-slate-200 shadow-sm p-3 space-y-1" aria-label="Settings sections">
+                    <button type="button" onclick="switchSettingsSection('user-management')" data-settings-section="user-management" class="settings-submenu-btn w-full px-4 py-2.5 rounded-xl text-sm font-bold bg-brand-600 text-white flex items-center justify-start gap-2">
+                        <i data-lucide="users" class="w-4 h-4"></i>
+                        <span>User Management</span>
+                    </button>
+                    <button type="button" onclick="switchSettingsSection('access-control')" data-settings-section="access-control" class="settings-submenu-btn w-full px-4 py-2.5 rounded-xl text-sm font-bold bg-white text-slate-700 hover:bg-slate-100 border border-slate-200 flex items-center justify-start gap-2">
+                        <i data-lucide="shield-check" class="w-4 h-4"></i>
+                        <span>Access Control</span>
+                    </button>
+                    <button type="button" onclick="switchSettingsSection('page-setup')" data-settings-section="page-setup" class="settings-submenu-btn w-full px-4 py-2.5 rounded-xl text-sm font-bold bg-white text-slate-700 hover:bg-slate-100 border border-slate-200 flex items-center justify-start gap-2">
+                        <i data-lucide="file-cog" class="w-4 h-4"></i>
+                        <span>Page Setup</span>
+                    </button>
+                    <button type="button" onclick="switchSettingsSection('theme')" data-settings-section="theme" class="settings-submenu-btn w-full px-4 py-2.5 rounded-xl text-sm font-bold bg-white text-slate-700 hover:bg-slate-100 border border-slate-200 flex items-center justify-start gap-2">
+                        <i data-lucide="palette" class="w-4 h-4"></i>
+                        <span>Theme</span>
+                    </button>
+                    <button type="button" onclick="switchSettingsSection('invoice-setup')" data-settings-section="invoice-setup" class="settings-submenu-btn w-full px-4 py-2.5 rounded-xl text-sm font-bold bg-white text-slate-700 hover:bg-slate-100 border border-slate-200 flex items-center justify-start gap-2">
+                        <i data-lucide="file-text" class="w-4 h-4"></i>
+                        <span>Invoice Setup</span>
+                    </button>
+                </nav>
+
+                <div class="settings-content min-w-0 space-y-6">
+                    <section id="settings-user-management" class="settings-section bg-white p-6 sm:p-8 rounded-2xl border border-slate-200 shadow-sm">
+                        <div class="flex items-start justify-between gap-4 mb-6 pb-4 border-b border-slate-100">
+                            <div>
+                                <h3 class="text-xl font-bold text-slate-900 mb-2">User Management</h3>
+                                <p class="text-xs text-slate-500">Manage users, roles, and the primary Super Admin account.</p>
+                            </div>
+                            <button type="button" onclick="openUserModal()" class="px-4 py-2.5 rounded-xl bg-brand-600 hover:bg-brand-700 text-white text-sm font-bold shadow-sm flex items-center gap-2 whitespace-nowrap">
+                                <i data-lucide="user-plus" class="w-4 h-4"></i>
+                                <span>Add New User</span>
+                            </button>
+                        </div>
+
+                        <form onsubmit="handleSaveSettings(event)" class="space-y-4 mb-8">
+                            <h4 class="text-sm font-bold text-slate-900">Super Admin Account</h4>
+                            <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                                <div>
+                                    <label class="block text-xs font-bold text-slate-700 mb-1">Admin Username</label>
+                                    <input type="text" id="set-admin-user" required class="w-full px-4 py-2.5 rounded-xl border border-slate-200 text-sm">
+                                </div>
+                                <div>
+                                    <label class="block text-xs font-bold text-slate-700 mb-1">New Password</label>
+                                    <input type="password" id="set-admin-pass" autocomplete="new-password" placeholder="Leave empty to keep the current password" class="w-full px-4 py-2.5 rounded-xl border border-slate-200 text-sm">
+                                </div>
+                            </div>
+
+                            <button type="submit" class="w-full py-3 rounded-xl bg-slate-900 hover:bg-slate-800 text-white font-bold shadow-md transition-all mt-4">
+                                Save Super Admin
+                            </button>
+                        </form>
+
+                        <div id="users-list" class="divide-y divide-slate-100 rounded-xl border border-slate-200 overflow-hidden"></div>
+                    </section>
+
+                    <!-- Add New User Modal -->
+                    <div id="user-modal" class="fixed inset-0 z-50 hidden flex items-center justify-center p-4 no-print">
+                        <div onclick="closeUserModal()" class="fixed inset-0 bg-slate-900/75 backdrop-blur-sm"></div>
+                        <div class="bg-white rounded-2xl max-w-lg w-full p-6 sm:p-8 relative z-10 shadow-2xl max-h-[90vh] overflow-y-auto">
+                            <div class="flex justify-between items-center pb-4 border-b border-slate-100 mb-5">
+                                <h3 class="text-lg font-bold text-slate-900">Add New User</h3>
+                                <button type="button" onclick="closeUserModal()" class="p-2 rounded-xl text-slate-400 hover:bg-slate-100"><i data-lucide="x" class="w-4 h-4"></i></button>
+                            </div>
+                            <form id="add-user-form" onsubmit="handleAddUser(event)" class="space-y-4">
+                                <div>
+                                    <label class="block text-xs font-bold text-slate-700 mb-1">Full Name *</label>
+                                    <input type="text" id="user-full-name" required maxlength="120" autocomplete="name" class="w-full px-4 py-2.5 rounded-xl border border-slate-200 text-sm" placeholder="Full name">
+                                </div>
+                                <div>
+                                    <label class="block text-xs font-bold text-slate-700 mb-1">Role *</label>
+                                    <select id="user-role" required class="w-full px-4 py-2.5 rounded-xl border border-slate-200 text-sm bg-white">
+                                        <option value="Admin">Admin</option>
+                                        <option value="Manager">Manager</option>
+                                        <option value="Salesman">Salesman</option>
+                                        <option value="Marketing">Marketing</option>
+                                    </select>
+                                </div>
+                                <div>
+                                    <label class="block text-xs font-bold text-slate-700 mb-1">Email ID *</label>
+                                    <input type="email" id="user-email" required autocomplete="email" class="w-full px-4 py-2.5 rounded-xl border border-slate-200 text-sm" placeholder="name@example.com" pattern="^[A-Za-z0-9._%+\\-]+@[A-Za-z0-9.\\-]+\\.[A-Za-z]{2,}$">
+                                </div>
+                                <div>
+                                    <label class="block text-xs font-bold text-slate-700 mb-1">Password *</label>
+                                    <input type="password" id="user-password" required minlength="10" autocomplete="new-password" class="w-full px-4 py-2.5 rounded-xl border border-slate-200 text-sm" placeholder="At least 10 characters">
+                                    <p class="text-[11px] text-slate-400 mt-1">Must include uppercase, lowercase, number, and special character.</p>
+                                </div>
+                                <button type="submit" class="w-full py-3 rounded-xl bg-brand-600 hover:bg-brand-700 text-white font-bold shadow-md transition-all">
+                                    Add New User
+                                </button>
+                            </form>
+                        </div>
+                    </div>
+
+                    <section id="settings-access-control" class="settings-section hidden bg-white p-6 sm:p-8 rounded-2xl border border-slate-200 shadow-sm">
+                        <h3 class="text-xl font-bold text-slate-900 mb-2">Access Control</h3>
+                        <p class="text-xs text-slate-500 mb-6 pb-4 border-b border-slate-100">Customize exact permissions individually for each user. Super Admin always has full access and cannot be removed.</p>
+
+                        <div class="rounded-xl border border-slate-200 bg-slate-50 p-4 mb-5">
+                            <p class="text-xs font-bold uppercase tracking-wider text-slate-500">Super Admin</p>
+                            <p id="access-admin-user" class="text-sm font-bold text-slate-900 mt-1">—</p>
+                            <p class="text-xs text-slate-500 mt-1">Full access. Only Super Admin can delete user accounts.</p>
+                        </div>
+
+                        <div class="grid grid-cols-1 lg:grid-cols-[240px_1fr] gap-5">
+                            <div>
+                                <label class="block text-xs font-bold text-slate-700 mb-1">Select User</label>
+                                <select id="access-user-id" onchange="renderAccessMatrix()" class="w-full px-3.5 py-2.5 rounded-xl border border-slate-200 text-sm bg-white"></select>
+                                <p class="text-[11px] text-slate-400 mt-2">Choose a specific user to view and edit their permission matrix.</p>
+                            </div>
+                            <div id="access-permissions-matrix" class="space-y-2"></div>
+                        </div>
+                    </section>
+
+                    <section id="settings-page-setup" class="settings-section hidden bg-white p-6 sm:p-8 rounded-2xl border border-slate-200 shadow-sm">
+                        <h3 class="text-xl font-bold text-slate-900 mb-2">Page Setup</h3>
+                        <p class="text-xs text-slate-500 mb-6 pb-4 border-b border-slate-100">Customize the panel title, shop details, logo, and dashboard theme.</p>
+
+                        <form onsubmit="handleSaveSettings(event)" class="space-y-4">
+                            <div>
+                                <label class="block text-xs font-bold text-slate-700 mb-1">Page Name</label>
+                                <input type="text" id="page-name" required class="w-full px-4 py-2.5 rounded-xl border border-slate-200 text-sm" placeholder="Website / panel title">
+                            </div>
+
+                            <div>
+                                <label class="block text-xs font-bold text-slate-700 mb-1">Shop Name</label>
+                                <input type="text" id="set-shop-name" required class="w-full px-4 py-2.5 rounded-xl border border-slate-200 text-sm">
+                            </div>
+                            <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                                <div>
+                                    <label class="block text-xs font-bold text-slate-700 mb-1">Shop Mobile Number</label>
+                                    <input type="text" id="set-shop-phone" required class="w-full px-4 py-2.5 rounded-xl border border-slate-200 text-sm">
+                                </div>
+                                <div>
+                                    <label class="block text-xs font-bold text-slate-700 mb-1">bKash / Nagad Payment Number</label>
+                                    <input type="text" id="set-payment-number" required class="w-full px-4 py-2.5 rounded-xl border border-slate-200 text-sm">
+                                </div>
+                            </div>
+                            <div>
+                                <label class="block text-xs font-bold text-slate-700 mb-1">Shop Address (shown on invoice)</label>
+                                <input type="text" id="set-shop-address" required class="w-full px-4 py-2.5 rounded-xl border border-slate-200 text-sm">
+                            </div>
+
+                            <div class="pt-4 border-t border-slate-100">
+                                <h4 class="text-sm font-bold text-slate-900 mb-3">Logo Upload</h4>
+                                <div class="flex flex-col sm:flex-row items-start sm:items-center gap-4">
+                                    <img id="settings-logo-preview" src="/logo.png?v=2" alt="Current site logo" class="w-16 h-16 rounded-xl object-cover border border-slate-200 bg-white">
+                                    <div class="space-y-2 w-full">
+                                        <input type="file" id="logo-upload" accept="image/*" class="block w-full text-sm text-slate-500 file:mr-3 file:py-2 file:px-4 file:rounded-xl file:border-0 file:text-sm file:font-bold file:bg-slate-900 file:text-white hover:file:bg-slate-800">
+                                        <button type="button" onclick="uploadSiteLogo()" class="px-4 py-2.5 rounded-xl bg-brand-600 hover:bg-brand-700 text-white text-sm font-bold">
+                                            Upload Logo
+                                        </button>
+                                    </div>
+                                </div>
+                            </div>
+
+                            
+                            <div class="pt-4 border-t border-slate-100">
+                                <label class="flex items-center justify-between gap-4 rounded-xl border border-slate-200 bg-slate-50 p-4 cursor-pointer">
+                                    <span>
+                                        <span class="block text-sm font-bold text-slate-900">Show Stock Count to Customers</span>
+                                        <span class="block text-xs text-slate-500 mt-1">Show or hide `Stock: XX` on public storefront product cards.</span>
+                                    </span>
+                                    <span class="stock-switch relative inline-flex h-7 w-12 shrink-0 items-center rounded-full bg-slate-300 transition-colors">
+                                        <input type="checkbox" id="set-show-stock" checked onchange="renderProducts()" role="switch" aria-label="Show Stock Count to Customers" class="peer sr-only">
+                                        <span class="absolute left-1 h-5 w-5 rounded-full bg-white shadow transition-transform"></span>
+                                    </span>
+                                </label>
+                            </div>
+
+                            <button type="submit" class="w-full py-3 rounded-xl bg-slate-900 hover:bg-slate-800 text-white font-bold shadow-md transition-all mt-4">
+                                Save Page Setup
+                            </button>
+                        </form>
+                    </section>
+<section id="settings-theme" class="settings-section hidden bg-white p-6 sm:p-8 rounded-2xl border border-slate-200 shadow-sm">
+    <h3 class="text-lg font-bold text-slate-900 mb-1">Theme</h3>
+    <p class="text-xs text-slate-500 mb-6 pb-4 border-b border-slate-100">Choose from 24 professional UI themes. Selecting a theme applies it to the dashboard immediately.</p>
+    <div id="theme-selector" class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3" data-selected="classic-pink"></div>
+</section>
+
+<section id="settings-invoice-setup" class="settings-section hidden bg-white p-6 sm:p-8 rounded-2xl border border-slate-200 shadow-sm">
+    <h3 class="text-lg font-bold text-slate-900 mb-1">Invoice Setup</h3>
+    <p class="text-xs text-slate-500 mb-6 pb-4 border-b border-slate-100">Custom TAHAM Official Pad template and printable safe-zone margins.</p>
+
+    <div class="space-y-6">
+        <div>
+            <h4 class="text-sm font-bold text-slate-900 mb-3">Custom Pad Upload &amp; Live Sync</h4>
+            <p class="text-xs text-slate-500 mb-3">Upload or replace the official pad template. Applies to invoices, delivery slips, Daily Report, Monthly Report, and every generated print page.</p>
+            <div class="flex flex-col sm:flex-row gap-4 items-start">
+                <img id="invoice-pad-preview" src="/official-pad-background.jpg" alt="Invoice pad preview" class="w-40 h-auto rounded-xl border border-slate-200 bg-white">
+                <div class="flex-1 space-y-3">
+                    <input type="file" id="invoice-pad-upload" accept="image/*" class="block w-full text-sm text-slate-500 file:mr-3 file:py-2 file:px-4 file:rounded-xl file:border-0 file:text-sm file:font-bold file:bg-slate-900 file:text-white hover:file:bg-slate-800">
+                    <button type="button" onclick="uploadInvoicePad()" class="px-4 py-2.5 rounded-xl bg-brand-600 hover:bg-brand-700 text-white text-sm font-bold">Upload Pad Template</button>
+                    <p id="invoice-pad-url" class="text-[11px] text-slate-500"></p>
+                </div>
+            </div>
+        </div>
+
+        <div class="pt-4 border-t border-slate-100">
+            <h4 class="text-sm font-bold text-slate-900 mb-3">Configurable Print Margins</h4>
+            <p class="text-xs text-slate-500 mb-3">Safe zone in millimetres. Content stays clear of the pad header and bottom signature/footer.</p>
+            <div class="grid grid-cols-2 sm:grid-cols-4 gap-3">
+                <label class="block text-xs font-bold text-slate-700">Top Margin<input type="number" id="invoice-margin-top" min="0" step="1" value="58" oninput="updateInvoicePadPreview(); saveInvoiceSetup();" class="mt-1 w-full px-3 py-2 rounded-xl border border-slate-200 text-sm"></label>
+                <label class="block text-xs font-bold text-slate-700">Bottom Margin<input type="number" id="invoice-margin-bottom" min="0" step="1" value="48" oninput="updateInvoicePadPreview(); saveInvoiceSetup();" class="mt-1 w-full px-3 py-2 rounded-xl border border-slate-200 text-sm"></label>
+                <label class="block text-xs font-bold text-slate-700">Left Margin<input type="number" id="invoice-margin-left" min="0" step="1" value="18" oninput="updateInvoicePadPreview(); saveInvoiceSetup();" class="mt-1 w-full px-3 py-2 rounded-xl border border-slate-200 text-sm"></label>
+                <label class="block text-xs font-bold text-slate-700">Right Margin<input type="number" id="invoice-margin-right" min="0" step="1" value="18" oninput="updateInvoicePadPreview(); saveInvoiceSetup();" class="mt-1 w-full px-3 py-2 rounded-xl border border-slate-200 text-sm"></label>
+            </div>
+            <p class="text-[11px] text-slate-500 mt-2">Units: mm. <button type="button" onclick="saveInvoiceSetup()" class="ml-2 px-3 py-1 rounded-lg bg-slate-900 text-white font-bold">Save Invoice Setup</button></p>
+        </div>
+
+        <div id="invoice-pad-live-preview" class="invoice-pad-live-preview" aria-label="Invoice pad live preview">
+            <img class="invoice-pad-live-bg" src="/official-pad-background.jpg" alt="">
+            <div id="invoice-pad-live-safe" class="invoice-pad-live-safe">
+                <strong>TAHAM Official Pad</strong>
+                <span>Safe printable area</span>
+                <span id="invoice-pad-live-dims">58mm / 48mm / 18mm / 18mm</span>
+            </div>
+        </div>
+    </div>
+</section>
+
+                </div>
+            </div>
+        </div>
+
+        <!-- SUB-TAB: REPORTS -->
+        <div id="subtab-reports" class="admin-subtab-panel hidden w-full">
+            <div class="bg-white p-6 rounded-2xl border border-slate-200 shadow-sm space-y-6">
+                <div class="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4 pb-4 border-b border-slate-100">
+                    <div>
+                        <h3 class="text-xl font-bold text-slate-900">Reports</h3>
+                        <p class="text-xs text-slate-500 mt-1">Financial summaries, order summaries, and calendar filtering.</p>
+                    </div>
+                    <div class="flex gap-2" role="tablist">
+                        <button type="button" onclick="switchReportView('daily')" data-report-tab="daily" class="report-tab px-4 py-2 rounded-xl text-sm font-bold bg-brand-600 text-white">Daily Report</button>
+                        <button type="button" onclick="switchReportView('monthly')" data-report-tab="monthly" class="report-tab px-4 py-2 rounded-xl text-sm font-bold bg-white text-slate-700 border border-slate-200">Monthly Report</button>
+                        <button type="button" onclick="printReport()" class="report-print-btn no-print px-4 py-2 rounded-xl text-sm font-bold bg-slate-900 text-white hover:bg-slate-800">Print Report</button>
+                    </div>
+                </div>
+
+                <div id="report-daily" class="report-view space-y-4">
+                    <div class="rounded-xl border border-slate-200 bg-slate-50 p-4">
+                        <h4 class="text-sm font-bold text-slate-900 mb-3">Calendar Date Filter</h4>
+                        <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
+                            <div>
+                                <label class="block text-xs font-bold text-slate-700 mb-1">Specific Date</label>
+                                <input type="date" id="daily-report-date" onchange="renderReports()" class="w-full px-3 py-2 rounded-xl border border-slate-200 bg-white text-sm">
+                            </div>
+                            <div>
+                                <label class="block text-xs font-bold text-slate-700 mb-1">From Date</label>
+                                <input type="date" id="daily-report-from" onchange="renderReports()" class="w-full px-3 py-2 rounded-xl border border-slate-200 bg-white text-sm">
+                            </div>
+                            <div>
+                                <label class="block text-xs font-bold text-slate-700 mb-1">To Date</label>
+                                <input type="date" id="daily-report-to" onchange="renderReports()" class="w-full px-3 py-2 rounded-xl border border-slate-200 bg-white text-sm">
+                            </div>
+                            <div class="flex items-end">
+                                <button type="button" onclick="clearReportFilters('daily')" class="w-full px-3 py-2 rounded-xl bg-white text-slate-700 border border-slate-200 text-sm font-bold hover:bg-slate-100">Clear Filters</button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <div id="report-monthly" class="report-view hidden space-y-4">
+                    <div class="rounded-xl border border-slate-200 bg-slate-50 p-4">
+                        <h4 class="text-sm font-bold text-slate-900 mb-3">Calendar Month Filter</h4>
+                        <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
+                            <div>
+                                <label class="block text-xs font-bold text-slate-700 mb-1">Month</label>
+                                <input type="month" id="monthly-report-month" onchange="renderReports()" class="w-full px-3 py-2 rounded-xl border border-slate-200 bg-white text-sm">
+                            </div>
+                            <div>
+                                <label class="block text-xs font-bold text-slate-700 mb-1">From Date</label>
+                                <input type="date" id="monthly-report-from" onchange="renderReports()" class="w-full px-3 py-2 rounded-xl border border-slate-200 bg-white text-sm">
+                            </div>
+                            <div>
+                                <label class="block text-xs font-bold text-slate-700 mb-1">To Date</label>
+                                <input type="date" id="monthly-report-to" onchange="renderReports()" class="w-full px-3 py-2 rounded-xl border border-slate-200 bg-white text-sm">
+                            </div>
+                            <div class="flex items-end">
+                                <button type="button" onclick="clearReportFilters('monthly')" class="w-full px-3 py-2 rounded-xl bg-white text-slate-700 border border-slate-200 text-sm font-bold hover:bg-slate-100">Clear Filters</button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <div id="report-print-area" class="print-pad report-print-area">
+                    <div class="report-print-header">
+                        <p id="report-type" class="report-print-kicker">Daily Report</p>
+                        <h4 class="report-print-title">Financial Summary &amp; Breakdown</h4>
+                        <p id="report-period" class="report-print-period"></p>
+                        <p id="report-generated-by" class="report-print-generated"></p>
+                    </div>
+
+                    <div id="report-metrics" class="report-metrics-grid grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4"></div>
+
+                    <div class="report-orders-wrap">
+                        <h4 class="report-orders-title">Order Summaries / Itemized Records</h4>
+                        <div id="report-orders" class="report-orders"></div>
+                    </div>
+                </div>
+            </div>
+        </div>
+            </div>
+        </div>
+    </main>
+
+    <!-- ========================================== -->
+    <!-- 3. SUPER ADMIN LOGIN MODAL                 -->
+    <!-- ========================================== -->
+    <div id="admin-login-modal" class="fixed inset-0 z-50 hidden flex items-center justify-center p-4 no-print">
+        <div onclick="closeAdminLoginModal()" class="fixed inset-0 bg-slate-900/75 backdrop-blur-sm"></div>
+        <div class="bg-white rounded-2xl max-w-md w-full p-6 sm:p-8 relative z-10 shadow-2xl">
+            <div class="flex justify-between items-center pb-4 border-b border-slate-100 mb-5">
+                <div class="flex items-center gap-2.5">
+                    <div class="w-10 h-10 rounded-xl bg-slate-900 text-pink-400 flex items-center justify-center">
+                        <i data-lucide="shield-check" class="w-5 h-5"></i>
+                    </div>
+                    <div>
+                        <h3 class="text-lg font-bold text-slate-900">Super Admin Login</h3>
+                        <p class="text-xs text-slate-500">Reserved for the shop owner only</p>
+                    </div>
+                </div>
+                <button onclick="closeAdminLoginModal()" class="p-2 rounded-xl text-slate-400 hover:bg-slate-100">
+                    <i data-lucide="x" class="w-5 h-5"></i>
+                </button>
+            </div>
+
+            <form onsubmit="handleAdminLogin(event)" class="space-y-4" autocomplete="on" name="admin-login">
+                <div>
+                    <label class="block text-xs font-bold text-slate-700 mb-1">Username</label>
+                    <input type="text" id="login-username" name="username" required autocomplete="username" autocapitalize="none" autocorrect="off" spellcheck="false" placeholder="Enter username" class="w-full px-4 py-2.5 rounded-xl border border-slate-200 focus:outline-none focus:ring-2 focus:ring-brand-500 text-sm">
+                </div>
+                <div>
+                    <label class="block text-xs font-bold text-slate-700 mb-1">Password</label>
+                    <input type="password" id="login-password" name="password" required autocomplete="current-password" spellcheck="false" placeholder="••••" class="w-full px-4 py-2.5 rounded-xl border border-slate-200 focus:outline-none focus:ring-2 focus:ring-brand-500 text-sm">
+                </div>
+
+                <button type="submit" class="w-full py-3 rounded-xl bg-slate-900 hover:bg-slate-800 text-white font-bold shadow-lg transition-all">
+                    Enter Dashboard
+                </button>
+            </form>
+        </div>
+    </div>
+
+    <!-- ========================================== -->
+    <!-- 4. SLIDE-OVER SHOPPING CART DRAWER         -->
+    <!-- ========================================== -->
+    <div id="cart-drawer" class="fixed inset-0 z-50 hidden no-print">
+        <div onclick="toggleCart(false)" class="fixed inset-0 bg-slate-900/60 backdrop-blur-sm"></div>
+        <div class="fixed inset-y-0 right-0 max-w-md w-full bg-white shadow-2xl flex flex-col z-10">
+            <div class="px-6 py-4 border-b border-slate-200 flex justify-between items-center bg-slate-50">
+                <div class="flex items-center gap-2">
+                    <i data-lucide="shopping-bag" class="w-5 h-5 text-brand-600"></i>
+                    <h3 class="text-lg font-bold text-slate-900">Your Shopping Bag</h3>
+                </div>
+                <button onclick="toggleCart(false)" class="p-2 rounded-xl text-slate-500 hover:bg-slate-200">
+                    <i data-lucide="x" class="w-5 h-5"></i>
+                </button>
+            </div>
+
+            <div id="cart-items-container" class="flex-1 overflow-y-auto p-6 space-y-4">
+                <!-- Cart items rendered dynamically -->
+            </div>
+
+            <div id="cart-footer" class="p-6 border-t border-slate-200 bg-slate-50 space-y-4">
+                <!-- Delivery Zone Selector -->
+                <div>
+                    <label class="block text-xs font-bold text-slate-700 mb-1.5">Choose delivery area:</label>
+                    <div class="grid grid-cols-2 gap-2">
+                        <label class="cursor-pointer">
+                            <input type="radio" name="delivery_zone" value="60" checked onchange="updateCartUI()" class="peer sr-only">
+                            <div class="p-2 rounded-xl border border-slate-200 peer-checked:border-brand-600 peer-checked:bg-brand-50 text-center text-xs font-bold">
+                                Inside Dhaka (৳ 60)
+                            </div>
+                        </label>
+                        <label class="cursor-pointer">
+                            <input type="radio" name="delivery_zone" value="120" onchange="updateCartUI()" class="peer sr-only">
+                            <div class="p-2 rounded-xl border border-slate-200 peer-checked:border-brand-600 peer-checked:bg-brand-50 text-center text-xs font-bold">
+                                Outside Dhaka (৳ 120)
+                            </div>
+                        </label>
+                    </div>
+                </div>
+
+                <div class="space-y-1 text-sm">
+                    <div class="flex justify-between text-slate-600">
+                        <span>Subtotal:</span>
+                        <span id="cart-subtotal" class="font-semibold">৳ 0</span>
+                    </div>
+                    <div class="flex justify-between text-slate-600">
+                        <span>Delivery Charge:</span>
+                        <span id="cart-delivery-display" class="font-semibold text-emerald-600">৳ 60</span>
+                    </div>
+                    <div class="flex justify-between text-base font-bold text-slate-900 pt-2 border-t border-slate-200">
+                        <span>Grand Total:</span>
+                        <span id="cart-total" class="text-brand-700 text-lg">৳ 0</span>
+                    </div>
+                </div>
+
+                <button onclick="openCheckoutModal()" class="w-full py-3.5 rounded-xl bg-brand-600 hover:bg-brand-700 text-white font-bold shadow-lg transition-all flex items-center justify-center gap-2">
+                    <span>Confirm Order</span>
+                    <i data-lucide="arrow-right" class="w-5 h-5"></i>
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <!-- ========================================== -->
+    <!-- 5. CHECKOUT MODAL (COD / bKash / Nagad)    -->
+    <!-- ========================================== -->
+    <div id="checkout-modal" class="fixed inset-0 z-50 hidden flex items-center justify-center p-4 no-print">
+        <div onclick="closeCheckoutModal()" class="fixed inset-0 bg-slate-900/70 backdrop-blur-sm"></div>
+        <div class="bg-white rounded-2xl max-w-lg w-full p-6 sm:p-8 relative z-10 shadow-2xl max-h-[90vh] overflow-y-auto">
+            <div class="flex justify-between items-center pb-4 border-b border-slate-100 mb-5">
+                <div>
+                    <h3 class="text-xl font-bold text-slate-900">Delivery & Payment Details</h3>
+                    <p class="text-xs text-slate-500">You will get a receipt as soon as the order is complete</p>
+                </div>
+                <button onclick="closeCheckoutModal()" class="p-2 rounded-xl text-slate-400 hover:bg-slate-100">
+                    <i data-lucide="x" class="w-5 h-5"></i>
+                </button>
+            </div>
+
+            <form id="checkout-form" onsubmit="submitCustomerOrder(event)" class="space-y-4">
+                <div>
+                    <label class="block text-xs font-bold text-slate-700 mb-1">Full Name *</label>
+                    <input type="text" id="cust-name" required placeholder="e.g. Tanvir Ahmed" class="w-full px-4 py-2.5 rounded-xl border border-slate-200 text-sm">
+                </div>
+
+                <div>
+                    <label class="block text-xs font-bold text-slate-700 mb-1">Phone Number *</label>
+                    <input type="tel" id="cust-phone" required placeholder="017XXXXXXXX" class="w-full px-4 py-2.5 rounded-xl border border-slate-200 text-sm">
+                </div>
+
+                <div>
+                    <label class="block text-xs font-bold text-slate-700 mb-1">Delivery Address *</label>
+                    <textarea id="cust-address" rows="2" required placeholder="House no, road, area, thana and district..." class="w-full px-4 py-2.5 rounded-xl border border-slate-200 text-sm"></textarea>
+                </div>
+
+                <!-- Optional Custom Design Instructions -->
+                <div id="custom-design-section" class="rounded-2xl border border-slate-200 bg-slate-50 p-4 space-y-3">
+                    <div class="flex items-center justify-between gap-3">
+                        <div>
+                            <h4 class="text-sm font-bold text-slate-900">Custom Design Instructions</h4>
+                            <p class="text-[11px] text-slate-500">Optional. Add print placement, text, color changes, sizing notes, or attach a mockup.</p>
+                        </div>
+                        <span class="text-[10px] font-bold uppercase tracking-wider text-slate-400 bg-white px-2 py-1 rounded-lg border border-slate-200">Optional</span>
+                    </div>
+                    <div>
+                        <label class="block text-xs font-bold text-slate-700 mb-1">Custom Design Notes</label>
+                        <textarea id="custom-design-notes" rows="3" maxlength="2000" placeholder="e.g. Place logo on left chest, use black thread, change sleeve color, custom text..." class="w-full px-3.5 py-2.5 rounded-xl border border-slate-200 bg-white text-sm"></textarea>
+                    </div>
+                    <div>
+                        <label class="block text-xs font-bold text-slate-700 mb-1">Reference Image / Mockup</label>
+                        <input type="file" id="custom-design-reference" accept="image/*" onchange="handleCustomDesignReferenceUpload(event)" class="block w-full text-sm text-slate-500 file:mr-3 file:py-2 file:px-4 file:rounded-xl file:border-0 file:text-sm file:font-bold file:bg-slate-900 file:text-white hover:file:bg-slate-800">
+                        <div id="custom-design-reference-preview" class="hidden pt-2">
+                            <img id="custom-design-reference-img" src="" alt="Custom design reference" class="h-28 w-28 object-cover rounded-xl border border-slate-200 bg-white">
+                            <button type="button" onclick="clearCustomDesignReference()" class="mt-2 text-xs text-rose-600 font-bold hover:underline">Remove reference image</button>
+                        </div>
+                    </div>
+                </div>
+
+                <div>
+                    <label class="block text-xs font-bold text-slate-700 mb-2">Choose payment method *</label>
+                    <div class="grid grid-cols-3 gap-2.5">
+                        <label class="cursor-pointer">
+                            <input type="radio" name="payment_method" value="Cash on Delivery" checked onchange="toggleTrxField(false)" class="peer sr-only">
+                            <div class="p-3 rounded-xl border-2 border-slate-200 peer-checked:border-brand-600 peer-checked:bg-brand-50 text-center">
+                                <p class="font-bold text-xs text-slate-800">Cash on Delivery</p>
+                                <p class="text-[10px] text-slate-500">Pay when you receive</p>
+                            </div>
+                        </label>
+                        <label class="cursor-pointer">
+                            <input type="radio" name="payment_method" value="bKash" onchange="toggleTrxField(true)" class="peer sr-only">
+                            <div class="p-3 rounded-xl border-2 border-slate-200 peer-checked:border-pink-600 peer-checked:bg-pink-50 text-center">
+                                <p class="font-bold text-xs text-pink-600">bKash</p>
+                                <p class="text-[10px] text-slate-500">Send Money</p>
+                            </div>
+                        </label>
+                        <label class="cursor-pointer">
+                            <input type="radio" name="payment_method" value="Nagad" onchange="toggleTrxField(true)" class="peer sr-only">
+                            <div class="p-3 rounded-xl border-2 border-slate-200 peer-checked:border-orange-500 peer-checked:bg-orange-50 text-center">
+                                <p class="font-bold text-xs text-orange-600">Nagad</p>
+                                <p class="text-[10px] text-slate-500">Send Money</p>
+                            </div>
+                        </label>
+                    </div>
+                </div>
+
+                <!-- Optional Transaction ID for bKash / Nagad -->
+                <div id="trx-id-box" class="hidden bg-pink-50/70 p-3.5 rounded-xl border border-pink-200 space-y-2">
+                    <p class="text-xs text-pink-900">Our merchant/personal number: <strong id="checkout-merchant-num">01700-000000</strong></p>
+                    <input type="text" id="cust-trx-id" placeholder="Enter TrxID (optional)" class="w-full px-3 py-2 rounded-lg border border-pink-200 bg-white text-xs">
+                </div>
+
+                <div class="bg-slate-50 p-3.5 rounded-xl border border-slate-200 flex justify-between items-center">
+                    <span class="text-sm font-semibold text-slate-700">Total payable:</span>
+                    <span id="modal-order-total" class="text-lg font-bold text-brand-700">৳ 0</span>
+                </div>
+
+                <button type="submit" id="place-order-btn" class="w-full py-3.5 rounded-xl bg-brand-600 hover:bg-brand-700 text-white font-bold shadow-lg transition-all">
+                    Place Order
+                </button>
+            </form>
+        </div>
+    </div>
+
+    <!-- ========================================== -->
+    <!-- 6. PRINTABLE INVOICE / CASH MEMO MODAL     -->
+    <!-- ========================================== -->
+    <div id="invoice-modal" class="fixed inset-0 z-50 hidden flex items-center justify-center p-4">
+        <div onclick="closeInvoiceModal()" class="fixed inset-0 bg-slate-900/75 backdrop-blur-sm no-print"></div>
+        <div class="bg-white rounded-2xl max-w-4xl w-full p-6 sm:p-8 relative z-10 shadow-2xl max-h-[92vh] overflow-y-auto">
+            <!-- Printable Area -->
+            <div id="invoice-print-area" class="invoice-pad print-pad">
+                <div class="invoice-accent-stripe" aria-hidden="true"></div>
+                <div class="invoice-watermark" aria-hidden="true">TAHAM</div>
+
+                <header class="invoice-header">
+                    <div class="invoice-brand">
+                        <img src="/logo.png?v=2" alt="TAHAM" class="invoice-logo">
+                        <div>
+                            <h2 id="inv-shop-name" class="invoice-title">TAHAM</h2>
+                            <p class="invoice-subtitle">Premium &amp; Custom Fashion Wear</p>
+                            <p id="inv-shop-address" class="invoice-address">Rayerbag, Dhaka, Bangladesh</p>
+                        </div>
+                    </div>
+                    <div class="invoice-order-heading">
+                        <span class="invoice-badge">INVOICE / CASH MEMO</span>
+                        <p class="invoice-helpline">Facebook · WhatsApp 01400570014 · taham.info@gmail.com</p>
+                    </div>
+                </header>
+
+                <section class="invoice-info-grid">
+                    <div class="invoice-box invoice-customer-box">
+                        <h4 class="invoice-box-title">Customer Information</h4>
+                        <p class="invoice-label">Customer Name</p>
+                        <p id="inv-cust-name" class="invoice-value"></p>
+                        <p class="invoice-label">Phone Number</p>
+                        <p id="inv-cust-phone" class="invoice-value"></p>
+                        <p class="invoice-label">Delivery Address</p>
+                        <p id="inv-cust-address" class="invoice-value invoice-address-value"></p>
+                    </div>
+
+                    <div class="invoice-box invoice-order-box">
+                        <h4 class="invoice-box-title">Order Details</h4>
+                        <div class="invoice-order-row">
+                            <span class="invoice-label">Memo / Invoice No</span>
+                            <span id="inv-order-id" class="invoice-value">#ORD-000000</span>
+                        </div>
+                        <div class="invoice-order-row">
+                            <span class="invoice-label">Order Date</span>
+                            <span id="inv-order-date" class="invoice-value"></span>
+                        </div>
+                        <div class="invoice-order-row">
+                            <span class="invoice-label">Courier / Delivery Method</span>
+                            <span id="inv-courier" class="invoice-value"></span>
+                        </div>
+                        <div class="invoice-order-row">
+                            <span class="invoice-label">Status</span>
+                            <span id="inv-status" class="invoice-status"></span>
+                        </div>
+                        <p id="inv-order-no" class="hidden" aria-hidden="true"></p>
+                        <p id="inv-shop-phone" class="hidden" aria-hidden="true"></p>
+                    </div>
+                </section>
+
+                <table class="invoice-table">
+                    <thead>
+                        <tr>
+                            <th class="invoice-sl">SL</th>
+                            <th>Item Name &amp; Custom Design Note</th>
+                            <th class="invoice-center">Size</th>
+                            <th class="invoice-center">Qty</th>
+                            <th class="invoice-right">Price</th>
+                            <th class="invoice-right">Total</th>
+                        </tr>
+                    </thead>
+                    <tbody id="inv-items-tbody"></tbody>
+                </table>
+
+                <section class="invoice-summary-grid">
+                    <div class="invoice-policy-box">
+                        <h4 class="invoice-box-title">Return &amp; Exchange Policy</h4>
+                        <ul>
+                            <li>Unused items can be returned or exchanged within 3 days with original receipt.</li>
+                            <li>No exchange on custom design, sale, damaged, altered, or used items.</li>
+                            <li>Custom design instructions are recorded on the itemized order line.</li>
+                        </ul>
+                    </div>
+
+                    <div class="invoice-totals">
+                        <div class="invoice-total-row"><span>Sub-Total</span><span id="inv-subtotal">৳ 0</span></div>
+                        <div class="invoice-total-row"><span>Discount</span><span id="inv-discount">৳ 0</span></div>
+                        <div class="invoice-total-row"><span>Delivery Charge</span><span id="inv-delivery">৳ 0</span></div>
+                        <div class="invoice-total-row invoice-grand-total"><span>Grand Total</span><span id="inv-total">৳ 0</span></div>
+                        <div class="invoice-total-row"><span>Advance Paid</span><span id="inv-advance">৳ 0</span></div>
+                        <div class="invoice-total-row invoice-due-total"><span>Due / Cash on Delivery</span><span id="inv-due">৳ 0</span></div>
+                    </div>
+                </section>
+
+                <section class="invoice-payment-box">
+                    <h4 class="invoice-box-title">Payment Method</h4>
+                    <div class="invoice-payment-methods">
+                        <span id="inv-payment-cash" class="invoice-payment-option"><span class="invoice-check">✓</span> COD / Cash on Delivery</span>
+                        <span id="inv-payment-bkash" class="invoice-payment-option"><span class="invoice-check">✓</span> bKash</span>
+                        <span id="inv-payment-nagad" class="invoice-payment-option"><span class="invoice-check">✓</span> Nagad</span>
+                    </div>
+                    <p id="inv-payment" class="invoice-payment-note"></p>
+                    <p id="inv-trx" class="invoice-payment-note"></p>
+                </section>
+
+                <footer class="invoice-signatures-footer">
+                    <div class="invoice-signatures">
+                        <div class="invoice-signature">
+                            <span class="invoice-signature-line"></span>
+                            <p>Customer Signature</p>
+                        </div>
+                        <div class="invoice-signature">
+                            <span class="invoice-signature-line"></span>
+                            <p>Authorized Signature</p>
+                        </div>
+                    </div>
+                    <div class="invoice-footer-bar">Powered by TAHAM</div>
+                </footer>
+            </div>
+
+            <!-- Modal Action Buttons -->
+            <div class="flex gap-3 mt-6 pt-4 border-t border-slate-100 no-print">
+                <button onclick="preparePrintPagination('#invoice-print-area'); window.print()" class="flex-1 py-3 rounded-xl bg-slate-900 hover:bg-slate-800 text-white font-bold flex items-center justify-center gap-2 shadow-md">
+                    <i data-lucide="printer" class="w-4 h-4"></i>
+                    <span>Print Invoice</span>
+                </button>
+                <button onclick="closeInvoiceModal()" class="px-5 py-3 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-700 font-bold">
+                    Close
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Footer -->
+    <footer class="footer-3d no-print">
+        <div class="max-w-7xl mx-auto px-5 sm:px-7 lg:px-9 py-7 flex flex-col sm:flex-row justify-between items-center gap-5">
+            <div class="footer-brand text-center sm:text-left">
+                <h4 id="footer-shop-name" class="footer-title text-white font-extrabold text-xl">Taham</h4>
+                <p id="footer-shop-address" class="footer-address text-sm mt-2 text-slate-300">Rayerbag, Dhaka, Bangladesh.</p>
+            </div>
+            <div class="flex items-center gap-4 text-xs">
+                <a id="footer-shop-phone" class="footer-phone-pill" href="tel:01400570014" title="Call / WhatsApp Helpline" aria-label="Call or WhatsApp helpline">
+                    <i data-lucide="phone" class="w-4 h-4"></i>
+                    <span id="footer-shop-phone-text">Helpline: 01400-570014</span>
+                </a>
+            </div>
+        </div>
+    </footer>
+
+    <!-- ========================================== -->
+    <!-- FLASK SERVER-CONNECTED ERP LOGIC            -->
+    <!-- ========================================== -->
+    <script type="module">
+        let doc, setDoc, addDoc, updateDoc, deleteDoc, onSnapshot, collection, getDocs;
+
+        // ==========================================
+        // SERVER API (Flask) helpers - data lives in taham.db on the server
+        // ==========================================
+        const esc = (v) => String(v ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+
+
+        // ==========================================
+        // LANGUAGE SWITCH (English <-> Bangla)
+        // ==========================================
+        const BN_DICT = {
+         "Syncing...": "ক্লাউড সিঙ্ক হচ্ছে...",
+         "Store": "দোকান (Store)",
+         "Super Admin": "সুপার অ্যাডমিন",
+         "Log out": "লগআউট করুন",
+         "Logout": "লগআউট",
+         "Exclusive Fashion Collection • Home delivery all over Bangladesh": "এক্সক্লুসিভ ফ্যাশন কালেকশন • সারা দেশে হোম ডেলিভারি",
+         "The finest quality": "সেরা মানের",
+         "clothing": "জামা-কাপড়",
+         "now directly online": "এখন সরাসরি অনলাইনে",
+         "Order premium Panjabi, Jamdani sarees, three-piece sets, T-shirts and kids wear from home. Cash on Delivery, bKash and Nagad are available": "প্রিমিয়াম পাঞ্জাবি, জামদানি শাড়ি, থ্রি-পিস, টি-শার্ট এবং বাচ্চাদের পোশাক অর্ডার করুন ঘরে বসেই। ক্যাশ অন ডেলিভারি, বিকাশ ও নগদ সুবিধা রয়েছে",
+         "Browse Collections": "কালেকশন দেখুন",
+         "Fast Home Delivery": "দ্রুত হোম ডেলিভারি",
+         "Delivery charge is only ৳60 inside Dhaka and ৳120 across Bangladesh": "ঢাকার ভেতরে ৳৬০ এবং সারা বাংলাদেশে মাত্র ৳১২০ ডেলিভারি চার্জ",
+         "100% Colour Guarantee": "১০০% কালার গ্যারান্টি",
+         "Inspect the product on delivery and pay after you receive it": "পণ্য হাতে পেয়ে যাচাই করে মূল্য পরিশোধ করার সুবিধা",
+         "Search clothes by name...": "পোশাকের নাম খুঁজুন...",
+         "All Collections": "সকল কালেকশন",
+         "Loading...": "লোড হচ্ছে...",
+         "View Store": "দোকান দেখুন",
+         "Lock / Logout": "লক / লগআউট",
+         "Total Sales (Revenue)": "মোট বিক্রি (Revenue)",
+         "Total sales including delivery charge": "ডেলিভারি চার্জসহ মোট সেল",
+         "Net Profit": "নিট লাভ (Net Profit)",
+         "Net profit after purchase cost and expenses": "কেনা দাম ও খরচ বাদে নিট লাভ",
+         "Total Expenses": "মোট খরচ (Expenses)",
+         "Shop & other expenses": "দোকান ও অন্যান্য খরচ",
+         "Pending Orders": "পেন্ডিং অর্ডার",
+         "Total Orders: 0": "মোট অর্ডার: ০টি",
+         "Low Stock Alert (<5)": "লো স্টক এলার্ট (<৫)",
+         "Total Items: 0": "মোট আইটেম: ০টি",
+         "Orders & Invoices": "অর্ডার ও ইনভয়েস (Orders)",
+         "Products & Stock (Inventory)": "পণ্য ও স্টক ম্যানেজমেন্ট (Inventory)",
+         "Daily Expenses": "দৈনিক খরচের হিসাব (Expenses)",
+         "All Customer Orders": "সকল কাস্টমার অর্ডার তালিকা",
+         "Changing the order status updates stock automatically, and you can print the receipt": "অর্ডার স্ট্যাটাস পরিবর্তন করলে স্টক অটোমেটিক আপডেট হবে এবং রসিদ প্রিন্ট করা যাবে",
+         "All Orders": "সব অর্ডার (All Orders)",
+         "Pending": "পেন্ডিং (Pending)",
+         "Processing": "প্রসেসিং (Processing)",
+         "Delivered": "ডেলিভারড (Delivered)",
+         "Cancelled": "বাতিল (Cancelled)",
+         "Add New Product": "নতুন পোশাক যোগ করুন",
+         "Cancel": "বাতিল",
+         "Product Name *": "পোশাকের নাম *",
+         "e.g. Premium Cotton Panjabi": "যেমন: প্রিমিয়াম কটন পাঞ্জাবি",
+         "Collection *": "ক্যাটাগরি *",
+         "Stock (Pcs) *": "স্টক সংখ্যা (Pcs) *",
+         "Buying Price (৳) *": "কেনা দাম (Buying ৳) *",
+         "Selling Price (৳) *": "বিক্রয় মূল্য (Selling ৳) *",
+         "Upload a photo from your gallery/computer:": "গ্যালারি/কম্পিউটার থেকে ছবি আপলোড করুন:",
+         "Or paste an image link (URL)...": "অথবা ছবির ইন্টারনেট লিংক (URL) দিন...",
+         "Description": "বিবরণ (Description)",
+         "Write about fabric quality, colour or size...": "কাপড়ের মান, রঙ বা সাইজ সম্পর্কে লিখুন...",
+         "Save Product": "পণ্য সেভ করুন",
+         "Stock & Profit/Loss List": "দোকানের স্টক ও লাভ-ক্ষতি তালিকা",
+         "Only you can see the buying price": "কেনা দাম শুধু আপনি দেখতে পাবেন",
+         "Add New Expense": "নতুন খরচ যোগ করুন",
+         "Expense Description *": "খরচের বিবরণ *",
+         "e.g. Shop rent / Packaging bags": "যেমন: দোকান ভাড়া / প্যাকেজিং ব্যাগ",
+         "Expense Category *": "খরচের খাত *",
+         "Shop rent & bills": "দোকান ভাড়া ও বিল",
+         "Shop rent & electricity bill": "দোকান ভাড়া ও বিদ্যুৎ বিল",
+         "Packaging & delivery": "প্যাকেজিং ও ডেলিভারি",
+         "Packaging & courier cost": "প্যাকেজিং ও কুরিয়ার খরচ",
+         "Marketing & boosting": "মার্কেটিং ও বুস্টিং",
+         "Facebook boosting / marketing": "ফেসবুক বুস্টিং / মার্কেটিং",
+         "Staff & hospitality": "কর্মচারী ও আপ্যায়ন",
+         "Staff salary & hospitality": "কর্মচারী বেতন ও আপ্যায়ন",
+         "Other": "অন্যান্য",
+         "Other expenses": "অন্যান্য খরচ",
+         "Amount (৳) *": "টাকার পরিমাণ (৳) *",
+         "Add Expense": "খরচ যুক্ত করুন",
+         "Daily Expense List": "দৈনিক খরচের তালিকা",
+         "Shop Information & Super Admin Security": "দোকানের তথ্য ও সুপার অ্যাডমিন সিকিউরিটি",
+         "Change the shop name, bKash/Nagad number and admin password from here": "এখান থেকে দোকানের নাম, বিকাশ/নগদ নম্বর এবং অ্যাডমিন পাসওয়ার্ড পরিবর্তন করতে পারবেন",
+         "Shop Name": "দোকানের নাম (Shop Name)",
+         "Shop Mobile Number": "দোকানের মোবাইল নম্বর",
+         "bKash / Nagad Payment Number": "বিকাশ / নগদ পেমেন্ট নম্বর",
+         "Shop Address (shown on invoice)": "দোকানের ঠিকানা (ইনভয়েসে দেখাবে)",
+         "Change Super Admin Login Details": "সুপার অ্যাডমিন লগইন তথ্য পরিবর্তন",
+         "Admin Username": "অ্যাডমিন ইউজারনেম (Username)",
+         "New Password": "নতুন পাসওয়ার্ড (Password)",
+         "Leave empty to keep the current password": "খালি রাখলে আগের পাসওয়ার্ডই থাকবে",
+         "Save Settings": "সেটিংস সেভ করুন",
+         "Super Admin Login": "সুপার অ্যাডমিন লগইন",
+         "Reserved for the shop owner only": "শুধুমাত্র দোকানের মালিকের জন্য সংরক্ষিত",
+         "Username": "ইউজারনেম (Username)",
+         "Enter username": "ইউজারনেম লিখুন",
+         "Password": "পাসওয়ার্ড (Password)",
+         "Enter Dashboard": "ড্যাশবোর্ডে প্রবেশ করুন",
+         "Your Shopping Bag": "আপনার শপিং ব্যাগ",
+         "Choose delivery area:": "ডেলিভারি এলাকা বেছে নিন:",
+         "Inside Dhaka (৳ 60)": "ঢাকার ভেতরে (৳ ৬০)",
+         "Outside Dhaka (৳ 120)": "ঢাকার বাইরে (৳ ১২০)",
+         "Subtotal:": "সাবটোটাল:",
+         "Delivery Charge:": "ডেলিভারি চার্জ:",
+         "Grand Total:": "সর্বমোট:",
+         "Confirm Order": "অর্ডার কনফার্ম করুন",
+         "Delivery & Payment Details": "ডেলিভারি ও পেমেন্ট তথ্য",
+         "You will get a receipt as soon as the order is complete": "অর্ডার সম্পন্ন হলে সাথে সাথে রসিদ পাবেন",
+         "Full Name *": "আপনার নাম (Full Name) *",
+         "e.g. Tanvir Ahmed": "যেমন: তানভীর আহমেদ",
+         "Phone Number *": "মোবাইল নম্বর (Phone Number) *",
+         "Delivery Address *": "সম্পূর্ণ ঠিকানা (Delivery Address) *",
+         "House no, road, area, thana and district...": "বাসা নং, রোড, এলাকা, থানা ও জেলা...",
+         "Choose payment method *": "পেমেন্ট মাধ্যম বেছে নিন *",
+         "Cash on Delivery": "ক্যাশ অন ডেলিভারি",
+         "Pay when you receive": "হাতে পেয়ে টাকা",
+         "bKash": "বিকাশ (bKash)",
+         "Nagad": "নগদ (Nagad)",
+         "Our merchant/personal number:": "আমাদের মার্চেন্ট/পার্সোনাল নম্বর:",
+         "Total payable:": "সর্বমোট পরিশোধযোগ্য:",
+         "Place Order": "অর্ডার প্লেস করুন (Place Order)",
+         "Dhaka, Bangladesh": "ঢাকা, বাংলাদেশ",
+         "Mobile:": "মোবাইল:",
+         "Bill To:": "কাস্টমারের তথ্য (Bill To):",
+         "Payment & Status:": "পেমেন্ট ও স্ট্যাটাস:",
+         "Item Description": "পোশাকের বিবরণ",
+         "Size": "সাইজ",
+         "Qty": "পরিমাণ",
+         "Rate": "দর",
+         "Total": "মোট",
+         "Total Bill:": "সর্বমোট বিল:",
+         "Thank you for shopping with us! To exchange a product, contact us with the receipt within 3 days": "আমাদের সাথে কেনাকাটা করার জন্য আন্তরিক ধন্যবাদ! পণ্য পরিবর্তনের জন্য ৩ দিনের মধ্যে রসিদসহ যোগাযোগ করুন",
+         "Print Invoice": "রসিদ প্রিন্ট করুন (Print Invoice)",
+         "Close": "বন্ধ করুন",
+         "We deliver the best quality clothing all over Bangladesh with trust": "বিশ্বস্ততার সাথে সেরা মানের পোশাক পৌঁছে দিচ্ছি সারা বাংলাদেশে",
+         "Helpline:": "হেল্পলাইন:",
+         "Something went wrong on the server": "সার্ভারে সমস্যা হয়েছে",
+         "Session expired, please log in again": "সেশন শেষ হয়ে গেছে, আবার লগইন করুন",
+         "New Market, Dhaka, Bangladesh": "নিউ মার্কেট, ঢাকা, বাংলাদেশ",
+         "Connected to server": "সার্ভার সংযুক্ত",
+         "Cannot connect to server": "সার্ভারের সাথে সংযোগ নেই",
+         "Welcome to the Super Admin panel!": "সুপার অ্যাডমিন প্যানেলে স্বাগতম!",
+         "Wrong username or password!": "ভুল ইউজারনেম বা পাসওয়ার্ড!",
+         "Logged out successfully": "সফলভাবে লগআউট হয়েছে",
+         "Premium quality fabric and flawless finishing": "প্রিমিয়াম কোয়ালিটি ফ্যাব্রিক ও নিখুঁত ফিনিশিং",
+         "Size:": "সাইজ (Size):",
+         "Price": "মূল্য",
+         "Add to Bag": "ব্যাগে যোগ করুন",
+         "You cannot add more than the available stock": "স্টকের চেয়ে বেশি যোগ করা যাবে না",
+         "Your shopping bag is empty": "আপনার শপিং ব্যাগ খালি",
+         "Add your favourite clothes to the bag and order easily": "পছন্দের জামা-কাপড় ব্যাগে যোগ করে সহজেই অর্ডার করুন",
+         "Processing order...": "অর্ডার প্রসেস হচ্ছে...",
+         "Could not place the order, please try again": "অর্ডার প্লেস করতে সমস্যা হয়েছে, আবার চেষ্টা করুন",
+         "No orders in this category": "এই ক্যাটাগরিতে কোনো অর্ডার নেই",
+         "Print Receipt": "রসিদ প্রিন্ট",
+         "Delete order": "অর্ডার ডিলিট",
+         "Customer:": "কাস্টমার:",
+         "Address:": "ঠিকানা:",
+         "Could not change the status": "স্ট্যাটাস পরিবর্তন ব্যর্থ হয়েছে",
+         "Permanently delete this order?": "এই অর্ডারটি স্থায়ীভাবে মুছে ফেলবেন?",
+         "Order deleted": "অর্ডারটি মুছে ফেলা হয়েছে",
+         "Could not delete the order": "অর্ডার মুছতে সমস্যা হয়েছে",
+         "Image is ready!": "ছবি প্রস্তুত হয়েছে!",
+         "Could not read the image, please choose another": "ছবিটি পড়া যায়নি, অন্য ছবি দিন",
+         "Enter the product name": "পোশাকের নাম দিন",
+         "Enter valid numbers for stock, buying price and selling price": "স্টক, কেনা দাম ও বিক্রয় মূল্য সঠিক সংখ্যায় দিন",
+         "Product updated!": "পোশাকের তথ্য আপডেট হয়েছে!",
+         "New product added to the shop!": "নতুন পোশাক দোকানে যুক্ত হয়েছে!",
+         "Could not save the product": "পণ্য সেভ করতে সমস্যা হয়েছে",
+         "Edit Product": "পোশাক এডিট করুন",
+         "Could not update the stock": "স্টক আপডেট করা যায়নি",
+         "Permanently delete this product?": "এই পোশাকটি স্থায়ীভাবে ডিলিট করবেন?",
+         "Product deleted": "পণ্যটি ডিলিট করা হয়েছে",
+         "Could not delete": "মুছে ফেলা যায়নি",
+         "pcs": "পিস",
+         "Edit": "এডিট",
+         "Delete": "ডিলিট",
+         "Enter the expense description and a valid amount": "খরচের বিবরণ ও সঠিক পরিমাণ দিন",
+         "Expense recorded!": "খরচ হিসাবভুক্ত হয়েছে!",
+         "Could not add the expense": "খরচ যোগ করা যায়নি",
+         "Expense deleted": "খরচটি মুছে ফেলা হয়েছে",
+         "No expenses added yet": "এখনো কোনো খরচ যোগ করা হয়নি",
+         "Shop settings and password updated successfully!": "দোকানের সেটিংস ও পাসওয়ার্ড সফলভাবে আপডেট হয়েছে!",
+         "Could not save the settings": "সেটিংস সেভ করা যায়নি",
+         "Admin login required": "অ্যাডমিন লগইন প্রয়োজন",
+         "is not a valid number": "সঠিক সংখ্যা নয়",
+         "cannot be negative": "ঋণাত্মক হতে পারে না",
+         "Too many wrong attempts, please try again in 5 minutes": "অনেকবার ভুল হয়েছে, ৫ মিনিট পরে আবার চেষ্টা করুন",
+         "Stock": "স্টক",
+         "Buying price": "কেনা দাম",
+         "Selling price": "বিক্রয় মূল্য",
+         "Image is too large, please use a smaller one": "ছবির সাইজ অনেক বড়, ছোট ছবি দিন",
+         "Enter the product name and price": "পণ্যের নাম ও দাম দিন",
+         "Product not found": "পণ্য পাওয়া যায়নি",
+         "Please enter name, phone number and address": "নাম, মোবাইল নম্বর ও ঠিকানা দিন",
+         "Invalid payment method": "পেমেন্ট মেথড সঠিক নয়",
+         "Invalid cart data": "কার্টের তথ্য সঠিক নয়",
+         "Invalid quantity": "পরিমাণ সঠিক নয়",
+         "Your cart is empty": "আপনার কার্ট খালি",
+         "A product is no longer available": "একটি পণ্য আর পাওয়া যাচ্ছে না",
+         "Invalid status": "স্ট্যাটাস সঠিক নয়",
+         "Order not found": "অর্ডার পাওয়া যায়নি",
+         "Enter the expense description": "খরচের বিবরণ দিন",
+         "Expense amount": "খরচের পরিমাণ",
+         "Please fill in all the shop details": "দোকানের সব তথ্য পূরণ করুন",
+         "Password must be at least 4 characters": "পাসওয়ার্ড কমপক্ষে ৪ অক্ষরের দিন",
+         "Not found": "পাওয়া যায়নি",
+         "All Items": "সব পোশাক",
+         "Panjabi": "পাঞ্জাবি",
+         "Saree": "শাড়ি",
+         "Salwar Kameez": "থ্রি-পিস",
+         "T-Shirt": "টি-শার্ট ও শার্ট",
+         "Kids": "বাচ্চাদের পোশাক",
+         "No clothes found": "কোনো পোশাক পাওয়া যায়নি",
+         "Try searching with another name or collection": "অন্য কোনো নাম বা কালেকশন দিয়ে খুঁজে দেখুন",
+         "Out of Stock": "স্টক শেষ",
+         "Out of stock": "স্টক নেই",
+         "{n} items found": "{n}টি পোশাক পাওয়া গেছে",
+         "{n} items": "{n}টি পোশাক",
+         "Stock: {n}": "স্টক: {n}টি",
+         "Helpline: {p}": "হেল্পলাইন: {p}",
+         "Total Orders: {n}": "মোট অর্ডার: {n}টি",
+         "Total Items: {n}": "মোট আইটেম: {n}টি",
+         "Sorry! Only {n} left in stock for this item.": "দুঃখিত! এই পোশাকটির স্টক মাত্র {n}টি আছে।",
+         "\"{name}\" ({size}) added to bag!": "\"{name}\" ({size}) ব্যাগে যোগ হয়েছে!",
+         "Thank you {name}! Your order ({num}) is complete.": "ধন্যবাদ {name}! আপনার অর্ডার ({num}) সম্পন্ন হয়েছে।",
+         "Order status updated to \"{s}\".": "অর্ডার স্ট্যাটাস \"{s}\" আপডেট হয়েছে।",
+         "Payment:": "পেমেন্ট:",
+         "Delivery:": "ডেলিভারি:",
+         "Total:": "মোট:",
+         "Buy:": "কেনা:",
+         "Price:": "মূল্য:",
+         "Profit/pc:": "লাভ/পিস:",
+         "Enter TrxID (optional)": "TrxID লিখুন (ঐচ্ছিক)",
+         "Shop by Collection": "কালেকশন অনুযায়ী কিনুন",
+         "Collections": "কালেকশন",
+         "Add New Collection": "নতুন কালেকশন যোগ করুন",
+         "Edit Collection": "কালেকশন এডিট করুন",
+         "Collection Name *": "কালেকশনের নাম *",
+         "e.g. Winter Wear": "যেমন: শীতের পোশাক",
+         "Upload a cover photo from your gallery/computer:": "গ্যালারি/কম্পিউটার থেকে কভার ছবি আপলোড করুন:",
+         "Save Collection": "কালেকশন সেভ করুন",
+         "Your Collections": "আপনার কালেকশনসমূহ",
+         "These photos appear on the storefront. Customers tap a collection to see its clothes.": "এই ছবিগুলো দোকানের পেজে দেখাবে। কাস্টমার কালেকশনে ট্যাপ করে পোশাক দেখতে পারবে।",
+         "No collections yet.": "এখনো কোনো কালেকশন নেই।",
+         "Collection added!": "নতুন কালেকশন যোগ হয়েছে!",
+         "Collection updated!": "কালেকশন আপডেট হয়েছে!",
+         "Collection deleted": "কালেকশন ডিলিট হয়েছে",
+         "Delete this collection?": "এই কালেকশনটি ডিলিট করবেন?",
+         "Enter the collection name": "কালেকশনের নাম দিন",
+         "Could not save the collection": "কালেকশন সেভ করা যায়নি",
+         "Could not delete the collection": "কালেকশন ডিলিট করা যায়নি",
+         "Select a collection. Add one in the Collections tab first.": "একটি কালেকশন বেছে নিন। আগে Collections ট্যাব থেকে কালেকশন যোগ করুন।",
+         "Discount (optional)": "ছাড় (ঐচ্ছিক)",
+         "No discount": "কোনো ছাড় নেই",
+         "Percentage (%)": "শতকরা (%)",
+         "Fixed amount (৳)": "নির্দিষ্ট টাকা (৳)",
+         "Value": "পরিমাণ",
+         "Customers pay ৳ {final} instead of ৳ {price} ({pct}% off)": "কাস্টমার ৳ {price} এর বদলে ৳ {final} দেবে ({pct}% ছাড়)",
+         "Warning: the sale price is below your buying price.": "সতর্কতা: বিক্রয় মূল্য আপনার কেনা দামের চেয়ে কম।",
+         "{pct}% OFF": "{pct}% ছাড়",
+         "Discount": "ছাড়",
+         "Sale price": "ছাড়ের পর মূল্য",
+         "Discount must be a whole number": "ছাড়ের পরিমাণ পূর্ণ সংখ্যায় দিন",
+         "Collection name is required": "কালেকশনের নাম দিন",
+         "A collection with this name already exists": "এই নামে একটি কালেকশন আগে থেকেই আছে",
+         "Collection not found": "কালেকশন পাওয়া যায়নি",
+         "This collection still has products. Move or delete them first": "এই কালেকশনে এখনো পণ্য আছে। আগে সেগুলো সরান বা ডিলিট করুন",
+         "Please choose a valid collection": "সঠিক কালেকশন বেছে নিন",
+         "Percentage discount must be between 1 and 95": "শতকরা ছাড় ১ থেকে ৯৫ এর মধ্যে হতে হবে",
+         "Discount amount must be less than the selling price": "ছাড়ের টাকা বিক্রয় মূল্যের চেয়ে কম হতে হবে",
+         "Discount type is not valid": "ছাড়ের ধরন সঠিক নয়",
+         "Discount value": "ছাড়ের পরিমাণ",
+         "CASH MEMO": "ক্যাশ মেমো",
+         "Send Money": "সেন্ড মানি",
+         "Real-Time Cloud Sync Active": "রিয়েল-টাইম সিঙ্ক চালু আছে",
+         "Colours (optional)": "রঙ (ঐচ্ছিক)",
+         "Pick from the list or add your own colour:": "তালিকা থেকে বেছে নিন বা নিজের রঙ যোগ করুন:",
+         "Colour name, e.g. Wine Red": "রঙের নাম, যেমন: ওয়াইন রেড",
+         "Add": "যোগ করুন",
+         "Selected colours:": "নির্বাচিত রঙ:",
+         "No colours selected": "কোনো রঙ বাছাই করা হয়নি",
+         "Colour:": "রঙ:",
+         "Enter a colour name": "রঙের নাম লিখুন",
+         "Please choose a colour": "একটি রঙ বেছে নিন",
+         "This colour is not available": "এই রঙটি পাওয়া যাচ্ছে না",
+         "Remove": "সরান",
+         "Black": "কালো",
+         "White": "সাদা",
+         "Grey": "ধূসর",
+         "Red": "লাল",
+         "Maroon": "মেরুন",
+         "Pink": "গোলাপি",
+         "Orange": "কমলা",
+         "Yellow": "হলুদ",
+         "Mustard": "সরিষা",
+         "Green": "সবুজ",
+         "Olive": "অলিভ",
+         "Teal": "টিল",
+         "Sky Blue": "আকাশি",
+         "Blue": "নীল",
+         "Navy Blue": "নেভি ব্লু",
+         "Purple": "বেগুনি",
+         "Brown": "বাদামি",
+         "Beige": "বেজ",
+         "Cream": "ক্রিম",
+         "Gold": "সোনালি",
+         "Product photos": "পণ্যের ছবি",
+         "Upload several photos at once (up to 8). The first photo is the main one.": "একসাথে একাধিক ছবি আপলোড করুন (সর্বোচ্চ ৮টি)। প্রথম ছবিটি মূল ছবি।",
+         "Set a colour under each photo so customers can recognise it.": "প্রতিটি ছবির নিচে রঙ ঠিক করে দিন, যাতে কাস্টমার সহজে চিনতে পারে।",
+         "Or add an image link (URL)...": "অথবা ছবির লিংক (URL) দিন...",
+         "Add link": "লিংক যোগ করুন",
+         "No photos yet": "এখনো কোনো ছবি নেই",
+         "Main": "মূল",
+         "Set main": "মূল করুন",
+         "General (no colour)": "সাধারণ (রঙ ছাড়া)",
+         "{n} photos added": "{n}টি ছবি যোগ হয়েছে",
+         "You can add up to 8 photos per product": "একটি পণ্যে সর্বোচ্চ ৮টি ছবি দেওয়া যাবে",
+         "Enter a valid image link": "সঠিক ছবির লিংক দিন",
+         "Too many photos (max 8)": "ছবি অনেক বেশি (সর্বোচ্চ ৮টি)",
+         "Photos": "ছবি"
+        };
+        const BN_PATTERNS = [
+            [/^Sorry! "(.*)" has only (\d+) in stock\.?$/, (m) => `দুঃখিত! "${m[1]}" এর স্টক মাত্র ${m[2]}টি আছে।`],
+            [/^(.+) is not a valid number\.?$/, (m) => `${BN_DICT[m[1]] || m[1]} সঠিক সংখ্যা নয়।`],
+            [/^(.+) cannot be negative\.?$/, (m) => `${BN_DICT[m[1]] || m[1]} ঋণাত্মক হতে পারে না।`]
+        ];
+        let LANG = 'en';
+        const T_ATTRS = ['placeholder', 'title', 'aria-label'];
+
+        function lookup(s) {
+            if (Object.prototype.hasOwnProperty.call(BN_DICT, s)) return BN_DICT[s];
+            const m = s.match(/^(.*?)([.!]+)$/);
+            if (m && Object.prototype.hasOwnProperty.call(BN_DICT, m[1])) return BN_DICT[m[1]] + (m[2] === '.' ? '।' : m[2]);
+            for (const [re, fn] of BN_PATTERNS) { const mm = s.match(re); if (mm) return fn(mm); }
+            return undefined;
+        }
+        function t(key, params) {
+            let s = key;
+            if (LANG === 'bn') { const b = lookup(key); if (b !== undefined) s = b; }
+            if (params) s = s.replace(/\{(\w+)\}/g, (_, k) => (params[k] !== undefined ? params[k] : '{' + k + '}'));
+            return s;
+        }
+        function fmtDate(ms, dateOnly) {
+            if (!ms) return '';
+            const opts = dateOnly ? { day: '2-digit', month: 'short', year: 'numeric' }
+                                  : { day: '2-digit', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit' };
+            return new Date(ms).toLocaleString(LANG === 'bn' ? 'bn-BD' : 'en-GB', opts);
+        }
+
+        const NODE_REC = new WeakMap();
+        function skipNode(n) {
+            const p = n.parentElement;
+            return !p || p.closest('script,style,textarea,[data-notranslate]');
+        }
+        function trNode(n) {
+            if (skipNode(n)) return;
+            const rec = NODE_REC.get(n);
+            if (rec && n.data === rec.bn) return;
+            const raw = n.data, core = raw.trim().replace(/\s+/g, ' ');
+            if (!core) return;
+            if (LANG === 'bn') {
+                const b = lookup(core);
+                if (b !== undefined) {
+                    const out = raw.match(/^\s*/)[0] + b + raw.match(/\s*$/)[0];
+                    NODE_REC.set(n, { en: raw, bn: out });
+                    n.data = out;
+                    return;
+                }
+            }
+            NODE_REC.delete(n);
+        }
+        function restoreNode(n) {
+            const rec = NODE_REC.get(n);
+            if (rec && n.data === rec.bn) n.data = rec.en;
+            NODE_REC.delete(n);
+        }
+        function trAttrs(el, restore) {
+            for (const a of T_ATTRS) {
+                if (!el.hasAttribute(a)) continue;
+                const v = el.getAttribute(a);
+                const rec = (el.__i18n = el.__i18n || {});
+                if (restore) { if (rec[a] && v === rec[a].bn) el.setAttribute(a, rec[a].en); delete rec[a]; continue; }
+                if (rec[a] && v === rec[a].bn) continue;
+                const b = LANG === 'bn' ? lookup(v.trim()) : undefined;
+                if (b !== undefined) { rec[a] = { en: v, bn: b }; el.setAttribute(a, b); } else delete rec[a];
+            }
+        }
+        function walk(root, restore) {
+            if (root.nodeType === 3) { restore ? restoreNode(root) : trNode(root); return; }
+            if (root.nodeType !== 1) return;
+            const tw = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+            const nodes = [];
+            while (tw.nextNode()) nodes.push(tw.currentNode);
+            nodes.forEach((n) => (restore ? restoreNode(n) : trNode(n)));
+            if (root.matches && root.matches('[placeholder],[title],[aria-label]')) trAttrs(root, restore);
+            root.querySelectorAll('[placeholder],[title],[aria-label]').forEach((el) => trAttrs(el, restore));
+        }
+        new MutationObserver((muts) => {
+            if (LANG !== 'bn') return;
+            for (const m of muts) {
+                if (m.type === 'childList') m.addedNodes.forEach((n) => walk(n, false));
+                else if (m.type === 'characterData') trNode(m.target);
+                else if (m.type === 'attributes') trAttrs(m.target, false);
+            }
+        }).observe(document.documentElement, { childList: true, subtree: true, characterData: true, attributes: true, attributeFilter: T_ATTRS });
+
+        window.setLanguage = function(lang) {
+            if (lang !== 'en' && lang !== 'bn') lang = 'en';
+            if (LANG === 'bn' && lang === 'en') walk(document.body, true);
+            LANG = lang;
+            try { localStorage.setItem('taham_lang', lang); } catch (e) { /* ignore */ }
+            document.documentElement.lang = lang;
+            const on = 'px-2.5 py-1.5 rounded-lg bg-slate-900 text-white', off = 'px-2.5 py-1.5 rounded-lg text-slate-600 hover:bg-slate-100';
+            document.getElementById('lang-en').className = lang === 'en' ? on : off;
+            document.getElementById('lang-bn').className = lang === 'bn' ? on : off;
+            // rebuild the dynamic parts so numbers/dates/templates use the new language
+            if (typeof applyStoreSettingsToUI === 'function' && db) {
+                applyStoreSettingsToUI();
+                renderCollections(); renderCategoryFilters(); updateCategoryTitle(); renderProducts(); updateCartUI();
+                updateDiscountPreview();
+                if (isAdminAuthenticated) updateAdminDashboard();
+                if (currentInvoice && !document.getElementById('invoice-modal').classList.contains('hidden')) openInvoiceModal(currentInvoice);
+            }
+            if (lang === 'bn') walk(document.body, false);
+        };
+
+
+        async function api(method, url, body) {
+            const res = await fetch(url, {
+                method,
+                headers: { 'Content-Type': 'application/json' },
+                credentials: 'same-origin',
+                body: body === undefined ? undefined : JSON.stringify(body)
+            });
+            let data = null;
+            try { data = await res.json(); } catch (e) { /* empty body */ }
+            if (!res.ok) {
+                if (res.status === 401 && isAdminAuthenticated && url !== '/api/login' && !window.__sessionExpiredSuppress) {
+                    const stillAdmin = await checkAdminSession();
+                    if (stillAdmin === false && !window.__sessionExpiredSuppress) sessionExpired();
+                }
+                const err = new Error((data && data.error) || 'Something went wrong on the server');
+                err.status = res.status;
+                throw err;
+            }
+            return data;
+        }
+
+        async function checkAdminSession() {
+            try {
+                const res = await fetch('/api/me', { credentials: 'same-origin', cache: 'no-store' });
+                if (!res.ok) return null;
+                const data = await res.json();
+                return typeof data.admin === 'boolean' ? data.admin : null;
+            } catch (e) {
+                return null;
+            }
+        }
+
+        function sessionExpired() {
+            if (window.__sessionExpiredSuppress || !isAdminAuthenticated) return;
+            isAdminAuthenticated = false;
+            document.getElementById('admin-logout-btn').classList.add('hidden');
+            showToast('Session expired, please log in again.', 'error');
+            switchView('store');
+            document.getElementById('admin-login-modal').classList.remove('hidden');
+        }
+
+        // Keeps the old Firestore-style helper names so the rest of the page works unchanged,
+        // but every call now goes to the Flask server.
+        function createApiBackend() {
+            const listeners = [];
+            const adminOnly = (c) => c === 'orders' || c === 'expenses';
+            const fetchList = async (c) => (adminOnly(c) && !isAdminAuthenticated) ? [] : await api('GET', `/api/${c}`);
+            const snapCol = (list) => ({
+                empty: list.length === 0,
+                docs: list.map((d) => ({ id: d.id, data: () => { const { id, ...rest } = d; return rest; } }))
+            });
+            const snapDoc = (list, id) => {
+                const d = list.find((x) => x.id === id);
+                return { id, exists: () => !!d, data: () => { if (!d) return undefined; const { id: _i, ...rest } = d; return rest; } };
+            };
+            async function run(l, force) {
+                try {
+                    const list = await fetchList(l.col);
+                    const sig = JSON.stringify(list);
+                    if (!force && sig === l.sig) return;
+                    l.sig = sig;
+                    l.cb(l.ref.kind === 'col' ? snapCol(list) : snapDoc(list, l.ref.id));
+                } catch (e) { if (l.err) l.err(e); }
+            }
+            const refreshCol = (c) => Promise.all(listeners.filter((l) => l.col === c).map((l) => run(l)));
+            const refreshAll = () => Promise.all(listeners.map((l) => run(l)));
+            return {
+                collection: (_db, ...segs) => ({ kind: 'col', col: segs[segs.length - 1] }),
+                doc: (_db, ...segs) => ({ kind: 'doc', col: segs[segs.length - 2], id: segs[segs.length - 1] }),
+                getDocs: async (ref) => snapCol(await fetchList(ref.col)),
+                addDoc: async (ref, payload) => { const r = await api('POST', `/api/${ref.col}`, payload); await refreshCol(ref.col); return r; },
+                setDoc: async (ref, payload) => { await api('PUT', `/api/${ref.col}/${ref.id}`, payload); await refreshAll(); },
+                updateDoc: async (ref, payload) => { await api('PATCH', `/api/${ref.col}/${ref.id}`, payload); await refreshCol(ref.col); },
+                deleteDoc: async (ref) => { await api('DELETE', `/api/${ref.col}/${ref.id}`); await refreshCol(ref.col); },
+                onSnapshot: (ref, cb, err) => {
+                    const l = { col: ref.col, ref, cb, err, sig: null };
+                    listeners.push(l);
+                    run(l, true);
+                    return () => { const i = listeners.indexOf(l); if (i >= 0) listeners.splice(i, 1); };
+                },
+                refreshAll,
+                startPolling: () => setInterval(() => { if (!document.hidden) refreshAll(); }, 8000)
+            };
+        }
+
+        // Environment Config
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'noor-fashion-erp-default';
+
+        let db = null;
+        let currentUser = null;
+
+        // Global Application State
+        let products = [];
+        let orders = [];
+        let expenses = [];
+        let storeSettings = {
+            shopName: 'Taham',
+            pageName: 'Taham',
+            theme: 'classic-pink',
+            shopPhone: '01700-000000',
+            paymentNumber: '01700-000000',
+            shopAddress: 'New Market, Dhaka, Bangladesh',
+        };
+
+        let cart = [];
+        let selectedCategory = 'All';
+        let selectedSizes = {};
+        let isAdminAuthenticated = false;
+        let isSuperAdmin = false;
+        let users = [];
+        let permissionDefs = [];
+        let currentAccessUserId = '';
+        let currentReportView = 'daily';
+        let customDesignReferenceImage = '';
+        let uploadedImageBase64 = '';
+        let uploadedCollectionImage = '';
+        let collections = [];
+        let currentInvoice = null;
+        let formColors = [];
+        let formImages = [];            // [{src, color}] photos of the product being edited
+        const MAX_PHOTOS = 8;
+        const selectedImages = {};      // productId -> index of the photo the customer clicked
+        const selectedColors = {};
+
+        // Start: connect to the Flask server and begin live listeners
+        async function initApp() {
+            const backend = createApiBackend();
+            ({ collection, doc, getDocs, addDoc, setDoc, updateDoc, deleteDoc, onSnapshot } = backend);
+            window.__refreshAll = backend.refreshAll;
+            db = { server: true };
+            currentUser = { uid: 'server' };
+            try {
+                const me = await api('GET', '/api/me');
+                if (me.admin) {
+                    isAdminAuthenticated = true;
+                    isSuperAdmin = !!me.isSuperAdmin || !!me.admin;
+                    document.getElementById('admin-logout-btn').classList.remove('hidden');
+                }
+                setCloudStatus('online', 'Connected to server');
+                setupRealtimeListeners();
+                await loadUsers();
+                backend.startPolling();
+            } catch (error) {
+                console.error('Server error:', error);
+                setCloudStatus('error', 'Cannot connect to server');
+            }
+        }
+
+        function setCloudStatus(status, text) {
+            const dot = document.getElementById('cloud-status-dot');
+            const label = document.getElementById('cloud-status-text');
+            label.innerText = text;
+            if (status === 'online') {
+                dot.className = 'w-2 h-2 rounded-full bg-emerald-500';
+            } else if (status === 'local') {
+                dot.className = 'w-2 h-2 rounded-full bg-sky-500';
+            } else if (status === 'error') {
+                dot.className = 'w-2 h-2 rounded-full bg-rose-500';
+            } else {
+                dot.className = 'w-2 h-2 rounded-full bg-amber-400';
+            }
+        }
+
+        // RULE 1 & 2: Public Data Paths + Simple collection() listeners
+        function setupRealtimeListeners() {
+            if (!currentUser || !db) return;
+
+            // 1. Listen to Products
+            const productsCol = collection(db, 'artifacts', appId, 'public', 'data', 'products');
+            onSnapshot(productsCol, (snapshot) => {
+                products = snapshot.docs.map(d => ({ id: d.id, ...d.data() }));
+                products.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+                renderProducts();
+                renderCollections();
+                if (isAdminAuthenticated) updateAdminDashboard();
+            }, (err) => console.error("Products snapshot error:", err));
+
+            // 2. Listen to Orders
+            const ordersCol = collection(db, 'artifacts', appId, 'public', 'data', 'orders');
+            onSnapshot(ordersCol, (snapshot) => {
+                orders = snapshot.docs.map(d => ({ id: d.id, ...d.data() }));
+                orders.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+                updatePendingBadge();
+                if (isAdminAuthenticated) updateAdminDashboard();
+            }, (err) => console.error("Orders snapshot error:", err));
+
+            // 3. Listen to Expenses
+            const expensesCol = collection(db, 'artifacts', appId, 'public', 'data', 'expenses');
+            onSnapshot(expensesCol, (snapshot) => {
+                expenses = snapshot.docs.map(d => ({ id: d.id, ...d.data() }));
+                expenses.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+                if (isAdminAuthenticated) updateAdminDashboard();
+            }, (err) => console.error("Expenses snapshot error:", err));
+
+            // 3b. Listen to Collections
+            const collectionsCol = collection(db, 'artifacts', appId, 'public', 'data', 'collections');
+            onSnapshot(collectionsCol, (snapshot) => {
+                collections = snapshot.docs.map(d => ({ id: d.id, ...d.data() }));
+                collections.sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0));
+                if (selectedCategory !== 'All' && !collections.some(c => c.name === selectedCategory)) selectedCategory = 'All';
+                renderCollections(); renderCategoryFilters(); updateCategoryTitle(); populateCategorySelect(); renderProducts();
+                if (isAdminAuthenticated) renderAdminCollections();
+            }, (err) => console.error("Collections snapshot error:", err));
+
+            // 4. Listen to Store Settings
+            const settingsDoc = doc(db, 'artifacts', appId, 'public', 'data', 'settings', 'store_config');
+            onSnapshot(settingsDoc, (docSnap) => {
+                if (docSnap.exists()) {
+                    storeSettings = { ...storeSettings, ...docSnap.data() };
+                    applyStoreSettingsToUI();
+                }
+            }, (err) => console.error("Settings snapshot error:", err));
+        }
+
+        const THEMES = [
+            { id: 'classic-pink', name: 'Classic Pink', description: 'Warm pink accent with clean enterprise contrast', brand50: '#fdf2f8', brand100: '#fce7f3', brand300: '#f9a8d4', brand500: '#e879a9', brand600: '#db2777', brand700: '#be185d', brand900: '#831843', appBg: '#f8fafc', appSurface: '#ffffff', appText: '#0f172a' },
+            { id: 'enterprise-indigo', name: 'Enterprise Indigo', description: 'Balanced indigo for a polished SaaS dashboard', brand50: '#eef2ff', brand100: '#e0e7ff', brand300: '#a5b4fc', brand500: '#6366f1', brand600: '#4f46e5', brand700: '#4338ca', brand900: '#312e81', appBg: '#f8fafc', appSurface: '#ffffff', appText: '#0f172a' },
+            { id: 'corporate-navy', name: 'Corporate Navy', description: 'Deep navy accents with crisp light surfaces', brand50: '#f1f5f9', brand100: '#e2e8f0', brand300: '#94a3b8', brand500: '#334155', brand600: '#1e3a5f', brand700: '#172a46', brand900: '#0b1726', appBg: '#f8fafc', appSurface: '#ffffff', appText: '#0f172a' },
+            { id: 'slate-emerald', name: 'Slate Emerald', description: 'Calm emerald accents with neutral contrast', brand50: '#ecfdf5', brand100: '#d1fae5', brand300: '#86efac', brand500: '#10b981', brand600: '#059669', brand700: '#047857', brand900: '#064e3b', appBg: '#f8fafc', appSurface: '#ffffff', appText: '#0f172a' },
+            { id: 'warm-sand', name: 'Warm Sand', description: 'Soft sand neutrals with restrained warmth', brand50: '#fefce8', brand100: '#fef9c3', brand300: '#fde68a', brand500: '#d97706', brand600: '#b45309', brand700: '#92400e', brand900: '#78350f', appBg: '#fafaf9', appSurface: '#ffffff', appText: '#1c1917' },
+            { id: 'graphite-slate', name: 'Graphite Slate', description: 'Neutral graphite for a minimal professional UI', brand50: '#f8fafc', brand100: '#f1f5f9', brand300: '#cbd5e1', brand500: '#64748b', brand600: '#475569', brand700: '#334155', brand900: '#1e293b', appBg: '#f8fafc', appSurface: '#ffffff', appText: '#0f172a' },
+            { id: 'deep-teal', name: 'Deep Teal', description: 'Sophisticated teal with cool clean backgrounds', brand50: '#f0fdfa', brand100: '#ccfbf1', brand300: '#5eead4', brand500: '#14b8a6', brand600: '#0f766e', brand700: '#115e59', brand900: '#134e4a', appBg: '#f8fafc', appSurface: '#ffffff', appText: '#0f172a' },
+            { id: 'royal-blue', name: 'Royal Blue', description: 'Refined blue accents with high readability', brand50: '#eff6ff', brand100: '#dbeafe', brand300: '#93c5fd', brand500: '#3b82f6', brand600: '#2563eb', brand700: '#1d4ed8', brand900: '#1e3a8a', appBg: '#f8fafc', appSurface: '#ffffff', appText: '#0f172a' },
+            { id: 'violet-indigo', name: 'Violet Indigo', description: 'Elegant violet harmonized with cool surfaces', brand50: '#f5f3ff', brand100: '#ede9fe', brand300: '#c4b5fd', brand500: '#8b5cf6', brand600: '#7c3aed', brand700: '#6d28d9', brand900: '#4c1d95', appBg: '#f8fafc', appSurface: '#ffffff', appText: '#0f172a' },
+            { id: 'crimson', name: 'Crimson', description: 'Confident crimson with clean neutral contrast', brand50: '#fef2f2', brand100: '#fee2e2', brand300: '#fca5a5', brand500: '#ef4444', brand600: '#dc2626', brand700: '#b91c1c', brand900: '#7f1d1d', appBg: '#f8fafc', appSurface: '#ffffff', appText: '#0f172a' },
+            { id: 'amber-gold', name: 'Amber Gold', description: 'Premium amber with restrained gold accents', brand50: '#fffbeb', brand100: '#fef3c7', brand300: '#fcd34d', brand500: '#f59e0b', brand600: '#d97706', brand700: '#b45309', brand900: '#78350f', appBg: '#fffbeb', appSurface: '#ffffff', appText: '#0f172a' },
+            { id: 'forest-green', name: 'Forest Green', description: 'Muted forest accent for a grounded feel', brand50: '#f0fdf4', brand100: '#dcfce7', brand300: '#86efac', brand500: '#22c55e', brand600: '#16a34a', brand700: '#15803d', brand900: '#14532d', appBg: '#f0fdf4', appSurface: '#ffffff', appText: '#0f172a' },
+            { id: 'ocean-blue', name: 'Ocean Blue', description: 'Clear blue accents with airy backgrounds', brand50: '#f0f9ff', brand100: '#e0f2fe', brand300: '#7dd3fc', brand500: '#0ea5e9', brand600: '#0284c7', brand700: '#0369a1', brand900: '#0c4a6e', appBg: '#f0f9ff', appSurface: '#ffffff', appText: '#0f172a' },
+            { id: 'rose-quartz', name: 'Rose Quartz', description: 'Soft rose accent with elegant contrast', brand50: '#fff1f2', brand100: '#ffe4e6', brand300: '#fda4af', brand500: '#f43f5e', brand600: '#e11d48', brand700: '#be123c', brand900: '#881337', appBg: '#fff1f2', appSurface: '#ffffff', appText: '#0f172a' },
+            { id: 'copper-warm', name: 'Copper Warm', description: 'Warm copper accent with soft neutral base', brand50: '#fff7ed', brand100: '#ffedd5', brand300: '#fdba74', brand500: '#f97316', brand600: '#c2410c', brand700: '#9a3412', brand900: '#7c2d12', appBg: '#fff7ed', appSurface: '#ffffff', appText: '#0f172a' },
+            { id: 'midnight', name: 'Midnight', description: 'Dark midnight accent with strong clean contrast', brand50: '#f1f5f9', brand100: '#e2e8f0', brand300: '#64748b', brand500: '#0f172a', brand600: '#020617', brand700: '#000000', brand900: '#000000', appBg: '#f8fafc', appSurface: '#ffffff', appText: '#0f172a' },
+            { id: 'lavender', name: 'Lavender', description: 'Soft lavender with calm cool backgrounds', brand50: '#f5f3ff', brand100: '#ede9fe', brand300: '#c4b5fd', brand500: '#a78bfa', brand600: '#8b5cf6', brand700: '#7c3aed', brand900: '#4c1d95', appBg: '#f5f3ff', appSurface: '#ffffff', appText: '#0f172a' },
+            { id: 'sky', name: 'Sky', description: 'Light sky accent with open spacing', brand50: '#f0f9ff', brand100: '#e0f2fe', brand300: '#bae6fd', brand500: '#38bdf8', brand600: '#0ea5e9', brand700: '#0284c7', brand900: '#0369a1', appBg: '#f0f9ff', appSurface: '#ffffff', appText: '#0f172a' },
+            { id: 'plum', name: 'Plum', description: 'Deep plum accent with refined contrast', brand50: '#fdf4ff', brand100: '#fae8ff', brand300: '#e9d5ff', brand500: '#a855f7', brand600: '#9333ea', brand700: '#7e22ce', brand900: '#581c87', appBg: '#fdf4ff', appSurface: '#ffffff', appText: '#0f172a' },
+            { id: 'carbon-gold', name: 'Carbon Gold', description: 'Carbon accent with restrained gold highlights', brand50: '#f8fafc', brand100: '#f1f5f9', brand300: '#cbd5e1', brand500: '#d4af37', brand600: '#b8962f', brand700: '#8a6d1f', brand900: '#1f2937', appBg: '#f8fafc', appSurface: '#ffffff', appText: '#0f172a' },
+            { id: 'aqua-mint', name: 'Aqua Mint', description: 'Cool aqua accent with fresh clean backgrounds', brand50: '#ecfeff', brand100: '#cffafe', brand300: '#a5f3fc', brand500: '#06b6d4', brand600: '#0891b2', brand700: '#0e7490', brand900: '#164e63', appBg: '#ecfeff', appSurface: '#ffffff', appText: '#0f172a' },
+            { id: 'coral', name: 'Coral', description: 'Warm coral accent with bright clean surfaces', brand50: '#fff1f2', brand100: '#ffe4e6', brand300: '#fecdd3', brand500: '#fb7185', brand600: '#f43f5e', brand700: '#e11d48', brand900: '#881337', appBg: '#fff1f2', appSurface: '#ffffff', appText: '#0f172a' },
+            { id: 'muted-sage', name: 'Muted Sage', description: 'Muted sage green for a calm enterprise palette', brand50: '#f0fdf4', brand100: '#dcfce7', brand300: '#bbf7d0', brand500: '#4d7c0f', brand600: '#3f6212', brand700: '#365314', brand900: '#1a2e05', appBg: '#f0fdf4', appSurface: '#ffffff', appText: '#0f172a' },
+            { id: 'ruby', name: 'Ruby', description: 'Rich ruby accent with polished neutral contrast', brand50: '#fef2f2', brand100: '#fee2e2', brand300: '#fecaca', brand500: '#ef4444', brand600: '#b91c1c', brand700: '#991b1b', brand900: '#7f1d1d', appBg: '#f8fafc', appSurface: '#ffffff', appText: '#0f172a' },
+        ];
+
+        window.applyTheme = function(themeId) {
+            const theme = THEMES.find(t => t.id === themeId) || THEMES[0];
+            const root = document.documentElement;
+            root.setAttribute('data-theme', theme.id);
+            root.style.setProperty('--brand-50', theme.brand50);
+            root.style.setProperty('--brand-100', theme.brand100);
+            root.style.setProperty('--brand-300', theme.brand300);
+            root.style.setProperty('--brand-500', theme.brand500);
+            root.style.setProperty('--brand-600', theme.brand600);
+            root.style.setProperty('--brand-700', theme.brand700);
+            root.style.setProperty('--brand-900', theme.brand900);
+            root.style.setProperty('--app-bg', theme.appBg);
+            root.style.setProperty('--app-surface', theme.appSurface);
+            root.style.setProperty('--app-text', theme.appText);
+            root.style.setProperty('--app-shadow', '0 1px 3px rgba(15, 23, 42, 0.06), 0 1px 2px rgba(15, 23, 42, 0.04)');
+            storeSettings.theme = theme.id;
+
+            const selector = document.getElementById('theme-selector');
+            if (selector) selector.dataset.selected = theme.id;
+            document.querySelectorAll('.theme-option').forEach(btn => {
+                const active = btn.dataset.theme === theme.id;
+                btn.setAttribute('aria-pressed', active ? 'true' : 'false');
+                btn.className = active
+                    ? 'theme-option rounded-xl border border-brand-600 bg-brand-50 p-3 text-left ring-2 ring-brand-500'
+                    : 'theme-option rounded-xl border border-slate-200 bg-white p-3 text-left hover:border-brand-300 hover:bg-slate-50';
+            });
+            if (window.lucide) lucide.createIcons();
+        };
+
+        window.renderThemeSelector = function() {
+            const container = document.getElementById('theme-selector');
+            if (!container) return;
+            const selected = storeSettings.theme || 'classic-pink';
+            container.dataset.selected = selected;
+            container.innerHTML = THEMES.map(theme => `
+                <button type="button" class="theme-option rounded-xl border border-slate-200 bg-white p-3 text-left hover:border-brand-300 hover:bg-slate-50"
+                    data-theme="${esc(theme.id)}" onclick="applyTheme('${esc(theme.id)}')" aria-pressed="${theme.id === selected ? 'true' : 'false'}">
+                    <span class="theme-swatch block h-8 rounded-lg mb-2" style="background: linear-gradient(135deg, ${esc(theme.brand500)} 0%, ${esc(theme.brand600)} 55%, ${esc(theme.brand700)} 100%);"></span>
+                    <span class="block text-sm font-bold text-slate-900">${esc(theme.name)}</span>
+                    <span class="block text-xs text-slate-500 mt-1">${esc(theme.description)}</span>
+                </button>
+            `).join('');
+            window.applyTheme(selected);
+        };
+
+        window.switchSettingsSection = function(sectionName) {
+            document.querySelectorAll('.settings-section').forEach(section => {
+                section.classList.toggle('hidden', section.id !== `settings-${sectionName}`);
+            });
+            document.querySelectorAll('.settings-submenu-btn').forEach(btn => {
+                const active = btn.dataset.settingsSection === sectionName;
+                btn.className = active
+                    ? 'settings-submenu-btn w-full px-4 py-2.5 rounded-xl text-sm font-bold bg-brand-600 text-white flex items-center justify-start gap-2'
+                    : 'settings-submenu-btn w-full px-4 py-2.5 rounded-xl text-sm font-bold bg-white text-slate-700 hover:bg-slate-100 border border-slate-200 flex items-center justify-start gap-2';
+            });
+            if (sectionName === 'access-control') renderAccessControl();
+            if (sectionName === 'user-management') loadUsers();
+            if (sectionName === 'theme') renderThemeSelector();
+            if (sectionName === 'invoice-setup') renderInvoicePadSettings();
+            if (window.lucide) lucide.createIcons();
+        };
+
+        const FALLBACK_PERMISSION_DEFS = [
+            { key: 'viewOrders', label: 'View Orders' },
+            { key: 'editOrders', label: 'Edit Orders' },
+            { key: 'manageProducts', label: 'Manage Products & Stock' },
+            { key: 'addCollections', label: 'Add Collections' },
+            { key: 'deleteCollections', label: 'Delete Collections' },
+            { key: 'manageExpenses', label: 'Manage Daily Expenses' },
+            { key: 'viewProfit', label: 'View Profit/Revenue Stats' },
+            { key: 'accessSettings', label: 'Access Settings' },
+            { key: 'userManagement', label: 'User Management' },
+        ];
+
+        function isValidEmail(email) {
+            return /^[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}$/.test(email);
+        }
+
+        function isStrongPassword(password) {
+            return password.length >= 10 && /[a-z]/.test(password) && /[A-Z]/.test(password) && /\d/.test(password) && /[^A-Za-z0-9]/.test(password);
+        }
+
+        window.openUserModal = function() {
+            document.getElementById('user-modal').classList.remove('hidden');
+            if (window.lucide) lucide.createIcons();
+        };
+
+        window.closeUserModal = function() {
+            document.getElementById('user-modal').classList.add('hidden');
+        };
+
+        window.handleAddUser = async function(e) {
+            e.preventDefault();
+            const fullName = document.getElementById('user-full-name').value.trim();
+            const role = document.getElementById('user-role').value;
+            const email = document.getElementById('user-email').value.trim();
+            const password = document.getElementById('user-password').value;
+
+            if (!fullName) { showToast('Full name is required.', 'error'); return; }
+            if (['Admin', 'Manager', 'Salesman', 'Marketing'].indexOf(role) < 0) { showToast('Invalid role. Super Admin is reserved for the primary owner.', 'error'); return; }
+            if (!isValidEmail(email)) { showToast('Please enter a strict valid email address.', 'error'); return; }
+            if (!isStrongPassword(password)) { showToast('Password must be at least 10 characters and include uppercase, lowercase, number, and special character.', 'error'); return; }
+
+            try {
+                await api('POST', '/api/users', { fullName, role, email, password });
+                e.target.reset();
+                closeUserModal();
+                await loadUsers();
+                showToast('User added successfully!');
+            } catch (err) {
+                showToast(err.message || 'Could not add user.', 'error');
+            }
+        };
+
+        window.deleteUser = async function(userId) {
+            if (!isSuperAdmin) { showToast('Only Super Admin can delete user accounts.', 'error'); return; }
+            if (!confirm('Delete this user account?')) return;
+            try {
+                await api('DELETE', `/api/users/${encodeURIComponent(userId)}`);
+                await loadUsers();
+                showToast('User deleted.');
+            } catch (err) {
+                showToast(err.message || 'Could not delete user.', 'error');
+            }
+        };
+
+        async function loadUsers() {
+            if (!isAdminAuthenticated) return;
+            try {
+                const data = await api('GET', '/api/users');
+                users = data.users || [];
+                permissionDefs = data.permissionDefs || FALLBACK_PERMISSION_DEFS;
+                renderUserManagement();
+                renderAccessControl();
+            } catch (err) {
+                console.error('Users error:', err);
+            }
+        }
+
+        window.renderUserManagement = function() {
+            const box = document.getElementById('users-list');
+            if (!box) return;
+            const superAdminHtml = `
+                <div class="p-4 flex items-center justify-between gap-3 bg-slate-50">
+                    <div class="min-w-0">
+                        <p class="text-sm font-bold text-slate-900 truncate">${esc(storeSettings.adminUser || 'Super Admin')}</p>
+                        <p class="text-xs text-slate-500">Super Admin</p>
+                    </div>
+                    <span class="text-xs font-bold text-emerald-700 bg-emerald-50 px-2 py-1 rounded-lg">Protected</span>
+                </div>`;
+            if (!users.length) {
+                box.innerHTML = superAdminHtml + `<p class="p-4 text-center text-xs text-slate-400">No additional users yet.</p>`;
+                if (window.lucide) lucide.createIcons();
+                return;
+            }
+            box.innerHTML = superAdminHtml + users.map(u => `
+                <div class="p-4 flex items-center justify-between gap-3">
+                    <div class="min-w-0">
+                        <p class="text-sm font-bold text-slate-900 truncate">${esc(u.fullName || u.email)}</p>
+                        <p class="text-xs text-slate-500 truncate">${esc(u.email)}</p>
+                    </div>
+                    <div class="flex items-center gap-2 shrink-0">
+                        <span class="text-xs font-bold text-slate-600 bg-slate-100 px-2 py-1 rounded-lg">${esc(u.role)}</span>
+                        ${isSuperAdmin ? `<button type="button" onclick="deleteUser('${esc(u.id)}')" class="p-2 rounded-xl text-rose-600 hover:bg-rose-50" title="Delete user"><i data-lucide="trash-2" class="w-4 h-4"></i></button>` : ''}
+                    </div>
+                </div>
+            `).join('');
+            if (window.lucide) lucide.createIcons();
+        };
+
+        window.renderAccessControl = function() {
+            const select = document.getElementById('access-user-id');
+            if (!select) return;
+            const defs = permissionDefs.length ? permissionDefs : FALLBACK_PERMISSION_DEFS;
+            permissionDefs = defs;
+            const superAdmin = { id: 'super-admin', fullName: storeSettings.adminUser || 'Super Admin', role: 'Super Admin', permissions: Object.fromEntries(defs.map(d => [d.key, true])), isSuperAdmin: true };
+            const allUsers = [superAdmin, ...users];
+            if (!currentAccessUserId || !allUsers.some(u => u.id === currentAccessUserId)) currentAccessUserId = superAdmin.id;
+            select.innerHTML = allUsers.map(u => `<option value="${esc(u.id)}">${esc(u.fullName || u.email || u.id)} (${esc(u.role)})</option>`).join('');
+            select.value = currentAccessUserId;
+            renderAccessMatrix();
+        };
+
+        window.renderAccessMatrix = function() {
+            const matrix = document.getElementById('access-permissions-matrix');
+            if (!matrix) return;
+            const select = document.getElementById('access-user-id');
+            if (select) currentAccessUserId = select.value;
+            const defs = permissionDefs.length ? permissionDefs : FALLBACK_PERMISSION_DEFS;
+            const superAdmin = { id: 'super-admin', fullName: storeSettings.adminUser || 'Super Admin', role: 'Super Admin', permissions: Object.fromEntries(defs.map(d => [d.key, true])), isSuperAdmin: true };
+            const allUsers = [superAdmin, ...users];
+            const user = allUsers.find(u => u.id === currentAccessUserId) || superAdmin;
+            const superAdminUser = user.id === 'super-admin';
+            matrix.innerHTML = defs.map(def => `
+                <label class="flex items-center justify-between gap-3 rounded-xl border border-slate-200 bg-white p-3 hover:bg-slate-50">
+                    <span class="text-sm text-slate-700">${esc(def.label)}</span>
+                    <input type="checkbox" class="w-4 h-4 rounded border-slate-300 text-brand-600" data-permission-key="${esc(def.key)}"
+                        ${superAdminUser || user.permissions[def.key] ? 'checked' : ''}
+                        ${superAdminUser || !isSuperAdmin ? 'disabled' : ''}
+                        onchange="togglePermission('${esc(user.id)}', '${esc(def.key)}', this.checked)">
+                </label>
+            `).join('');
+        };
+
+        window.togglePermission = async function(userId, key, checked) {
+            if (!isSuperAdmin) return;
+            const user = users.find(u => u.id === userId);
+            if (!user) return;
+            user.permissions = { ...(user.permissions || {}), [key]: checked };
+            try {
+                await api('PUT', `/api/users/${encodeURIComponent(userId)}/permissions`, { permissions: user.permissions });
+            } catch (err) {
+                showToast(err.message || 'Could not update permission.', 'error');
+            }
+            renderAccessMatrix();
+        };
+
+        function applyStoreSettingsToUI() {
+            const shopName = storeSettings.shopName || 'Taham';
+            const pageName = storeSettings.pageName || shopName || 'Taham';
+            const setValue = (id, value) => {
+                const el = document.getElementById(id);
+                if (el) el.value = value || '';
+            };
+            const setChecked = (id, checked) => {
+                const el = document.getElementById(id);
+                if (el) el.checked = checked;
+            };
+
+            document.title = pageName;
+            document.getElementById('header-shop-name').innerText = pageName;
+            document.getElementById('footer-shop-name').innerText = shopName;
+            document.getElementById('footer-shop-address').innerText = storeSettings.shopAddress || 'Rayerbag, Dhaka, Bangladesh.';
+
+            const footerPhoneNumber = storeSettings.shopPhone || '01400-570014';
+            const footerPhoneLink = document.getElementById('footer-shop-phone');
+            const footerPhoneText = document.getElementById('footer-shop-phone-text');
+            if (footerPhoneLink) {
+                const phoneDigits = footerPhoneNumber.replace(/[^\d+]/g, '');
+                footerPhoneLink.href = `tel:${phoneDigits}`;
+                footerPhoneLink.setAttribute('aria-label', `Call or WhatsApp helpline ${footerPhoneNumber}`);
+                footerPhoneLink.title = 'Call / WhatsApp Helpline';
+            }
+            if (footerPhoneText) footerPhoneText.innerText = t('Helpline: {p}', { p: footerPhoneNumber });
+
+            document.getElementById('checkout-merchant-num').innerText = storeSettings.paymentNumber || '';
+
+            // Populate settings form inputs
+            setValue('page-name', pageName);
+            setValue('set-shop-name', shopName);
+            setValue('set-shop-phone', storeSettings.shopPhone);
+            setValue('set-payment-number', storeSettings.paymentNumber);
+            setValue('set-shop-address', storeSettings.shopAddress);
+            setValue('set-admin-user', storeSettings.adminUser || '');
+            setValue('set-admin-pass', '');
+            setChecked('set-show-stock', storeSettings.showStockToCustomers !== false && storeSettings.showStockToCustomers !== 'false');
+
+            const accessAdmin = document.getElementById('access-admin-user');
+            if (accessAdmin) accessAdmin.innerText = storeSettings.adminUser || shopName;
+            renderUserManagement();
+            renderAccessControl();
+
+            const preview = document.getElementById('settings-logo-preview');
+            if (preview) preview.src = `/logo.png?v=${Date.now()}`;
+
+            applyTheme(storeSettings.theme || 'classic-pink');
+            renderThemeSelector();
+            renderInvoicePadSettings();
+            renderProducts();
+        }
+
+        window.getInvoicePadUrl = function() {
+            const url = (typeof storeSettings !== 'undefined' && storeSettings.invoicePadUrl) || '/official-pad-background.jpg';
+            return String(url || '/official-pad-background.jpg');
+        };
+
+        window.insertPrintPadBackground = function(root) {
+            if (!root) return;
+            const padUrl = window.getInvoicePadUrl();
+            let bg = root.querySelector(':scope > .print-pad-background');
+            if (!bg) {
+                bg = document.createElement('img');
+                bg.className = 'print-pad-background';
+                bg.alt = '';
+                bg.setAttribute('aria-hidden', 'true');
+                root.insertBefore(bg, root.firstChild);
+            }
+            bg.src = padUrl;
+            return bg;
+        };
+
+        window.applyInvoicePadSettings = function() {
+            const padUrl = window.getInvoicePadUrl();
+            const rootStyle = document.documentElement.style;
+            const ss = (typeof storeSettings !== 'undefined' && storeSettings) ? storeSettings : {};
+            const top = `${Number(ss.invoiceMarginTop || 58)}mm`;
+            const bottom = `${Number(ss.invoiceMarginBottom || 48)}mm`;
+            const left = `${Number(ss.invoiceMarginLeft || 18)}mm`;
+            const right = `${Number(ss.invoiceMarginRight || 18)}mm`;
+            rootStyle.setProperty('--invoice-pad-image', `url("${padUrl}")`);
+            rootStyle.setProperty('--invoice-margin-top', top);
+            rootStyle.setProperty('--invoice-margin-bottom', bottom);
+            rootStyle.setProperty('--invoice-margin-left', left);
+            rootStyle.setProperty('--invoice-margin-right', right);
+            let dynamicPadStyle = document.getElementById('taham-dynamic-pad-style');
+            if (!dynamicPadStyle) {
+                dynamicPadStyle = document.createElement('style');
+                dynamicPadStyle.id = 'taham-dynamic-pad-style';
+                document.head.appendChild(dynamicPadStyle);
+            }
+            // Escape characters that could break out of a CSS url("...") token.
+            const safePadUrl = String(padUrl).replace(/["'`\\()]/g, encodeURIComponent);
+            const PAD_VARS = `--invoice-margin-top:${top};--invoice-margin-right:${right};--invoice-margin-bottom:${bottom};--invoice-margin-left:${left}`;
+            // SINGLE letterhead pad layer. Only `.print-pad-background` carries the pad image;
+            // `.print-pad`, `@page`, html/body and watermarks must NOT also paint it (no double pad).
+            const SINGLE_PAD_RESET = `
+    ${PAD_VARS};
+    position: relative !important;
+    box-sizing: border-box !important;
+    width: 210mm !important; max-width: 210mm !important;
+    min-height: 297mm !important; max-height: none !important; height: auto !important;
+    margin: 0 auto !important; border: 0 !important; border-radius: 0 !important; box-shadow: none !important;
+    background-color: transparent !important; background-image: none !important; background: transparent !important;
+    padding: ${top} ${right} ${bottom} ${left} !important;
+    overflow: visible !important;
+    -webkit-print-color-adjust: exact !important; print-color-adjust: exact !important;
+`;
+            const SINGLE_PAD_BG = `
+    display: block !important; visibility: visible !important; opacity: 1 !important;
+    position: absolute !important; top: 0 !important; left: 0 !important; right: 0 !important; bottom: 0 !important;
+    inset: 0 !important; width: 100% !important; height: 100% !important; margin: 0 !important; padding: 0 !important; border: 0 !important;
+    background-image: none !important; background: none !important;
+    object-fit: cover !important; object-position: center center !important; z-index: 0 !important; pointer-events: none !important;
+    -webkit-print-color-adjust: exact !important; print-color-adjust: exact !important;
+`;
+            dynamicPadStyle.textContent = `
+@media print { @page { size: A4 portrait; margin: 0; background-image: none !important; background: none !important; } }
+@media screen {
+  .print-pad, .print-pad.print-pad, #invoice-print-area.print-pad, #report-print-area.print-pad, #invoice-print-area, #report-print-area { background-image: none !important; background: transparent !important; }
+  .print-pad-background { display: block !important; }
+}
+@media print {
+  html, body { margin: 0 !important; padding: 0 !important; background: transparent !important; background-image: none !important; -webkit-print-color-adjust: exact !important; print-color-adjust: exact !important; }
+  .print-pad, .print-pad.print-pad, #invoice-print-area.print-pad, #report-print-area.print-pad, #invoice-print-area, #report-print-area { ${SINGLE_PAD_RESET} }
+  #invoice-print-area, #report-print-area { padding: ${top} ${right} ${bottom} ${left} !important; background-image: none !important; background: transparent !important; }
+  .print-pad-background { ${SINGLE_PAD_BG} }
+  .print-pad > :not(.print-pad-background) { position: relative; z-index: 1; }
+  /* proper page breaks + spacing inside pad boundaries on A4 */
+  .print-pad { page-break-inside: auto !important; break-inside: auto !important; }
+  table { page-break-inside: auto !important; break-inside: auto !important; }
+  thead { display: table-header-group !important; }
+  tfoot { display: table-footer-group !important; }
+  tr, .report-metrics-grid > *, .report-print-table tbody tr { page-break-inside: avoid !important; break-inside: avoid !important; }
+  .report-print-header, .report-orders-wrap, .invoice-totals, .invoice-payment-box, .invoice-signatures-footer { page-break-inside: avoid !important; break-inside: avoid !important; }
+  /* don't clip monthly/ daily content inside the pad */
+  .print-pad, #report-print-area, #invoice-print-area { overflow: visible !important; max-height: none !important; }
+}`;
+            document.querySelectorAll('.print-pad').forEach(pad => {
+                pad.style.setProperty('--invoice-pad-image', `url("${padUrl}")`);
+                window.insertPrintPadBackground(pad);
+            });
+            return padUrl;
+        };
+
+        window.preparePrintPagination = function(selector) {
+            const root = document.querySelector(selector);
+            if (!root) return;
+            window.applyInvoicePadSettings();
+            window.insertPrintPadBackground(root);
+            root.querySelectorAll('.print-pad').forEach(pad => window.insertPrintPadBackground(pad));
+            root.querySelectorAll('table').forEach(table => {
+                table.style.breakInside = 'auto';
+                table.style.pageBreakInside = 'auto';
+            });
+            root.querySelectorAll('table tbody tr').forEach(tr => {
+                tr.style.breakInside = 'avoid';
+                tr.style.pageBreakInside = 'avoid';
+                tr.style.pageBreakAfter = 'auto';
+            });
+            root.querySelectorAll('table thead').forEach(thead => { thead.style.display = 'table-header-group'; });
+            root.querySelectorAll('table tfoot').forEach(tfoot => { tfoot.style.display = 'table-footer-group'; });
+            root.classList.add('print-pad-paginated');
+        };
+
+        window.updateInvoicePadPreview = function() {
+            const ss = (typeof storeSettings !== 'undefined' && storeSettings) ? storeSettings : {};
+            const read = (id, fallback) => {
+                const el = document.getElementById(id);
+                const n = parseFloat(el ? el.value : ss[id]);
+                return Number.isFinite(n) && n >= 0 ? n : fallback;
+            };
+            const top = read('invoice-margin-top', Number(ss.invoiceMarginTop || 58));
+            const bottom = read('invoice-margin-bottom', Number(ss.invoiceMarginBottom || 48));
+            const left = read('invoice-margin-left', Number(ss.invoiceMarginLeft || 18));
+            const right = read('invoice-margin-right', Number(ss.invoiceMarginRight || 18));
+            const padUrl = window.getInvoicePadUrl();
+            const unit = (ss.invoiceMarginUnit || 'mm');
+
+            ['document', 'invoice-pad-live-preview'].forEach(() => {});
+            const setVar = (name, value) => document.documentElement.style.setProperty(name, value);
+            setVar('--invoice-margin-top', `${top}${unit}`);
+            setVar('--invoice-margin-bottom', `${bottom}${unit}`);
+            setVar('--invoice-margin-left', `${left}${unit}`);
+            setVar('--invoice-margin-right', `${right}${unit}`);
+
+            const preview = document.getElementById('invoice-pad-live-preview');
+            const safe = document.getElementById('invoice-pad-live-safe');
+            const bg = document.querySelector('.invoice-pad-live-bg');
+            const dims = document.getElementById('invoice-pad-live-dims');
+            const padImg = document.getElementById('invoice-pad-preview');
+            const urlText = document.getElementById('invoice-pad-url');
+            if (preview) preview.style.setProperty('--invoice-pad-image', `url("${padUrl}")`);
+            if (safe) {
+                safe.style.top = `${top}${unit}`;
+                safe.style.bottom = `${bottom}${unit}`;
+                safe.style.left = `${left}${unit}`;
+                safe.style.right = `${right}${unit}`;
+            }
+            if (bg) bg.src = padUrl;
+            if (padImg) padImg.src = padUrl;
+            if (urlText) urlText.innerText = padUrl;
+            if (dims) dims.innerText = `${top}${unit} / ${bottom}${unit} / ${left}${unit} / ${right}${unit}`;
+            window.applyInvoicePadSettings();
+        };
+
+        window.renderInvoicePadSettings = function() {
+            const ss = (typeof storeSettings !== 'undefined' && storeSettings) ? storeSettings : {};
+            const setValue = (id, value) => { const el = document.getElementById(id); if (el) el.value = value == null ? '' : value; };
+            setValue('invoice-margin-top', ss.invoiceMarginTop != null ? ss.invoiceMarginTop : 58);
+            setValue('invoice-margin-bottom', ss.invoiceMarginBottom != null ? ss.invoiceMarginBottom : 48);
+            setValue('invoice-margin-left', ss.invoiceMarginLeft != null ? ss.invoiceMarginLeft : 18);
+            setValue('invoice-margin-right', ss.invoiceMarginRight != null ? ss.invoiceMarginRight : 18);
+            const padImg = document.getElementById('invoice-pad-preview');
+            const bg = document.querySelector('.invoice-pad-live-bg');
+            const urlText = document.getElementById('invoice-pad-url');
+            if (padImg) padImg.src = window.getInvoicePadUrl();
+            if (bg) bg.src = window.getInvoicePadUrl();
+            if (urlText) urlText.innerText = window.getInvoicePadUrl();
+            window.updateInvoicePadPreview();
+        };
+
+        window.saveInvoiceSetup = async function() {
+            const ss = (typeof storeSettings !== 'undefined' && storeSettings) ? storeSettings : {};
+            const num = (id, fallback) => {
+                const el = document.getElementById(id);
+                const n = parseFloat(el ? el.value : fallback);
+                return Number.isFinite(n) && n >= 0 ? String(Math.round(n * 100) / 100) : String(fallback);
+            };
+            const payload = Object.assign({}, ss, {
+                invoiceMarginTop: num('invoice-margin-top', ss.invoiceMarginTop || 58),
+                invoiceMarginBottom: num('invoice-margin-bottom', ss.invoiceMarginBottom || 48),
+                invoiceMarginLeft: num('invoice-margin-left', ss.invoiceMarginLeft || 18),
+                invoiceMarginRight: num('invoice-margin-right', ss.invoiceMarginRight || 18),
+                invoiceMarginUnit: ss.invoiceMarginUnit || 'mm'
+            });
+            if (typeof storeSettings !== 'undefined') Object.assign(storeSettings, payload);
+            try {
+                if (typeof api === 'function') await api('PUT', '/api/settings/store_config', payload);
+                window.applyInvoicePadSettings();
+                window.updateInvoicePadPreview();
+            } catch (err) {
+                if (typeof showToast === 'function') showToast(err.message || 'Could not save invoice setup.', 'error');
+            }
+        };
+
+        window.uploadInvoicePad = async function() {
+            const input = document.getElementById('invoice-pad-upload');
+            if (!input || !input.files || !input.files[0]) {
+                if (typeof showToast === 'function') showToast('Please choose an image file.', 'error');
+                return;
+            }
+            const file = input.files[0];
+            if (!file.type.startsWith('image/')) {
+                if (typeof showToast === 'function') showToast('Please choose an image file.', 'error');
+                return;
+            }
+            if (file.size > 8 * 1024 * 1024) {
+                if (typeof showToast === 'function') showToast('Image must be smaller than 8 MB.', 'error');
+                return;
+            }
+            const dataUrl = await new Promise((resolve, reject) => {
+                const reader = new FileReader();
+                reader.onload = () => resolve(reader.result);
+                reader.onerror = () => reject(new Error('Could not read the image file.'));
+                reader.readAsDataURL(file);
+            });
+            try {
+                const result = await api('POST', '/api/invoice-pad', { dataUrl, filename: file.name });
+                const padUrl = result.padUrl || result.invoicePadUrl || '/invoice-pad-background.jpg';
+                if (typeof storeSettings !== 'undefined') {
+                    storeSettings.invoicePadUrl = padUrl;
+                    storeSettings.invoicePadFilename = file.name;
+                }
+                await api('PUT', '/api/settings/store_config', Object.assign({}, storeSettings, { invoicePadUrl: padUrl, invoicePadFilename: file.name }));
+                window.applyInvoicePadSettings();
+                window.renderInvoicePadSettings();
+                if (typeof showToast === 'function') showToast('Invoice pad uploaded and applied.');
+            } catch (err) {
+                if (typeof showToast === 'function') showToast(err.message || 'Could not upload invoice pad.', 'error');
+            }
+        };
+        function updatePendingBadge() {
+            const pendingCount = orders.filter(o => o.status === 'Pending').length;
+            const badge = document.getElementById('pending-orders-badge');
+            if (pendingCount > 0) {
+                badge.innerText = pendingCount;
+                badge.classList.remove('hidden');
+            } else {
+                badge.classList.add('hidden');
+            }
+        }
+
+        // Toast Helper
+        window.showToast = function(message, type = 'success') {
+            const container = document.getElementById('toast-container');
+            const toast = document.createElement('div');
+            const bgColor = type === 'success' ? 'bg-slate-900 text-white' : 'bg-rose-600 text-white';
+            toast.className = `${bgColor} px-4 py-3 rounded-xl shadow-xl flex items-center gap-2.5 text-sm font-medium transition-all duration-300 translate-y-2 opacity-0`;
+            toast.innerHTML = `
+                <i data-lucide="${type === 'success' ? 'check-circle-2' : 'alert-circle'}" class="w-4 h-4 text-pink-400 shrink-0"></i>
+                <span>${esc(t(message))}</span>
+            `;
+            container.appendChild(toast);
+            lucide.createIcons();
+            requestAnimationFrame(() => toast.classList.remove('translate-y-2', 'opacity-0'));
+            setTimeout(() => {
+                toast.classList.add('opacity-0', 'translate-y-2');
+                setTimeout(() => toast.remove(), 300);
+            }, 3200);
+        };
+
+        // ==========================================
+        // NAVIGATION & SUPER ADMIN AUTHENTICATION
+        // ==========================================
+        window.switchView = function(view) {
+            const storeView = document.getElementById('store-view');
+            const adminView = document.getElementById('admin-view');
+            const cartBtn = document.getElementById('header-cart-btn');
+
+            if (view === 'store') {
+                storeView.classList.remove('hidden');
+                adminView.classList.add('hidden');
+                cartBtn.classList.remove('hidden');
+            } else if (view === 'admin') {
+                if (!isAdminAuthenticated) {
+                    document.getElementById('admin-login-modal').classList.remove('hidden');
+                    return;
+                }
+                storeView.classList.add('hidden');
+                adminView.classList.remove('hidden');
+                cartBtn.classList.add('hidden');
+                updateAdminDashboard();
+            }
+            window.scrollTo({ top: 0, behavior: 'smooth' });
+        };
+
+        window.handleAdminNavClick = function() {
+            if (isAdminAuthenticated) {
+                switchView('admin');
+            } else {
+                document.getElementById('admin-login-modal').classList.remove('hidden');
+            }
+        };
+
+        window.closeAdminLoginModal = function() {
+            document.getElementById('admin-login-modal').classList.add('hidden');
+        };
+
+        window.handleAdminLogin = async function(e) {
+            e.preventDefault();
+            e.stopPropagation();
+            const usernameEl = document.getElementById('login-username');
+            const passwordEl = document.getElementById('login-password');
+            const username = (usernameEl.value || '').trim();
+            const password = passwordEl.value || '';
+            const submitBtn = e.submitter || null;
+            if (!username || !password) {
+                showToast('Please enter username and password.', 'error');
+                return;
+            }
+            if (submitBtn) submitBtn.disabled = true;
+            try {
+                await api('POST', '/api/login', { username, password });
+                isAdminAuthenticated = true;
+                isSuperAdmin = true;
+                window.adminUsername = username;
+                document.getElementById('admin-logout-btn').classList.remove('hidden');
+                closeAdminLoginModal();
+                passwordEl.value = '';
+                window.__sessionExpiredSuppress = true;
+                try {
+                    await window.__refreshAll();
+                    await loadUsers();
+                } catch (refreshErr) {
+                    console.warn('Login succeeded, but dashboard refresh failed:', refreshErr);
+                } finally {
+                    window.__sessionExpiredSuppress = false;
+                }
+                showToast('Welcome to the Super Admin panel!');
+                switchView('admin');
+            } catch (err) {
+                isAdminAuthenticated = false;
+                isSuperAdmin = false;
+                showToast(err.message || 'Wrong username or password!', 'error');
+            } finally {
+                if (submitBtn) submitBtn.disabled = false;
+            }
+        };
+
+        window.logoutAdmin = async function() {
+            try { await api('POST', '/api/logout'); } catch (e) { /* ignore */ }
+            isAdminAuthenticated = false;
+            isSuperAdmin = false;
+            users = [];
+            currentAccessUserId = '';
+            document.getElementById('admin-logout-btn').classList.add('hidden');
+            await window.__refreshAll();
+            showToast('Logged out successfully.');
+            switchView('store');
+        };
+
+        window.switchAdminSubTab = function(tabName) {
+            document.querySelectorAll('.admin-subtab-panel').forEach(p => p.classList.add('hidden'));
+            document.getElementById(`subtab-${tabName}`).classList.remove('hidden');
+
+            document.querySelectorAll('.admin-sub-btn').forEach(btn => {
+                const active = btn.dataset.subtab === tabName;
+                btn.className = active
+                    ? "admin-sub-btn w-full px-4 py-2.5 rounded-xl text-sm font-bold bg-brand-600 text-white shadow-sm flex items-center justify-start gap-2"
+                    : "admin-sub-btn w-full px-4 py-2.5 rounded-xl text-sm font-bold bg-white text-slate-700 hover:bg-slate-100 border border-slate-200 flex items-center justify-start gap-2";
+            });
+            if (tabName === 'settings' && typeof window.switchSettingsSection === 'function') {
+                window.switchSettingsSection('user-management');
+            }
+            if (tabName === 'reports' && typeof window.renderReports === 'function') {
+                window.switchReportView(currentReportView || 'daily');
+            }
+            lucide.createIcons();
+        };
+
+        window.openAdminSummary = function(tabName, orderFilter) {
+            window.switchAdminSubTab(tabName);
+            if (tabName === 'orders') {
+                const filter = document.getElementById('admin-order-filter');
+                if (filter) {
+                    filter.value = orderFilter || 'All';
+                    window.renderAdminOrders();
+                }
+            } else if (tabName === 'inventory' && typeof window.renderAdminInventory === 'function') {
+                window.renderAdminInventory();
+            } else if (tabName === 'expenses' && typeof window.renderAdminExpenses === 'function') {
+                window.renderAdminExpenses();
+            }
+        };
+
+        // ==========================================
+        // STOREFRONT RENDERING & CART LOGIC
+        // ==========================================
+        window.updateCategoryTitle = function() {
+            document.getElementById('current-category-title').innerText =
+                selectedCategory === 'All' ? t('All Collections') : selectedCategory;
+        };
+
+        window.filterCategory = function(category) {
+            selectedCategory = category;
+            renderCategoryFilters();
+            updateCategoryTitle();
+            renderProducts();
+        };
+
+        window.selectCollection = function(name) {
+            filterCategory(name);
+            document.getElementById('products-section').scrollIntoView({ behavior: 'smooth' });
+        };
+
+        window.renderCategoryFilters = function() {
+            const box = document.getElementById('category-filters');
+            const names = ['All', ...collections.map(c => c.name)];
+            box.innerHTML = names.map(n => {
+                const cls = n === selectedCategory
+                    ? 'cat-btn active px-4 py-2 rounded-xl text-sm font-semibold whitespace-nowrap bg-brand-600 text-white shadow-sm transition-all'
+                    : 'cat-btn px-4 py-2 rounded-xl text-sm font-semibold whitespace-nowrap bg-slate-100 text-slate-700 hover:bg-slate-200 transition-all';
+                return `<button data-cat="${esc(n)}" onclick="filterCategory(this.dataset.cat)" class="${cls}">${n === 'All' ? 'All Items' : esc(n)}</button>`;
+            }).join('');
+        };
+
+        window.renderCollections = function() {
+            const section = document.getElementById('collections-section');
+            const grid = document.getElementById('collections-grid');
+            if (!collections.length) { section.classList.add('hidden'); return; }
+            section.classList.remove('hidden');
+            grid.innerHTML = collections.map(c => {
+                const assigned = Array.isArray(c.productIds) ? c.productIds : [];
+                const n = products.filter(p => assigned.includes(p.id) || p.category === c.name).length;
+                return `
+                    <button data-cat="${esc(c.name)}" onclick="selectCollection(this.dataset.cat)"
+                        class="group relative overflow-hidden rounded-2xl aspect-[4/5] bg-slate-200 shadow-sm hover:shadow-xl transition-all text-left">
+                        <img src="${esc(c.image)}" alt="${esc(c.name)}"
+                             onerror="this.onerror=null;this.src='/placeholder.svg?w=600&h=750&text=Taham'"
+                             class="w-full h-full object-cover group-hover:scale-105 transition-transform duration-500">
+                        <div class="absolute inset-0 bg-gradient-to-t from-slate-900/80 via-slate-900/10 to-transparent"></div>
+                        <div class="absolute bottom-0 left-0 right-0 p-4 text-white">
+                            <h4 class="font-bold text-lg leading-tight">${esc(c.name)}</h4>
+                            <p class="text-xs text-slate-200 mt-0.5">${esc(t('{n} items', { n }))}</p>
+                        </div>
+                    </button>`;
+            }).join('');
+        };
+
+        window.initTiltInteractions = function() {
+            if (window.__tiltInitialized) return;
+            window.__tiltInitialized = true;
+
+            document.addEventListener('mousemove', function(event) {
+                const el = event.target.closest && event.target.closest('.tilt-3d');
+                if (!el) return;
+                const rect = el.getBoundingClientRect();
+                if (!rect.width || !rect.height) return;
+                const x = Math.max(0, Math.min(1, (event.clientX - rect.left) / rect.width));
+                const y = Math.max(0, Math.min(1, (event.clientY - rect.top) / rect.height));
+                const maxTilt = el.classList.contains('size-selector') ? 4 : 7;
+                const rotateX = (0.5 - y) * maxTilt;
+                const rotateY = (x - 0.5) * maxTilt;
+                const lift = el.classList.contains('size-selector') ? 'translateY(-3px) scale(1.08)' : 'translateY(-8px) scale(1.018)';
+                el.style.transform = `perspective(900px) rotateX(${rotateX.toFixed(2)}deg) rotateY(${rotateY.toFixed(2)}deg) ${lift}`;
+            });
+
+            document.addEventListener('mouseout', function(event) {
+                const el = event.target.closest && event.target.closest('.tilt-3d');
+                if (!el) return;
+                if (event.relatedTarget && el.contains(event.relatedTarget)) return;
+                el.style.transform = '';
+            });
+        };
+
+        window.initScrollReveal = function(root) {
+            const scope = root && root.querySelectorAll ? root : document;
+            const items = scope.querySelectorAll ? scope.querySelectorAll('.reveal') : [];
+            if (!items.length) return;
+
+            const reduceMotion = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+            if (reduceMotion || !('IntersectionObserver' in window)) {
+                items.forEach(item => item.classList.add('reveal-visible'));
+                return;
+            }
+
+            if (!window.__revealObserver) {
+                window.__revealObserver = new IntersectionObserver((entries) => {
+                    entries.forEach(entry => {
+                        if (entry.isIntersecting) {
+                            entry.target.classList.add('reveal-visible');
+                            window.__revealObserver.unobserve(entry.target);
+                        }
+                    });
+                }, { threshold: 0.08, rootMargin: '0px 0px -40px 0px' });
+            }
+
+            items.forEach(item => window.__revealObserver.observe(item));
+        };
+
+        window.selectProductSize = function(productId, size) {
+            selectedSizes[productId] = size;
+            renderProducts();
+        };
+
+        window.renderProducts = function() {
+            const grid = document.getElementById('products-grid');
+            const searchQuery = document.getElementById('search-input').value.toLowerCase().trim();
+
+            const filtered = products.filter(p => {
+                const matchesCat = selectedCategory === 'All' || p.category === selectedCategory;
+                const matchesSearch = String(p.name || '').toLowerCase().includes(searchQuery) || String(p.category || '').toLowerCase().includes(searchQuery);
+                return matchesCat && matchesSearch;
+            });
+
+            document.getElementById('product-count-label').innerText = t('{n} items found', { n: filtered.length });
+
+            if (filtered.length === 0) {
+                grid.innerHTML = `
+                    <div class="col-span-full py-16 text-center bg-white rounded-2xl border border-slate-200">
+                        <i data-lucide="search-x" class="w-12 h-12 text-slate-300 mx-auto mb-3"></i>
+                        <h4 class="text-lg font-bold text-slate-700">No clothes found</h4>
+                        <p class="text-sm text-slate-500 mt-1">Try searching with another name or collection.</p>
+                    </div>
+                `;
+                lucide.createIcons();
+                return;
+            }
+
+            grid.innerHTML = filtered.map(product => {
+                const activeSize = selectedSizes[product.id] || 'L';
+                const sizes = ['S', 'M', 'L', 'XL'];
+                const colors = Array.isArray(product.colors) ? product.colors : [];
+                const activeColor = colors.some(c => c.name === selectedColors[product.id]) ? selectedColors[product.id] : (colors[0] ? colors[0].name : '');
+                const photos = productPhotos(product);
+                let photoIdx = selectedImages[product.id];
+                if (!(photoIdx >= 0 && photoIdx < photos.length)) {
+                    const byColor = photos.findIndex(im => activeColor && im.color === activeColor);
+                    photoIdx = byColor >= 0 ? byColor : 0;
+                }
+                const shownPhoto = photos[photoIdx];
+                const stock = Number(product.stock ?? 0);
+                const isOutOfStock = stock <= 0;
+                const price = Number(product.price);
+                const sale = Number(product.salePrice ?? product.price);
+                const hasDiscount = sale < price;
+                const pct = hasDiscount ? Math.round((1 - sale / price) * 100) : 0;
+                const stockToggle = document.getElementById('set-show-stock');
+                const showStockToCustomers = storeSettings.showStockToCustomers !== false && storeSettings.showStockToCustomers !== 'false' && (!stockToggle || stockToggle.checked);
+
+                return `
+                    <div class="product-card tilt-3d reveal bg-white/90 backdrop-blur-sm rounded-2xl border border-slate-200 overflow-hidden shadow-sm flex flex-col group">
+                        <div class="relative aspect-[4/4] bg-slate-100 overflow-hidden">
+                            <img src="${esc(shownPhoto.src)}"
+                                 alt="${esc(product.name)}"
+                                 onerror="this.onerror=null;this.src='/placeholder.svg?w=600&h=700&text=Taham'"
+                                 onmouseenter="startInPlaceZoom(this)"
+                                 onmousemove="updateInPlaceZoom(event, this)"
+                                 onmouseleave="endInPlaceZoom(this)"
+                                 class="product-image-zoom zoomable-image w-full h-full object-cover ${isOutOfStock ? 'grayscale opacity-60' : ''}">
+                            <span class="absolute top-3 left-3 bg-white/85 backdrop-blur-md text-slate-800 text-xs font-bold px-3 py-1 rounded-lg shadow-sm border border-white/50">${esc(product.category)}</span>
+                            ${isOutOfStock ? `<span class="absolute right-3 ${hasDiscount ? 'top-20' : 'top-3'} bg-rose-600 text-white text-[11px] font-bold px-2.5 py-1 rounded-lg shadow-sm">${esc(t('Out of Stock'))}</span>` : (showStockToCustomers ? `<span class="absolute right-3 ${hasDiscount ? 'top-20' : 'top-3'} ${stock < 5 ? 'bg-amber-500 text-white' : 'bg-emerald-600 text-white'} text-[11px] font-bold px-2.5 py-1 rounded-lg shadow-sm">${esc(t('Stock: {n}', { n: stock }))}</span>` : '')}
+                            ${hasDiscount ? `<span class="discount-badge absolute top-3 right-3" role="img" aria-label="${esc(`${pct}% discount`)}">
+                                <span class="discount-badge-shadow" aria-hidden="true"></span>
+                                <span class="discount-badge-layer" aria-hidden="true"></span>
+                                <span class="discount-badge-navy">${esc(t('{pct}%', { pct }))}</span>
+                                <span class="discount-badge-ribbon">${esc(t('DISCOUNT'))}</span>
+                                <span class="discount-badge-accent discount-badge-accent-one" aria-hidden="true"></span>
+                                <span class="discount-badge-accent discount-badge-accent-two" aria-hidden="true"></span>
+                                <span class="discount-badge-accent discount-badge-accent-three" aria-hidden="true"></span>
+                            </span>` : ''}
+                            ${shownPhoto.color ? `<span class="absolute bottom-3 right-3 bg-white/85 backdrop-blur-md text-slate-800 text-[11px] font-bold px-2.5 py-1 rounded-lg shadow-sm border border-white/50 flex items-center gap-1.5"><span class="w-3 h-3 rounded-full border border-slate-300" style="background:${esc((colors.find(c => c.name === shownPhoto.color) || {}).hex || '#ccc')}"></span><span>${esc(shownPhoto.color)}</span></span>` : ''}
+                        </div>
+
+                        ${photos.length > 1 ? `<div class="flex gap-2 overflow-x-auto px-4 pt-3">
+                            ${photos.map((im, k) => `<button data-id="${esc(product.id)}" data-k="${k}" onclick="selectProductImage(this.dataset.id, Number(this.dataset.k))" class="shrink-0 w-14 text-center">
+                                <img src="${esc(im.src)}" onerror="this.onerror=null;this.src='/placeholder.svg?w=100&h=100&text=Photo'" class="w-14 h-14 rounded-lg object-cover border-2 ${k === photoIdx ? 'border-brand-600' : 'border-transparent'} bg-slate-100">
+                                ${im.color ? `<span class="block text-[10px] leading-tight mt-0.5 text-slate-600 truncate">${esc(im.color)}</span>` : ''}
+                            </button>`).join('')}
+                        </div>` : ''}
+
+                        <div class="p-5 flex-1 flex flex-col justify-between space-y-4">
+                            <div>
+                                <h4 class="font-bold text-slate-900 text-lg leading-snug line-clamp-1">${esc(product.name)}</h4>
+                                <p class="text-xs text-slate-500 mt-1 line-clamp-2">${esc(product.desc || t('Premium quality fabric and flawless finishing.'))}</p>
+                            </div>
+
+                            <div class="space-y-3 pt-2 border-t border-slate-100">
+                                <div class="flex items-center justify-between">
+                                    <span class="text-xs font-semibold text-slate-500">Size:</span>
+                                    <div class="flex gap-1.5">
+                                        ${sizes.map(sz => `
+                                            <button onclick="selectProductSize('${product.id}', '${sz}')"
+                                                class="size-selector tilt-3d w-8 h-8 rounded-lg text-xs font-bold transition-all ${activeSize === sz ? 'bg-slate-900 text-white' : 'bg-slate-100 text-slate-600 hover:bg-slate-200'}">${sz}</button>
+                                        `).join('')}
+                                    </div>
+                                </div>
+
+                                ${colors.length ? `
+                                <div class="flex items-center justify-between gap-2">
+                                    <span class="text-xs font-semibold text-slate-500">Colour:</span>
+                                    <div class="flex flex-wrap justify-end gap-1.5">
+                                        ${colors.map(c => `<button data-id="${esc(product.id)}" data-color="${esc(c.name)}" onclick="selectProductColor(this.dataset.id, this.dataset.color)" title="${esc(c.name)}"
+                                            class="w-6 h-6 rounded-full border transition-all ${c.name === activeColor ? 'ring-2 ring-offset-1 ring-brand-600 border-white' : 'border-slate-300'}" style="background:${esc(c.hex)}"></button>`).join('')}
+                                    </div>
+                                </div>
+                                <p class="text-[11px] font-semibold text-slate-600 text-right -mt-1">${esc(activeColor)}</p>` : ''}
+
+                                <div class="flex items-center justify-between pt-1">
+                                    <div>
+                                        <span class="text-xs text-slate-400 block">Price</span>
+                                        <div class="flex items-baseline gap-2">
+                                            <span class="text-xl font-bold text-brand-700">৳ ${sale.toLocaleString('en-US')}</span>
+                                            ${hasDiscount ? `<span class="text-sm text-slate-400 line-through">৳ ${price.toLocaleString('en-US')}</span>` : ''}
+                                        </div>
+                                    </div>
+                                    <button onclick="addToCart('${product.id}')" ${isOutOfStock ? 'disabled' : ''}
+                                        class="action-button tilt-3d px-4 py-2.5 rounded-xl ${isOutOfStock ? 'bg-slate-200 text-slate-400 cursor-not-allowed' : 'bg-brand-600 hover:bg-brand-700 text-white shadow-sm'} text-sm font-semibold transition-all flex items-center gap-1.5">
+                                        <i data-lucide="shopping-bag" class="w-4 h-4"></i>
+                                        <span>${isOutOfStock ? 'Out of stock' : 'Add to Bag'}</span>
+                                    </button>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                `;
+            }).join('');
+            lucide.createIcons();
+            initScrollReveal(grid);
+            initTiltInteractions();
+        };
+
+        window.addToCart = function(productId) {
+            const product = products.find(p => p.id === productId);
+            if (!product || Number(product.stock) <= 0) return;
+
+            const size = selectedSizes[productId] || 'L';
+            const colorList = Array.isArray(product.colors) ? product.colors : [];
+            const chosenColor = colorList.find(c => c.name === selectedColors[productId]) || colorList[0] || null;
+            const color = chosenColor ? chosenColor.name : '';
+            const colorHex = chosenColor ? chosenColor.hex : '';
+            const existingIndex = cart.findIndex(item => item.productId === productId && item.size === size && (item.color || '') === color);
+
+            const currentQtyInCart = cart.filter(i => i.productId === productId).reduce((s, i) => s + i.qty, 0);
+            if (currentQtyInCart + 1 > Number(product.stock)) {
+                showToast(t('Sorry! Only {n} left in stock for this item.', { n: product.stock }), 'error');
+                return;
+            }
+
+            if (existingIndex > -1) {
+                cart[existingIndex].qty += 1;
+            } else {
+                cart.push({
+                    productId: product.id,
+                    name: product.name,
+                    buyingPrice: Number(product.buyingPrice || 0),
+                    price: Number(product.salePrice ?? product.price),
+                    originalPrice: Number(product.price),
+                    image: photoForColor(product, color),
+                    size: size,
+                    color: color,
+                    colorHex: colorHex,
+                    qty: 1
+                });
+            }
+
+            updateCartUI();
+            showToast(t('"{name}" ({size}) added to bag!', { name: product.name + (color ? ' / ' + color : ''), size }));
+        };
+
+        window.updateCartQty = function(index, delta) {
+            const item = cart[index];
+            const product = products.find(p => p.id === item.productId);
+            if (delta > 0 && product && item.qty + 1 > Number(product.stock)) {
+                showToast('You cannot add more than the available stock.', 'error');
+                return;
+            }
+            item.qty += delta;
+            if (item.qty <= 0) cart.splice(index, 1);
+            updateCartUI();
+        };
+
+        window.toggleCart = function(open) {
+            const drawer = document.getElementById('cart-drawer');
+            if (open) {
+                drawer.classList.remove('hidden');
+                updateCartUI();
+            } else {
+                drawer.classList.add('hidden');
+            }
+        };
+
+        function getSelectedDeliveryCharge() {
+            const checked = document.querySelector('input[name="delivery_zone"]:checked');
+            return checked ? Number(checked.value) : 60;
+        }
+
+        window.updateCartUI = function() {
+            const totalItems = cart.reduce((sum, item) => sum + item.qty, 0);
+            document.getElementById('cart-count').innerText = totalItems;
+
+            const container = document.getElementById('cart-items-container');
+            const footer = document.getElementById('cart-footer');
+
+            if (cart.length === 0) {
+                footer.classList.add('hidden');
+                container.innerHTML = `
+                    <div class="h-full flex flex-col items-center justify-center text-center py-12">
+                        <div class="w-16 h-16 rounded-full bg-slate-100 text-slate-400 flex items-center justify-center mb-4">
+                            <i data-lucide="shopping-bag" class="w-8 h-8"></i>
+                        </div>
+                        <h4 class="font-bold text-slate-800 text-lg">Your shopping bag is empty</h4>
+                        <p class="text-sm text-slate-500 mt-1 max-w-xs">Add your favourite clothes to the bag and order easily.</p>
+                    </div>
+                `;
+                lucide.createIcons();
+                return;
+            }
+
+            footer.classList.remove('hidden');
+            let subtotal = 0;
+
+            container.innerHTML = cart.map((item, idx) => {
+                subtotal += item.price * item.qty;
+                return `
+                    <div class="flex gap-3.5 bg-white p-3 rounded-xl border border-slate-200">
+                        <img src="${esc(item.image)}" onerror="this.onerror=null;this.src='/placeholder.svg?w=150&h=150&text=Dress'" class="w-16 h-20 rounded-lg object-cover bg-slate-100 shrink-0">
+                        <div class="flex-1 min-w-0">
+                            <h5 class="font-bold text-slate-900 text-sm truncate">${esc(item.name)}</h5>
+                            <span class="inline-block text-[11px] font-semibold bg-slate-100 text-slate-600 px-2 py-0.5 rounded mt-1"><span>Size:</span> ${esc(item.size)}</span>
+                            ${item.color ? `<span class="inline-flex items-center gap-1 text-[11px] font-semibold bg-slate-100 text-slate-600 px-2 py-0.5 rounded mt-1 ml-1"><span class="w-3 h-3 rounded-full border border-slate-300" style="background:${esc(item.colorHex || '#ccc')}"></span><span>${esc(item.color)}</span></span>` : ''}
+                            <div class="flex items-center justify-between mt-2">
+                                <span class="font-bold text-brand-700 text-sm">৳ ${(item.price * item.qty).toLocaleString('en-US')}</span>
+                                <div class="flex items-center gap-2 bg-slate-100 rounded-lg p-1">
+                                    <button onclick="updateCartQty(${idx}, -1)" class="w-6 h-6 rounded bg-white text-slate-700 font-bold shadow-sm">-</button>
+                                    <span class="text-xs font-bold w-4 text-center">${item.qty}</span>
+                                    <button onclick="updateCartQty(${idx}, 1)" class="w-6 h-6 rounded bg-white text-slate-700 font-bold shadow-sm">+</button>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                `;
+            }).join('');
+
+            const deliveryCharge = getSelectedDeliveryCharge();
+            const grandTotal = subtotal + deliveryCharge;
+            document.getElementById('cart-subtotal').innerText = `৳ ${subtotal.toLocaleString('en-US')}`;
+            document.getElementById('cart-delivery-display').innerText = `৳ ${deliveryCharge}`;
+            document.getElementById('cart-total').innerText = `৳ ${grandTotal.toLocaleString('en-US')}`;
+            document.getElementById('modal-order-total').innerText = `৳ ${grandTotal.toLocaleString('en-US')}`;
+            lucide.createIcons();
+        };
+
+        window.startInPlaceZoom = function(img) {
+            if (!img) return;
+            img.style.transform = 'scale(1.55)';
+        };
+
+        window.updateInPlaceZoom = function(event, img) {
+            if (!img) return;
+            const rect = img.getBoundingClientRect();
+            if (!rect.width || !rect.height) return;
+            const x = Math.max(0, Math.min(100, ((event.clientX - rect.left) / rect.width) * 100));
+            const y = Math.max(0, Math.min(100, ((event.clientY - rect.top) / rect.height) * 100));
+            img.style.transformOrigin = `${x}% ${y}%`;
+            img.style.transform = 'scale(1.55)';
+        };
+
+        window.endInPlaceZoom = function(img) {
+            if (!img) return;
+            img.style.transform = 'scale(1)';
+            img.style.transformOrigin = 'center center';
+        };
+
+        window.handleCustomDesignReferenceUpload = async function(event) {
+            const file = event.target.files && event.target.files[0];
+            if (!file) return;
+            if (!file.type.startsWith('image/')) {
+                showToast('Please choose an image reference.', 'error');
+                event.target.value = '';
+                return;
+            }
+            try {
+                customDesignReferenceImage = await readImageFile(file, 1600, 0.85);
+                document.getElementById('custom-design-reference-img').src = customDesignReferenceImage;
+                document.getElementById('custom-design-reference-preview').classList.remove('hidden');
+                showToast('Reference image attached.');
+            } catch (err) {
+                showToast(err.message || 'Could not read the reference image.', 'error');
+                clearCustomDesignReference();
+            }
+        };
+
+        window.clearCustomDesignReference = function() {
+            customDesignReferenceImage = '';
+            const input = document.getElementById('custom-design-reference');
+            const preview = document.getElementById('custom-design-reference-preview');
+            const img = document.getElementById('custom-design-reference-img');
+            if (input) input.value = '';
+            if (preview) preview.classList.add('hidden');
+            if (img) img.src = '';
+        };
+
+        window.openCheckoutModal = function() {
+            toggleCart(false);
+            clearCustomDesignReference();
+            document.getElementById('checkout-modal').classList.remove('hidden');
+        };
+
+        window.closeCheckoutModal = function() {
+            document.getElementById('checkout-modal').classList.add('hidden');
+        };
+
+        window.toggleTrxField = function(show) {
+            const box = document.getElementById('trx-id-box');
+            if (show) box.classList.remove('hidden');
+            else box.classList.add('hidden');
+        };
+
+        // Customer checkout: the server checks prices + stock and saves the order
+        window.submitCustomerOrder = async function(e) {
+            e.preventDefault();
+            if (cart.length === 0) return;
+
+            const btn = document.getElementById('place-order-btn');
+            btn.disabled = true;
+            btn.innerText = 'Processing order...';
+
+            try {
+                const name = document.getElementById('cust-name').value.trim();
+                const order = await api('POST', '/api/orders', {
+                    customerName: name,
+                    customerPhone: document.getElementById('cust-phone').value.trim(),
+                    customerAddress: document.getElementById('cust-address').value.trim(),
+                    paymentMethod: document.querySelector('input[name="payment_method"]:checked').value,
+                    trxId: document.getElementById('cust-trx-id').value.trim(),
+                    customDesignNotes: document.getElementById('custom-design-notes').value.trim(),
+                    referenceImage: customDesignReferenceImage,
+                    customDesignReferenceImage: customDesignReferenceImage,
+                    deliveryCharge: getSelectedDeliveryCharge(),
+                    items: cart.map((i) => ({ productId: i.productId, size: i.size, color: i.color || '', qty: i.qty }))
+                });
+
+                cart = [];
+                updateCartUI();
+                document.getElementById('checkout-form').reset();
+                clearCustomDesignReference();
+                closeCheckoutModal();
+                showToast(t('Thank you {name}! Your order ({num}) is complete.', { name, num: order.orderNumber }));
+                window.__refreshAll();
+                openInvoiceModal(order);
+            } catch (err) {
+                console.error('Order submit error:', err);
+                showToast(err.message || 'Could not place the order, please try again.', 'error');
+                window.__refreshAll();
+            } finally {
+                btn.disabled = false;
+                btn.innerText = 'Place Order';
+            }
+        };
+
+        // ==========================================
+        // INVOICE / CASH MEMO PRINT MODAL
+        // ==========================================
+        window.openInvoiceModal = function(order) {
+            currentInvoice = order;
+            order = order || {};
+            const items = Array.isArray(order.items) ? order.items : [];
+            const paymentRaw = String(order.paymentMethod || '').trim();
+            const paymentLower = paymentRaw.toLowerCase();
+            const isBkash = paymentLower.includes('bkash');
+            const isNagad = paymentLower.includes('nagad');
+            const isCOD = !isBkash && !isNagad;
+            const orderNo = `#${order.orderNumber || (order.id ? order.id.slice(0, 8) : 'ORD-000000')}`;
+            const money = (value) => {
+                const n = Number(value || 0);
+                return `৳ ${(Number.isFinite(n) ? n : 0).toLocaleString('en-US')}`;
+            };
+            const setText = (id, value) => {
+                const el = document.getElementById(id);
+                if (el) el.innerText = value == null ? '' : String(value);
+            };
+
+            setText('inv-shop-name', 'TAHAM');
+            setText('inv-shop-address', 'Rayerbag, Dhaka, Bangladesh');
+            setText('inv-shop-phone', 'Facebook · WhatsApp 01400570014 · taham.info@gmail.com');
+            setText('inv-order-id', orderNo);
+            setText('inv-order-no', orderNo);
+            setText('inv-order-date', fmtDate(order.createdAt) || order.dateStr || '');
+            setText('inv-cust-name', order.customerName || '');
+            setText('inv-cust-phone', order.customerPhone || '');
+            setText('inv-cust-address', order.customerAddress || '');
+            setText('inv-courier', order.courier || order.deliveryMethod || order.courierName || order.shippingMethod || order.deliveryType || (isCOD ? 'Cash on Delivery' : paymentRaw) || '');
+            setText('inv-status', order.status || '');
+            setText('inv-payment', paymentRaw);
+            setText('inv-trx', order.trxId ? `TrxID: ${order.trxId}` : '');
+
+            const setPayment = (id, active) => {
+                const el = document.getElementById(id);
+                if (!el) return;
+                el.classList.toggle('active', active);
+                el.setAttribute('aria-checked', active ? 'true' : 'false');
+            };
+            setPayment('inv-payment-cash', isCOD);
+            setPayment('inv-payment-bkash', isBkash);
+            setPayment('inv-payment-nagad', isNagad);
+
+            const tbody = document.getElementById('inv-items-tbody');
+            tbody.innerHTML = items.map((item, k) => {
+                const qty = Number(item.qty || 1) || 1;
+                const rate = Number(item.price || 0) || 0;
+                const total = rate * qty;
+                const customNote = item.customDesignNote || item.customDesignNotes || item.customDesign || item.designNote || (k === 0 ? order.customDesignNotes : '');
+                return `
+                <tr>
+                    <td class="invoice-sl">${k + 1}</td>
+                    <td><strong>${esc(item.name || '')}</strong>${item.color ? `<div class="invoice-item-meta">Colour: ${esc(item.color)}</div>` : ''}${customNote ? `<div class="invoice-custom-note"><span>Custom Design Note:</span> ${esc(customNote)}</div>` : ''}</td>
+                    <td class="invoice-center">${esc(item.size || '')}</td>
+                    <td class="invoice-center">${qty}</td>
+                    <td class="invoice-right">${money(rate)}${Number(item.originalPrice) > rate ? `<div class="invoice-original-price">${money(item.originalPrice)}</div>` : ''}</td>
+                    <td class="invoice-right"><strong>${money(total)}</strong></td>
+                </tr>`;
+            }).join('');
+
+            const subtotal = order.subtotal !== undefined ? Number(order.subtotal || 0) : items.reduce((sum, item) => sum + (Number(item.price || 0) * (Number(item.qty || 1) || 1)), 0);
+            const delivery = Number(order.deliveryCharge || 0) || 0;
+            const discount = Number(order.discount || order.discountAmount || order.discountValue || 0) || 0;
+            const grandTotal = Number(order.total !== undefined ? order.total : Math.max(0, subtotal + delivery - discount)) || 0;
+            const advance = Number(order.advancePaid || order.advance || order.advancePaidAmount || 0) || 0;
+            const due = Math.max(0, grandTotal - advance);
+
+            setText('inv-subtotal', money(subtotal));
+            setText('inv-discount', money(discount));
+            setText('inv-delivery', money(delivery));
+            setText('inv-total', money(grandTotal));
+            setText('inv-advance', money(advance));
+            setText('inv-due', money(due));
+
+            document.getElementById('invoice-modal').classList.remove('hidden');
+            if (window.applyInvoicePadSettings) window.applyInvoicePadSettings();
+            lucide.createIcons();
+        };
+
+        window.openInvoiceById = function(orderId) {
+            const order = orders.find(o => o.id === orderId);
+            if (order) openInvoiceModal(order);
+        };
+
+        window.closeInvoiceModal = function() {
+            document.getElementById('invoice-modal').classList.add('hidden');
+        };
+
+        // ==========================================
+        // SUPER ADMIN ERP OPERATIONS
+        // ==========================================
+        window.updateAdminDashboard = function() {
+            if (!isAdminAuthenticated) return;
+
+            // Calculate Financials (Excluding Cancelled Orders)
+            const activeOrders = orders.filter(o => o.status !== 'Cancelled');
+            const totalRevenue = activeOrders.reduce((sum, o) => sum + Number(o.total || 0), 0);
+            const totalProductCost = activeOrders.reduce((sum, o) => sum + Number(o.totalCost || 0), 0);
+            const totalDeliveryCost = activeOrders.reduce((sum, o) => sum + Number(o.deliveryCharge || 0), 0);
+            const totalExpenses = expenses.reduce((sum, e) => sum + Number(e.amount || 0), 0);
+
+            // Net Profit = (Revenue - Delivery Charge - Product Buying Cost) - Business Expenses
+            const grossMargin = totalRevenue - totalDeliveryCost - totalProductCost;
+            const netProfit = grossMargin - totalExpenses;
+
+            const pendingCount = orders.filter(o => o.status === 'Pending').length;
+            const lowStockCount = products.filter(p => Number(p.stock) < 5).length;
+
+            document.getElementById('stat-revenue').innerText = `৳ ${totalRevenue.toLocaleString('en-US')}`;
+            document.getElementById('stat-profit').innerText = `৳ ${netProfit.toLocaleString('en-US')}`;
+            document.getElementById('stat-expenses').innerText = `৳ ${totalExpenses.toLocaleString('en-US')}`;
+            document.getElementById('stat-pending').innerText = pendingCount;
+            document.getElementById('stat-total-orders').innerText = t('Total Orders: {n}', { n: orders.length });
+            document.getElementById('stat-low-stock').innerText = lowStockCount;
+            document.getElementById('stat-total-products').innerText = t('Total Items: {n}', { n: products.length });
+
+            renderAdminOrders();
+            renderAdminInventory();
+            renderAdminExpenses();
+            renderAdminCollections();
+            renderReports();
+        };
+
+        window.renderAdminOrders = function() {
+            const container = document.getElementById('admin-orders-list');
+            const filterVal = document.getElementById('admin-order-filter').value;
+            const filtered = filterVal === 'All' ? orders : orders.filter(o => o.status === filterVal);
+
+            if (filtered.length === 0) {
+                container.innerHTML = `<div class="text-center py-10 text-slate-500 text-sm bg-slate-50 rounded-xl">No orders in this category.</div>`;
+                return;
+            }
+
+            container.innerHTML = filtered.map(order => {
+                const statusColors = {
+                    'Pending': 'bg-amber-100 text-amber-800 border-amber-200',
+                    'Processing': 'bg-blue-100 text-blue-800 border-blue-200',
+                    'Delivered': 'bg-emerald-100 text-emerald-800 border-emerald-200',
+                    'Cancelled': 'bg-rose-100 text-rose-800 border-rose-200'
+                };
+                const badgeClass = statusColors[order.status] || 'bg-slate-100 text-slate-800';
+
+                return `
+                    <div class="p-4 sm:p-5 rounded-2xl border border-slate-200 bg-slate-50/50 space-y-3">
+                        <div class="flex flex-wrap justify-between items-start gap-3">
+                            <div>
+                                <div class="flex items-center gap-2">
+                                    <span class="font-bold text-slate-900 text-base">${esc(order.orderNumber || order.id.slice(0, 8))}</span>
+                                    <span class="text-xs px-2.5 py-0.5 rounded-full font-bold border ${badgeClass}">${esc(order.status)}</span>
+                                </div>
+                                <p class="text-xs text-slate-500 mt-0.5"><span>${esc(fmtDate(order.createdAt))}</span> • <span>Payment:</span> <strong class="text-slate-800">${esc(order.paymentMethod)}</strong> ${order.trxId ? `(TrxID: ${esc(order.trxId)})` : ''}</p>
+                            </div>
+
+                            <div class="flex flex-wrap items-center gap-2">
+                                <select onchange="changeOrderStatus('${order.id}', this.value)" class="px-3 py-1.5 rounded-xl border border-slate-300 bg-white text-xs font-bold text-slate-800">
+                                    <option value="Pending" ${order.status === 'Pending' ? 'selected' : ''}>Pending</option>
+                                    <option value="Processing" ${order.status === 'Processing' ? 'selected' : ''}>Processing</option>
+                                    <option value="Delivered" ${order.status === 'Delivered' ? 'selected' : ''}>Delivered</option>
+                                    <option value="Cancelled" ${order.status === 'Cancelled' ? 'selected' : ''}>Cancelled</option>
+                                </select>
+
+                                <button onclick="openInvoiceById('${order.id}')" class="px-3 py-1.5 rounded-xl bg-slate-900 hover:bg-slate-800 text-white text-xs font-bold flex items-center gap-1.5">
+                                    <i data-lucide="printer" class="w-3.5 h-3.5"></i>
+                                    <span>Print Receipt</span>
+                                </button>
+
+                                <button onclick="deleteOrder('${order.id}')" class="p-1.5 rounded-xl text-rose-600 hover:bg-rose-100" title="Delete order">
+                                    <i data-lucide="trash-2" class="w-4 h-4"></i>
+                                </button>
+                            </div>
+                        </div>
+
+                        <div class="bg-white p-3 rounded-xl border border-slate-200 text-xs grid grid-cols-1 sm:grid-cols-2 gap-2">
+                            <p><strong class="text-slate-700">Customer:</strong> ${esc(order.customerName)} (<a href="tel:${esc(order.customerPhone)}" class="text-brand-600 underline">${esc(order.customerPhone)}</a>)</p>
+                            <p><strong class="text-slate-700">Address:</strong> ${esc(order.customerAddress)}</p>
+                        </div>
+
+                        ${(order.customDesignNotes || order.referenceImage) ? `
+                        <div class="bg-white p-3 rounded-xl border border-slate-200 text-xs space-y-2">
+                            <p class="font-bold text-slate-700">Custom Design Instructions</p>
+                            ${order.customDesignNotes ? `<p class="whitespace-pre-line text-slate-700">${esc(order.customDesignNotes)}</p>` : ''}
+                            ${order.referenceImage ? `<div><p class="text-slate-500 mb-1">Reference Image / Mockup:</p><img src="${esc(order.referenceImage)}" alt="Custom design reference" class="h-32 w-32 object-cover rounded-xl border border-slate-200 bg-slate-50"></div>` : ''}
+                        </div>` : ''}
+
+                        <div class="flex flex-wrap justify-between items-center gap-2 pt-1 text-xs">
+                            <div>
+                                ${(order.items || []).map(i => `<span class="inline-block bg-white border border-slate-200 px-2.5 py-1 rounded-lg mr-1.5 mb-1 font-medium">${esc(i.name)} (${esc(i.size)}${i.color ? ', ' + esc(i.color) : ''}) × ${Number(i.qty)}</span>`).join('')}
+                            </div>
+                            <div class="text-right">
+                                <span class="text-slate-500 mr-2"><span>Delivery:</span> ৳${order.deliveryCharge || 0}</span>
+                                <span class="font-bold text-base text-brand-700"><span>Total:</span> ৳ ${Number(order.total).toLocaleString('en-US')}</span>
+                            </div>
+                        </div>
+                    </div>
+                `;
+            }).join('');
+            lucide.createIcons();
+            initTiltInteractions();
+        };
+
+        window.switchReportView = function(view) {
+            currentReportView = view === 'monthly' ? 'monthly' : 'daily';
+            document.querySelectorAll('.report-view').forEach(el => el.classList.toggle('hidden', el.id !== `report-${currentReportView}`));
+            document.querySelectorAll('.report-tab').forEach(btn => {
+                const active = btn.dataset.reportTab === currentReportView;
+                btn.className = active
+                    ? 'report-tab px-4 py-2 rounded-xl text-sm font-bold bg-brand-600 text-white'
+                    : 'report-tab px-4 py-2 rounded-xl text-sm font-bold bg-white text-slate-700 border border-slate-200';
+            });
+            if (currentReportView === 'daily') {
+                const dateEl = document.getElementById('daily-report-date');
+                if (dateEl && !dateEl.value) dateEl.value = todayKey();
+            } else {
+                const monthEl = document.getElementById('monthly-report-month');
+                if (monthEl && !monthEl.value) monthEl.value = monthKey(new Date());
+            }
+            renderReports();
+        };
+
+        window.clearReportFilters = function(view) {
+            const prefix = view === 'monthly' ? 'monthly' : 'daily';
+            if (prefix === 'daily') {
+                document.getElementById('daily-report-date').value = todayKey();
+                document.getElementById('daily-report-from').value = '';
+                document.getElementById('daily-report-to').value = '';
+            } else {
+                document.getElementById('monthly-report-month').value = monthKey(new Date());
+                document.getElementById('monthly-report-from').value = '';
+                document.getElementById('monthly-report-to').value = '';
+            }
+            renderReports();
+        };
+
+        window.renderReports = function() {
+            const metricsBox = document.getElementById('report-metrics');
+            const ordersBox = document.getElementById('report-orders');
+            if (!metricsBox || !ordersBox) return;
+
+            const range = getReportRange(currentReportView);
+            const filteredOrders = orders.filter(o => inReportRange(orderTime(o), range));
+            const filteredExpenses = expenses.filter(e => inReportRange(expenseTime(e), range));
+            const activeOrders = filteredOrders.filter(o => o.status !== 'Cancelled');
+
+            const totalSales = activeOrders.reduce((sum, o) => sum + Number(o.total || 0), 0);
+            const totalProductCost = activeOrders.reduce((sum, o) => sum + Number(o.totalCost || 0), 0);
+            const totalDeliveryCost = activeOrders.reduce((sum, o) => sum + Number(o.deliveryCharge || 0), 0);
+            const totalExpenses = filteredExpenses.reduce((sum, e) => sum + Number(e.amount || 0), 0);
+            const netProfit = totalSales - totalProductCost - totalDeliveryCost - totalExpenses;
+            const orderCount = filteredOrders.length;
+            const totalItems = activeOrders.reduce((sum, o) => sum + (o.items || []).reduce((n, i) => n + Number(i.qty || 0), 0), 0);
+            const cancelledCount = filteredOrders.filter(o => o.status === 'Cancelled').length;
+            const pendingCount = filteredOrders.filter(o => o.status === 'Pending').length;
+
+            setReportPrintHeader(currentReportView, range);
+
+            metricsBox.innerHTML = `
+                ${reportMetricCard('Total Sales', money(totalSales), 'banknote', 'text-brand-700')}
+                ${reportMetricCard('Total Expenses', money(totalExpenses), 'receipt', 'text-rose-600')}
+                ${reportMetricCard('Net Profit', money(netProfit), 'trending-up', netProfit < 0 ? 'text-rose-600' : 'text-emerald-700')}
+                ${reportMetricCard('Total Orders', String(orderCount), 'package-check', 'text-slate-900')}
+                ${reportMetricCard('Items Sold', String(totalItems), 'shirt', 'text-slate-900')}
+                ${reportMetricCard('Pending', String(pendingCount), 'clock', 'text-amber-600')}
+                ${reportMetricCard('Cancelled', String(cancelledCount), 'x-circle', 'text-rose-600')}
+                ${reportMetricCard('Expenses Count', String(filteredExpenses.length), 'wallet', 'text-slate-900')}
+            `;
+
+            if (!filteredOrders.length) {
+                ordersBox.innerHTML = `<div class="report-empty p-8 text-center text-sm text-slate-400">No order summaries in this date range.</div>`;
+            } else {
+                ordersBox.innerHTML = `
+                    <table class="report-print-table">
+                        <thead>
+                            <tr>
+                                <th>Date</th>
+                                <th>Order No</th>
+                                <th>Customer</th>
+                                <th>Status</th>
+                                <th>Items</th>
+                                <th class="num">Total</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            ${filteredOrders.map(o => `
+                                <tr>
+                                    <td>${esc(fmtDate(orderTime(o)))}</td>
+                                    <td class="strong">${esc(o.orderNumber || (o.id ? o.id.slice(0, 8) : ''))}</td>
+                                    <td>${esc(o.customerName || '')}</td>
+                                    <td>${esc(o.status || '')}</td>
+                                    <td>${(o.items || []).length} item(s)</td>
+                                    <td class="num strong">${money(o.total)}</td>
+                                </tr>
+                            `).join('')}
+                        </tbody>
+                    </table>`;
+            }
+            if (window.applyInvoicePadSettings) window.applyInvoicePadSettings();
+            if (window.lucide) lucide.createIcons();
+        };
+
+        function setReportPrintHeader(view, range) {
+            const set = (id, v) => { const el = document.getElementById(id); if (el) el.innerText = v == null ? '' : String(v); };
+            const get = (id) => { const el = document.getElementById(id); return el ? el.value : ''; };
+            const daily = view !== 'monthly';
+            set('report-type', daily ? 'Daily Report' : 'Monthly Report');
+
+            let period = '';
+            if (daily) {
+                const from = get('daily-report-from'), to = get('daily-report-to');
+                const date = get('daily-report-date') || todayKey();
+                period = (from || to) ? `${from || '...'} to ${to || '...'}` : date;
+            } else {
+                const from = get('monthly-report-from'), to = get('monthly-report-to');
+                const month = get('monthly-report-month') || monthKey(new Date());
+                period = (from || to) ? `${from || '...'} to ${to || '...'}` : month;
+            }
+            set('report-period', `Selected Date / Date Range: ${period}`);
+
+            const user = window.adminUsername
+                || (typeof currentUser !== 'undefined' && currentUser && (currentUser.name || currentUser.email || currentUser.uid))
+                || (typeof isAdminAuthenticated !== 'undefined' && isAdminAuthenticated ? 'Admin' : 'TAHAM');
+            set('report-generated-by', `Generated By: ${user} · Generated: ${new Date().toLocaleString('en-US')}`);
+        }
+
+        window.printReport = function() {
+            if (typeof renderReports === 'function') renderReports();
+            setReportPrintHeader(currentReportView, getReportRange(currentReportView));
+            document.body.classList.add('printing-report');
+            const cleanup = () => document.body.classList.remove('printing-report');
+            window.addEventListener('afterprint', cleanup, { once: true });
+            window.preparePrintPagination('#report-print-area');
+            window.print();
+            setTimeout(cleanup, 1000);
+        };
+
+        function reportMetricCard(label, value, icon, colorClass) {
+            return `
+                <div class="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
+                    <div class="flex items-center justify-between">
+                        <p class="text-xs font-semibold text-slate-500">${esc(label)}</p>
+                        <i data-lucide="${esc(icon)}" class="w-5 h-5 text-slate-400"></i>
+                    </div>
+                    <p class="text-2xl font-bold mt-2 ${colorClass || 'text-slate-900'}">${esc(value)}</p>
+                </div>`;
+        }
+
+        function money(value) {
+            return `৳ ${Number(value || 0).toLocaleString('en-US')}`;
+        }
+
+        function todayKey() {
+            return dateKey(new Date());
+        }
+
+        function monthKey(date) {
+            const d = date instanceof Date ? date : parseLooseDate(date);
+            if (!d) return '';
+            return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
+        }
+
+        function dateKey(date) {
+            const d = date instanceof Date ? date : parseLooseDate(date);
+            if (!d || Number.isNaN(d.getTime())) return '';
+            return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+        }
+
+        function startOfDay(date) {
+            const d = date instanceof Date ? new Date(date) : parseLooseDate(date);
+            if (!d) return null;
+            d.setHours(0, 0, 0, 0);
+            return d;
+        }
+
+        function endOfDay(date) {
+            const d = date instanceof Date ? new Date(date) : parseLooseDate(date);
+            if (!d) return null;
+            d.setHours(23, 59, 59, 999);
+            return d;
+        }
+
+        function parseLooseDate(value) {
+            if (!value) return null;
+            if (value instanceof Date) return Number.isNaN(value.getTime()) ? null : value;
+            if (typeof value === 'number') return Number.isNaN(new Date(value).getTime()) ? null : new Date(value);
+            const s = String(value).trim();
+            const dmy = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})/);
+            if (dmy) return new Date(Number(dmy[3]), Number(dmy[2]) - 1, Number(dmy[1]), 12, 0, 0, 0);
+            const parsed = new Date(s);
+            return Number.isNaN(parsed.getTime()) ? null : parsed;
+        }
+
+        function orderTime(order) {
+            if (order.createdAt) return new Date(Number(order.createdAt)).getTime();
+            const parsed = parseLooseDate(order.dateStr);
+            return parsed ? parsed.getTime() : 0;
+        }
+
+        function expenseTime(expense) {
+            if (expense.createdAt) return new Date(Number(expense.createdAt)).getTime();
+            const parsed = parseLooseDate(expense.dateStr || expense.date);
+            return parsed ? parsed.getTime() : 0;
+        }
+
+        function inReportRange(time, range) {
+            if (!range) return true;
+            if (!time) return false;
+            return time >= range.start.getTime() && time <= range.end.getTime();
+        }
+
+        function getReportRange(view) {
+            const get = (id) => { const el = document.getElementById(id); return el ? el.value : ''; };
+            const fromValue = view === 'monthly' ? get('monthly-report-from') : get('daily-report-from');
+            const toValue = view === 'monthly' ? get('monthly-report-to') : get('daily-report-to');
+
+            if (fromValue || toValue) {
+                const start = fromValue ? startOfDay(fromValue) : new Date(0);
+                const end = toValue ? endOfDay(toValue) : new Date(8640000000000000);
+                return { start, end };
+            }
+
+            if (view === 'monthly') {
+                const month = get('monthly-report-month') || monthKey(new Date());
+                const match = month.match(/^(\d{4})-(\d{2})$/);
+                if (match) {
+                    const year = Number(match[1]);
+                    const monthIndex = Number(match[2]) - 1;
+                    return { start: new Date(year, monthIndex, 1, 0, 0, 0, 0), end: new Date(year, monthIndex + 1, 0, 23, 59, 59, 999) };
+                }
+                return null;
+            }
+
+            const date = get('daily-report-date') || todayKey();
+            return { start: startOfDay(date), end: endOfDay(date) };
+        }
+
+        window.changeOrderStatus = async function(orderId, newStatus) {
+            try {
+                await api('PATCH', `/api/orders/${orderId}`, { status: newStatus });   // server also fixes stock
+                await window.__refreshAll();
+                showToast(t('Order status updated to "{s}".', { s: newStatus }));
+            } catch (err) {
+                console.error('Status update error:', err);
+                showToast(err.message || 'Could not change the status.', 'error');
+            }
+        };
+
+        window.deleteOrder = async function(orderId) {
+            if (!confirm(t('Permanently delete this order?'))) return;
+            try {
+                await api('DELETE', `/api/orders/${orderId}`);
+                await window.__refreshAll();
+                showToast('Order deleted.', 'error');
+            } catch (err) {
+                showToast(err.message || 'Could not delete the order.', 'error');
+            }
+        };
+
+        // Reads an image file, shrinks it and returns a JPEG data URL
+        function readImageFile(file, maxDim, quality) {
+            return new Promise((resolve, reject) => {
+                const fail = () => reject(new Error('Could not read the image, please choose another'));
+                const reader = new FileReader();
+                reader.onerror = fail;
+                reader.onload = (e) => {
+                    const img = new Image();
+                    img.onerror = fail;
+                    img.onload = () => {
+                        const scale = Math.min(1, maxDim / Math.max(img.width, img.height));
+                        const w = Math.max(1, Math.round(img.width * scale));
+                        const h = Math.max(1, Math.round(img.height * scale));
+                        const canvas = document.createElement('canvas');
+                        canvas.width = w; canvas.height = h;
+                        const ctx = canvas.getContext('2d');
+                        ctx.fillStyle = '#ffffff';
+                        ctx.fillRect(0, 0, w, h);
+                        ctx.drawImage(img, 0, 0, w, h);
+                        resolve(canvas.toDataURL('image/jpeg', quality));
+                    };
+                    img.src = e.target.result;
+                };
+                reader.readAsDataURL(file);
+            });
+        }
+
+        window.handleImageFileUpload = async function(event) {
+            const files = Array.from(event.target.files || []);
+            event.target.value = '';
+            if (!files.length) return;
+            const room = MAX_PHOTOS - formImages.length;
+            if (room <= 0) { showToast('You can add up to 8 photos per product', 'error'); return; }
+            let added = 0;
+            for (const file of files.slice(0, room)) {
+                try {
+                    formImages.push({ src: await readImageFile(file, 700, 0.78), color: '' });
+                    added++;
+                } catch (err) {
+                    showToast(err.message, 'error');
+                }
+            }
+            if (files.length > room) showToast('You can add up to 8 photos per product', 'error');
+            if (added) showToast(t('{n} photos added', { n: added }));
+            renderGallery();
+        };
+
+        window.addImageLink = function() {
+            const input = document.getElementById('prod-image');
+            const url = input.value.trim();
+            if (!/^(https?:\/\/|\/)/i.test(url)) { showToast('Enter a valid image link', 'error'); return; }
+            if (formImages.length >= MAX_PHOTOS) { showToast('You can add up to 8 photos per product', 'error'); return; }
+            formImages.push({ src: url, color: '' });
+            input.value = '';
+            renderGallery();
+        };
+
+        window.renderGallery = function() {
+            const box = document.getElementById('prod-gallery');
+            if (!formImages.length) {
+                box.innerHTML = '<p class="col-span-full text-[11px] text-slate-400">No photos yet</p>';
+                return;
+            }
+            box.innerHTML = formImages.map((im, i) => `
+                <div class="relative bg-white rounded-xl border ${i === 0 ? 'border-brand-500 ring-1 ring-brand-300' : 'border-slate-200'} p-1.5 space-y-1.5">
+                    <img src="${esc(im.src)}" onerror="this.onerror=null;this.src='/placeholder.svg?w=200&h=200&text=Photo'" class="w-full aspect-square object-cover rounded-lg bg-slate-100">
+                    ${i === 0
+                        ? '<span class="absolute top-2.5 left-2.5 bg-brand-600 text-white text-[9px] font-bold px-1.5 py-0.5 rounded">Main</span>'
+                        : `<button type="button" data-i="${i}" onclick="makeMainImage(Number(this.dataset.i))" class="absolute top-2.5 left-2.5 bg-white/95 text-slate-700 text-[9px] font-bold px-1.5 py-0.5 rounded border border-slate-200">Set main</button>`}
+                    <button type="button" data-i="${i}" onclick="removeFormImage(Number(this.dataset.i))" title="Remove" class="absolute top-2.5 right-2.5 w-5 h-5 rounded-full bg-rose-600 text-white text-xs leading-none">&times;</button>
+                    <select data-i="${i}" onchange="setImageColor(Number(this.dataset.i), this.value)" class="w-full px-1.5 py-1 rounded-lg border border-slate-200 text-[11px] bg-white">
+                        <option value="">General (no colour)</option>
+                        ${formColors.map(c => `<option value="${esc(c.name)}" ${im.color === c.name ? 'selected' : ''}>${esc(c.name)}</option>`).join('')}
+                    </select>
+                </div>`).join('');
+        };
+
+        window.setImageColor = function(i, color) { if (formImages[i]) formImages[i].color = color; };
+        window.removeFormImage = function(i) { formImages.splice(i, 1); renderGallery(); };
+        window.makeMainImage = function(i) {
+            const [im] = formImages.splice(i, 1);
+            formImages.unshift(im);
+            renderGallery();
+        };
+
+        // photo to show for a colour (falls back to the main photo)
+        function productPhotos(p) {
+            return (Array.isArray(p.images) && p.images.length) ? p.images : [{ src: p.image, color: '' }];
+        }
+        function photoForColor(p, color) {
+            const list = productPhotos(p);
+            return (list.find(im => color && im.color === color) || list[0]).src;
+        }
+
+        // ---- discount helpers (same maths as the server) ----
+        function computeSale(price, type, value) {
+            if (!Number.isFinite(price)) return price;
+            if (type === 'percent' && value > 0 && value <= 95) return Math.max(0, price - Math.round(price * value / 100));
+            if (type === 'amount' && value > 0 && value < price) return price - value;
+            return price;
+        }
+
+        window.updateDiscountPreview = function() {
+            const box = document.getElementById('discount-preview');
+            const type = document.getElementById('prod-discount-type').value;
+            const valueInput = document.getElementById('prod-discount-value');
+            const value = parseInt(valueInput.value, 10) || 0;
+            const price = parseInt(document.getElementById('prod-price').value, 10);
+            const buying = parseInt(document.getElementById('prod-buying-price').value, 10);
+            valueInput.disabled = type === 'none';
+            if (type === 'none' || !Number.isFinite(price) || value <= 0) { box.classList.add('hidden'); return; }
+            const finalPrice = computeSale(price, type, value);
+            const pct = Math.round((1 - finalPrice / price) * 100);
+            let msg = t('Customers pay ৳ {final} instead of ৳ {price} ({pct}% off)',
+                { final: finalPrice.toLocaleString('en-US'), price: price.toLocaleString('en-US'), pct });
+            if (Number.isFinite(buying) && finalPrice < buying) msg += ' ' + t('Warning: the sale price is below your buying price.');
+            box.textContent = msg;
+            box.classList.remove('hidden');
+        };
+
+        window.populateCategorySelect = function(selected) {
+            const sel = document.getElementById('prod-category');
+            const keep = selected !== undefined ? selected : sel.value;
+            sel.innerHTML = collections.map(c => `<option value="${esc(c.name)}">${esc(c.name)}</option>`).join('');
+            if (keep && collections.some(c => c.name === keep)) sel.value = keep;
+        };
+
+        const PRESET_COLORS = [
+            { name: 'Black', hex: '#111111' }, { name: 'White', hex: '#ffffff' }, { name: 'Grey', hex: '#9ca3af' },
+            { name: 'Red', hex: '#dc2626' }, { name: 'Maroon', hex: '#7f1d1d' }, { name: 'Pink', hex: '#ec4899' },
+            { name: 'Orange', hex: '#f97316' }, { name: 'Yellow', hex: '#facc15' }, { name: 'Mustard', hex: '#ca8a04' },
+            { name: 'Green', hex: '#16a34a' }, { name: 'Olive', hex: '#6b7a2a' }, { name: 'Teal', hex: '#0f766e' },
+            { name: 'Sky Blue', hex: '#38bdf8' }, { name: 'Blue', hex: '#2563eb' }, { name: 'Navy Blue', hex: '#1e3a8a' },
+            { name: 'Purple', hex: '#7c3aed' }, { name: 'Brown', hex: '#78350f' }, { name: 'Beige', hex: '#d6c3a1' },
+            { name: 'Cream', hex: '#fff3d6' }, { name: 'Gold', hex: '#d4af37' }
+        ];
+        const hasColor = (name) => formColors.some(c => c.name.toLowerCase() === String(name).toLowerCase());
+
+        window.renderColorEditor = function() {
+            document.getElementById('color-presets').innerHTML = PRESET_COLORS.map(c => `
+                <button type="button" data-name="${esc(c.name)}" onclick="togglePresetColor(this.dataset.name)"
+                    class="flex items-center gap-1.5 pl-1.5 pr-2.5 py-1 rounded-full border text-[11px] font-semibold ${hasColor(c.name) ? 'bg-slate-900 text-white border-slate-900' : 'bg-white text-slate-700 border-slate-200 hover:bg-slate-50'}">
+                    <span class="w-4 h-4 rounded-full border border-slate-300" style="background:${c.hex}"></span><span>${esc(c.name)}</span>
+                </button>`).join('');
+            const box = document.getElementById('color-selected');
+            box.innerHTML = formColors.length
+                ? formColors.map(c => `
+                    <span class="inline-flex items-center gap-1.5 pl-1.5 pr-1 py-1 rounded-full bg-white border border-slate-200 text-[11px] font-semibold text-slate-700">
+                        <span class="w-4 h-4 rounded-full border border-slate-300" style="background:${esc(c.hex)}"></span><span>${esc(c.name)}</span>
+                        <button type="button" data-name="${esc(c.name)}" onclick="removeColor(this.dataset.name)" title="Remove" class="w-4 h-4 rounded-full text-rose-600 hover:bg-rose-50 leading-none">&times;</button>
+                    </span>`).join('')
+                : '<span class="text-[11px] text-slate-400">No colours selected</span>';
+            formImages.forEach(im => { if (im.color && !hasColor(im.color)) im.color = ''; });
+            renderGallery();
+        };
+
+        window.togglePresetColor = function(name) {
+            if (hasColor(name)) formColors = formColors.filter(c => c.name.toLowerCase() !== name.toLowerCase());
+            else { const p = PRESET_COLORS.find(c => c.name === name); if (p) formColors.push({ name: p.name, hex: p.hex }); }
+            renderColorEditor();
+        };
+
+        window.removeColor = function(name) {
+            formColors = formColors.filter(c => c.name.toLowerCase() !== name.toLowerCase());
+            renderColorEditor();
+        };
+
+        window.addCustomColor = function() {
+            const nameInput = document.getElementById('prod-color-name');
+            const name = nameInput.value.trim();
+            const hex = document.getElementById('prod-color-hex').value || '#9ca3af';
+            if (!name) { showToast('Enter a colour name', 'error'); return; }
+            const existing = formColors.find(c => c.name.toLowerCase() === name.toLowerCase());
+            if (existing) existing.hex = hex; else formColors.push({ name, hex });
+            nameInput.value = '';
+            renderColorEditor();
+        };
+
+        window.selectProductImage = function(productId, idx) {
+            const p = products.find(x => x.id === productId);
+            selectedImages[productId] = idx;
+            const photo = p ? productPhotos(p)[idx] : null;
+            if (photo && photo.color) selectedColors[productId] = photo.color;   // tapping a photo also picks its colour
+            renderProducts();
+        };
+
+        window.selectProductColor = function(productId, name) {
+            selectedColors[productId] = name;
+            delete selectedImages[productId];
+            renderProducts();
+        };
+
+        window.handleSaveProduct = async function(e) {
+            e.preventDefault();
+            if (!currentUser || !db) return;
+
+            const editId = document.getElementById('edit-prod-id').value;
+            const name = document.getElementById('prod-name').value.trim();
+            const category = document.getElementById('prod-category').value;
+            const stock = parseInt(document.getElementById('prod-stock').value, 10);
+            const buyingPrice = parseInt(document.getElementById('prod-buying-price').value, 10);
+            const price = parseInt(document.getElementById('prod-price').value, 10);
+            const discountType = document.getElementById('prod-discount-type').value;
+            const discountValue = discountType === 'none' ? 0 : (parseInt(document.getElementById('prod-discount-value').value || '0', 10));
+            const desc = document.getElementById('prod-desc').value.trim();
+
+            if (!name) { showToast('Enter the product name', 'error'); return; }
+            if (!category) { showToast('Select a collection. Add one in the Collections tab first.', 'error'); return; }
+            if ([stock, buyingPrice, price].some((n) => !Number.isInteger(n) || n < 0)) {
+                showToast('Enter valid numbers for stock, buying price and selling price', 'error');
+                return;
+            }
+            if (!Number.isInteger(discountValue) || discountValue < 0) { showToast('Discount must be a whole number', 'error'); return; }
+
+            const pendingLink = document.getElementById('prod-image').value.trim();
+            if (pendingLink && /^(https?:\/\/|\/)/i.test(pendingLink) && formImages.length < MAX_PHOTOS) {
+                formImages.push({ src: pendingLink, color: '' });
+            }
+            const finalImage = formImages.length
+                ? formImages[0].src
+                : `/placeholder.svg?w=600&h=700&text=${encodeURIComponent(name.slice(0, 20))}`;
+
+            try {
+                const payload = {
+                    name, category, stock, buyingPrice, price,
+                    discountType, discountValue,
+                    colors: formColors,
+                    images: formImages,
+                    image: finalImage,
+                    desc: desc || 'Exclusive collection from Taham.'
+                };
+
+                if (editId) {
+                    await updateDoc(doc(db, 'artifacts', appId, 'public', 'data', 'products', editId), payload);
+                    showToast('Product updated!');
+                } else {
+                    await addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'products'), payload);
+                    showToast('New product added to the shop!');
+                }
+                resetProductForm();
+            } catch (err) {
+                console.error("Save product error:", err);
+                showToast(err.message || 'Could not save the product', 'error');
+            }
+        };
+
+        window.editProduct = function(productId) {
+            const p = products.find(item => item.id === productId);
+            if (!p) return;
+
+            populateCategorySelect(p.category);
+            document.getElementById('edit-prod-id').value = p.id;
+            document.getElementById('prod-name').value = p.name;
+            document.getElementById('prod-category').value = p.category;
+            document.getElementById('prod-stock').value = p.stock ?? 0;
+            document.getElementById('prod-buying-price').value = p.buyingPrice ?? 0;
+            document.getElementById('prod-price').value = p.price;
+            document.getElementById('prod-discount-type').value = p.discountType || 'none';
+            document.getElementById('prod-discount-value').value = p.discountValue || 0;
+            document.getElementById('prod-image').value = '';
+            formImages = productPhotos(p).filter(im => im.src).map(im => ({ src: im.src, color: im.color || '' }));
+            renderGallery();
+
+            document.getElementById('product-form-title').innerText = 'Edit Product';
+            document.getElementById('cancel-edit-btn').classList.remove('hidden');
+            updateDiscountPreview();
+            document.getElementById('product-form').scrollIntoView({ behavior: 'smooth' });
+        };
+
+        window.resetProductForm = function() {
+            document.getElementById('product-form').reset();
+            document.getElementById('edit-prod-id').value = '';
+            formColors = [];
+            renderColorEditor();
+            formImages = [];
+            renderGallery();
+            document.getElementById('product-form-title').innerText = 'Add New Product';
+            document.getElementById('cancel-edit-btn').classList.add('hidden');
+            updateDiscountPreview();
+        };
+
+        // ---------- Collections (name + cover photo) ----------
+        window.handleCollectionImageUpload = async function(event) {
+            const file = event.target.files[0];
+            if (!file) return;
+            try {
+                uploadedCollectionImage = await readImageFile(file, 800, 0.8);
+                document.getElementById('col-image-preview-img').src = uploadedCollectionImage;
+                document.getElementById('col-image-preview-box').classList.remove('hidden');
+                showToast('Image is ready!');
+            } catch (err) {
+                showToast(err.message, 'error');
+            }
+        };
+
+        window.handleSaveCollection = async function(e) {
+            e.preventDefault();
+            const editId = document.getElementById('edit-col-id').value;
+            const name = document.getElementById('col-name').value.trim();
+            if (!name) { showToast('Enter the collection name', 'error'); return; }
+            const image = uploadedCollectionImage || document.getElementById('col-image-url').value.trim();
+            const selectedProductIds = Array.from(document.querySelectorAll('#col-product-selector input[type="checkbox"]:checked')).map(el => el.value);
+            const previousName = editId ? (collections.find(x => x.id === editId) || {}).name : '';
+            const payload = { name, productIds: selectedProductIds };
+            if (image) payload.image = image;
+            try {
+                if (editId) {
+                    await updateDoc(doc(db, 'artifacts', appId, 'public', 'data', 'collections', editId), payload);
+                    showToast('Collection updated!');
+                } else {
+                    await addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'collections'), payload);
+                    showToast('Collection added!');
+                }
+
+                const affectedIds = new Set(selectedProductIds);
+                products.forEach(p => {
+                    if (p.category === name || (previousName && p.category === previousName)) affectedIds.add(p.id);
+                });
+                for (const productId of affectedIds) {
+                    const p = products.find(x => x.id === productId);
+                    if (!p) continue;
+                    const nextCategory = selectedProductIds.includes(productId) ? name : '';
+                    if (p.category !== nextCategory) {
+                        await updateDoc(doc(db, 'artifacts', appId, 'public', 'data', 'products', productId), { category: nextCategory });
+                    }
+                }
+
+                resetCollectionForm();
+                closeCollectionModal();
+                await window.__refreshAll();
+            } catch (err) {
+                showToast(err.message || 'Could not save the collection', 'error');
+            }
+        };
+
+        window.openCollectionModal = function() {
+            resetCollectionForm();
+            document.getElementById('collection-modal').classList.remove('hidden');
+            renderCollectionProductSelector();
+            if (window.lucide) lucide.createIcons();
+        };
+
+        window.closeCollectionModal = function() {
+            document.getElementById('collection-modal').classList.add('hidden');
+        };
+
+        window.editCollection = function(id) {
+            const c = collections.find(x => x.id === id);
+            if (!c) return;
+            document.getElementById('edit-col-id').value = c.id;
+            document.getElementById('col-name').value = c.name;
+            document.getElementById('col-image-url').value = String(c.image || '').startsWith('data:') ? '' : (c.image || '');
+            uploadedCollectionImage = '';
+            document.getElementById('col-image-preview-img').src = c.image || '';
+            document.getElementById('col-image-preview-box').classList.toggle('hidden', !c.image);
+            document.getElementById('col-form-title').innerText = 'Edit Collection';
+            document.getElementById('col-cancel-btn').classList.remove('hidden');
+            document.getElementById('collection-modal').classList.remove('hidden');
+            renderCollectionProductSelector();
+            if (window.lucide) lucide.createIcons();
+        };
+
+        window.renderCollectionProductSelector = function() {
+            const box = document.getElementById('col-product-selector');
+            if (!box) return;
+            const name = document.getElementById('col-name').value.trim();
+            const editId = document.getElementById('edit-col-id').value;
+            const oldName = editId ? (collections.find(x => x.id === editId) || {}).name : '';
+            const selected = new Set(Array.from(document.querySelectorAll('#col-product-selector input[type="checkbox"]:checked')).map(el => el.value));
+            const assigned = new Set(((collections.find(x => x.id === editId) || {}).productIds || []));
+            if (!products.length) {
+                box.innerHTML = `<p class="p-3 text-center text-xs text-slate-400">No products yet.</p>`;
+                return;
+            }
+            box.innerHTML = products.map(p => `
+                <label class="flex items-center gap-3 p-3 hover:bg-slate-50 cursor-pointer">
+                    <input type="checkbox" class="w-4 h-4 rounded border-slate-300 text-brand-600" value="${esc(p.id)}" ${selected.has(p.id) || assigned.has(p.id) || p.category === name || p.category === oldName ? 'checked' : ''}>
+                    <span class="text-sm text-slate-700">${esc(p.name)}</span>
+                    <span class="text-xs text-slate-400 ml-auto">${esc(p.category || '')}</span>
+                </label>
+            `).join('');
+        };
+
+        window.resetCollectionForm = function() {
+            document.getElementById('collection-form').reset();
+            document.getElementById('edit-col-id').value = '';
+            uploadedCollectionImage = '';
+            document.getElementById('col-image-preview-box').classList.add('hidden');
+            document.getElementById('col-form-title').innerText = 'Add New Collection';
+            document.getElementById('col-cancel-btn').classList.add('hidden');
+            renderCollectionProductSelector();
+        };
+
+        window.deleteCollection = async function(id) {
+            if (!confirm(t('Delete this collection?'))) return;
+            try {
+                await deleteDoc(doc(db, 'artifacts', appId, 'public', 'data', 'collections', id));
+                showToast('Collection deleted', 'error');
+            } catch (err) {
+                showToast(err.message || 'Could not delete the collection', 'error');
+            }
+        };
+
+        window.renderAdminCollections = function() {
+            const box = document.getElementById('admin-collections-list');
+            if (!collections.length) {
+                box.innerHTML = `<p class="text-center py-8 text-sm text-slate-400">No collections yet.</p>`;
+                return;
+            }
+            box.innerHTML = collections.map(c => {
+                const assigned = Array.isArray(c.productIds) ? c.productIds : [];
+                const n = products.filter(p => assigned.includes(p.id) || p.category === c.name).length;
+                return `
+                    <div class="py-3.5 flex items-center justify-between gap-3">
+                        <div class="flex items-center gap-3 min-w-0">
+                            <img src="${esc(c.image)}" onerror="this.onerror=null;this.src='/placeholder.svg?w=100&h=125&text=Taham'" class="w-14 h-[70px] rounded-xl object-cover bg-slate-100 shrink-0 border border-slate-200">
+                            <div class="min-w-0">
+                                <h5 class="font-bold text-slate-900 text-sm truncate">${esc(c.name)}</h5>
+                                <p class="text-xs text-slate-500 mt-0.5">${esc(t('{n} items', { n }))}</p>
+                            </div>
+                        </div>
+                        <div class="flex items-center gap-2 shrink-0">
+                            <button data-id="${esc(c.id)}" onclick="editCollection(this.dataset.id)" class="p-2 rounded-xl text-blue-600 hover:bg-blue-50" title="Edit"><i data-lucide="edit-3" class="w-4 h-4"></i></button>
+                            <button data-id="${esc(c.id)}" onclick="deleteCollection(this.dataset.id)" class="p-2 rounded-xl text-rose-600 hover:bg-rose-50" title="Delete"><i data-lucide="trash-2" class="w-4 h-4"></i></button>
+                        </div>
+                    </div>`;
+            }).join('');
+            lucide.createIcons();
+            initTiltInteractions();
+        };
+
+        window.adjustStockQuick = async function(productId, delta) {
+            if (!currentUser || !db) return;
+            const p = products.find(item => item.id === productId);
+            if (!p) return;
+            const nextStock = Math.max(0, Number(p.stock || 0) + delta);
+            try {
+                await updateDoc(doc(db, 'artifacts', appId, 'public', 'data', 'products', productId), { stock: nextStock });
+            } catch (err) {
+                showToast(err.message || 'Could not update the stock.', 'error');
+            }
+        };
+
+        window.deleteProduct = async function(productId) {
+            if (!currentUser || !db) return;
+            if (!confirm(t('Permanently delete this product?'))) return;
+            try {
+                await deleteDoc(doc(db, 'artifacts', appId, 'public', 'data', 'products', productId));
+                showToast('Product deleted.', 'error');
+            } catch (err) {
+                showToast(err.message || 'Could not delete.', 'error');
+            }
+        };
+
+        window.renderAdminInventory = function() {
+            const container = document.getElementById('admin-products-list');
+            container.innerHTML = products.map(p => {
+                const price = Number(p.price);
+                const sale = Number(p.salePrice ?? p.price);
+                const hasDiscount = sale < price;
+                const pct = hasDiscount ? Math.round((1 - sale / price) * 100) : 0;
+                const stockToggle = document.getElementById('set-show-stock');
+                const showStockToCustomers = storeSettings.showStockToCustomers !== false && storeSettings.showStockToCustomers !== 'false' && (!stockToggle || stockToggle.checked);
+                const profitPerUnit = sale - Number(p.buyingPrice || 0);
+                const colorDots = (p.colors || []).map(c => `<span title="${esc(c.name)}" class="inline-block w-3 h-3 rounded-full border border-slate-300 align-middle" style="background:${esc(c.hex)}"></span>`).join(' ');
+                const stock = Number(p.stock ?? 0);
+                return `
+                    <div class="py-3.5 flex flex-wrap sm:flex-nowrap items-center justify-between gap-3">
+                        <div class="flex items-center gap-3 min-w-0">
+                            <img src="${esc(p.image)}" onerror="this.onerror=null;this.src='/placeholder.svg?w=100&h=100&text=Cloth'" class="w-14 h-14 rounded-xl object-cover bg-slate-100 shrink-0 border border-slate-200">
+                            <div class="min-w-0">
+                                <h5 class="font-bold text-slate-900 text-sm truncate">${esc(p.name)}</h5>
+                                <p class="text-xs text-slate-500 mt-0.5">
+                                    <span>${esc(p.category)}</span> • ${colorDots ? colorDots + ' • ' : ''}<span>Buy:</span> ৳${p.buyingPrice || 0} • <span>Price:</span>
+                                    ${hasDiscount
+                                        ? `<span class="line-through text-slate-400">৳${price}</span> <strong class="text-brand-700">৳${sale}</strong> <span class="bg-rose-100 text-rose-700 font-bold px-1.5 py-0.5 rounded">-${pct}%</span>`
+                                        : `<strong class="text-brand-700">৳${price}</strong>`}
+                                    • <span class="${profitPerUnit < 0 ? 'text-rose-600' : 'text-emerald-600'} font-bold"><span>Profit/pc:</span> ৳${profitPerUnit}</span>
+                                </p>
+                            </div>
+                        </div>
+
+                        <div class="flex items-center gap-2 shrink-0">
+                            <div class="flex items-center gap-1.5 bg-slate-100 px-2 py-1 rounded-xl border border-slate-200">
+                                <button onclick="adjustStockQuick('${p.id}', -1)" class="w-6 h-6 rounded-lg bg-white font-bold text-slate-700 shadow-sm">-</button>
+                                <span class="text-xs font-bold px-1.5 ${stock < 5 ? 'text-rose-600' : 'text-slate-800'}"><span>${stock}</span> <span>pcs</span></span>
+                                <button onclick="adjustStockQuick('${p.id}', 1)" class="w-6 h-6 rounded-lg bg-white font-bold text-slate-700 shadow-sm">+</button>
+                            </div>
+
+                            <button onclick="editProduct('${p.id}')" class="p-2 rounded-xl text-blue-600 hover:bg-blue-50" title="Edit">
+                                <i data-lucide="edit-3" class="w-4 h-4"></i>
+                            </button>
+                            <button onclick="deleteProduct('${p.id}')" class="p-2 rounded-xl text-rose-600 hover:bg-rose-50" title="Delete">
+                                <i data-lucide="trash-2" class="w-4 h-4"></i>
+                            </button>
+                        </div>
+                    </div>
+                `;
+            }).join('');
+            lucide.createIcons();
+            initTiltInteractions();
+        };
+
+        // Expenses Management
+        window.openExpenseModal = function() {
+            document.getElementById('expense-modal').classList.remove('hidden');
+            if (window.lucide) lucide.createIcons();
+        };
+
+        window.closeExpenseModal = function() {
+            document.getElementById('expense-modal').classList.add('hidden');
+        };
+
+        window.handleAddExpense = async function(e) {
+            e.preventDefault();
+            if (!currentUser || !db) return;
+            const title = document.getElementById('exp-title').value.trim();
+            const category = document.getElementById('exp-category').value;
+            const amount = parseInt(document.getElementById('exp-amount').value, 10);
+
+            if (!title || !Number.isInteger(amount) || amount < 1) {
+                showToast('Enter the expense description and a valid amount.', 'error');
+                return;
+            }
+            try {
+                await addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'expenses'), { title, category, amount });
+                e.target.reset();
+                closeExpenseModal();
+                showToast('Expense recorded!');
+            } catch (err) {
+                showToast(err.message || 'Could not add the expense.', 'error');
+            }
+        };
+
+        window.deleteExpense = async function(expId) {
+            if (!currentUser || !db) return;
+            try {
+                await deleteDoc(doc(db, 'artifacts', appId, 'public', 'data', 'expenses', expId));
+                showToast('Expense deleted.', 'error');
+            } catch (err) {
+                showToast(err.message || 'Could not delete.', 'error');
+            }
+        };
+
+        window.renderAdminExpenses = function() {
+            const container = document.getElementById('admin-expenses-list');
+            if (expenses.length === 0) {
+                container.innerHTML = `<p class="text-center py-8 text-sm text-slate-400">No expenses added yet.</p>`;
+                return;
+            }
+            container.innerHTML = expenses.map(exp => `
+                <div class="py-3 flex items-center justify-between gap-3">
+                    <div>
+                        <h5 class="font-bold text-slate-800 text-sm">${esc(exp.title)}</h5>
+                        <p class="text-xs text-slate-500">${esc(exp.category)} • ${esc(fmtDate(exp.createdAt, true))}</p>
+                    </div>
+                    <div class="flex items-center gap-3">
+                        <span class="font-bold text-rose-600 text-sm">- ৳ ${Number(exp.amount).toLocaleString('en-US')}</span>
+                        <button onclick="deleteExpense('${exp.id}')" class="p-1.5 rounded-lg text-slate-400 hover:text-rose-600">
+                            <i data-lucide="trash-2" class="w-4 h-4"></i>
+                        </button>
+                    </div>
+                </div>
+            `).join('');
+            lucide.createIcons();
+        };
+
+        // Store Settings & Password Update
+        window.handleSaveSettings = async function(e) {
+            e.preventDefault();
+            if (!currentUser || !db) return;
+
+            const val = (id) => {
+                const el = document.getElementById(id);
+                return el ? el.value.trim() : '';
+            };
+            const shopName = val('set-shop-name') || storeSettings.shopName || 'Taham';
+            const pageName = val('page-name') || storeSettings.pageName || shopName;
+            const themeSelector = document.getElementById('theme-selector');
+            const updatedSettings = {
+                ...storeSettings,
+                shopName,
+                pageName,
+                theme: (themeSelector && themeSelector.dataset.selected) || storeSettings.theme || 'classic-pink',
+                shopPhone: val('set-shop-phone') || storeSettings.shopPhone,
+                paymentNumber: val('set-payment-number') || storeSettings.paymentNumber,
+                shopAddress: val('set-shop-address') || storeSettings.shopAddress,
+                showStockToCustomers: document.getElementById('set-show-stock') ? document.getElementById('set-show-stock').checked : storeSettings.showStockToCustomers !== false,
+                adminUser: val('set-admin-user') || storeSettings.adminUser || '',
+                adminPass: val('set-admin-pass')
+            };
+
+            const settingsDoc = doc(db, 'artifacts', appId, 'public', 'data', 'settings', 'store_config');
+            try {
+                await setDoc(settingsDoc, updatedSettings);
+                storeSettings = { ...storeSettings, ...updatedSettings };
+                delete storeSettings.adminPass;
+                applyStoreSettingsToUI();
+                showToast('Settings updated successfully!');
+            } catch (err) {
+                showToast(err.message || 'Could not save the settings.', 'error');
+            }
+        };
+
+        window.uploadSiteLogo = async function() {
+            const input = document.getElementById('logo-upload');
+            if (!input || !input.files || !input.files.length) {
+                showToast('Please choose an image file.', 'error');
+                return;
+            }
+            const file = input.files[0];
+            if (!file.type.startsWith('image/')) {
+                showToast('Please choose an image file.', 'error');
+                return;
+            }
+            try {
+                const dataUrl = await new Promise((resolve, reject) => {
+                    const reader = new FileReader();
+                    reader.onload = () => resolve(reader.result);
+                    reader.onerror = () => reject(new Error('Could not read the image.'));
+                    reader.readAsDataURL(file);
+                });
+                await api('POST', '/api/logo', { dataUrl });
+                const cacheBust = Date.now();
+                ['site-logo', 'settings-logo-preview'].forEach(id => {
+                    const img = document.getElementById(id);
+                    if (img) img.src = `/logo.png?v=${cacheBust}`;
+                });
+                showToast('Logo uploaded successfully!');
+            } catch (err) {
+                showToast(err.message || 'Could not upload logo.', 'error');
+            }
+        };
+
+        // Start App
+        window.addEventListener('DOMContentLoaded', () => {
+            lucide.createIcons();
+            renderCategoryFilters();
+            renderColorEditor();
+            renderGallery();
+            let saved = 'en';
+            try { saved = localStorage.getItem('taham_lang') || 'en'; } catch (e) { /* ignore */ }
+            initApp();
+            window.setLanguage(saved);
+        });
+    </script>
+</body>
+</html>"""
+
+
+if __name__ == "__main__":
+    port = PORT
+    for candidate in range(PORT, PORT + 20):          # if 5000 is busy, try the next ports
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            if probe.connect_ex(("127.0.0.1", candidate)) != 0:
+                port = candidate
+                break
+    url = f"http://localhost:{port}"
+
+    # Detect the Main PC's LAN IPv4 address so other PCs can connect.
+    lan_ip = None
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(("192.0.2.1", 80))  # no data is sent; selects the active network interface
+            lan_ip = s.getsockname()[0]
+    except OSError:
+        pass
+
+    print(f"\n  Taham Store is running ->  {url}")
+    if lan_ip and not lan_ip.startswith("127."):
+        print(f"  Open from another PC ->  http://{lan_ip}:{port}")
+    print("  Keep this window open while other PCs use the store.")
+    print("  If another PC cannot connect, allow Python/TCP port "
+          f"{port} through Windows Firewall on Private networks only.")
+    print("  Press Ctrl+C to stop the server.\n")
+
+    if os.environ.get("NO_BROWSER") != "1":
+        threading.Timer(1.2, lambda: webbrowser.open(url)).start()
+    app.run(host=HOST, port=port, debug=False, threaded=True)
